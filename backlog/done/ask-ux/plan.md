@@ -20,19 +20,19 @@ Manual (user, after /reload): one `ask_smart_plan` call with 2 questions — tab
 
 ## Tasks
 
-- [ ] T1: custom form component
+- [x] T1: custom form component
   deps: []
   owns: [src/ask-form.ts]
   done: file exports a function `runAskForm(ctx, questions) => Promise<AskResult>` using `ctx.ui.custom`; tsc of that file in the package tsconfig exits 0
-- [ ] T2: wire ask_smart_plan + package files
+- [x] T2: wire ask_smart_plan + package files
   deps: [T1]
   owns: [index.ts, package.json]
   done: index.ts has no `ui.select` / `ui.editor` in the ask path; package.json `files` includes `src`; tsc whole package exit 0
-- [ ] T3: README — describe the form (tabs, preview, inline note)
+- [x] T3: README — describe the form (tabs, preview, inline note)
   deps: []
   owns: [README.md]
   done: rg -n 'tab|preview|inline' README.md → ≥1
-- [ ] T4: root DoD
+- [x] T4: root DoD
   deps: [T1, T2, T3]
   owns: []
   done: tsc + npm pack --dry-run green

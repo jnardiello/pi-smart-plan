@@ -4,8 +4,9 @@
  * <cwd>/backlog/ directory. Only the user (native confirm, ctrl+p toggle) or the
  * /plan-guard command can exit; the model has no unilateral way out.
  */
-import { isToolCallEventType, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { runAskForm } from "./src/ask-form.ts";
 
 const STORE_KEY = "plan-guard";
 const STATUS_KEY = "plan-guard";
@@ -42,57 +43,6 @@ function insideBacklog(cwd: string, rawPath: unknown): boolean {
 
 function syncStatus(ctx: ExtensionContext): void {
 	ctx.ui.setStatus(STATUS_KEY, enabled ? "PLAN" : undefined);
-}
-
-interface AskQuestionInput {
-	question: string;
-	header?: string;
-	multiSelect?: boolean;
-	options: { label: string; description?: string }[];
-}
-
-type AskResult = { declined: true } | { answer: string | string[] };
-
-const CUSTOM_CHOICE = "None of these — I'll specify";
-
-function optionLabel(option: { label: string; description?: string }): string {
-	return option.description ? `${option.label} — ${option.description}` : option.label;
-}
-
-/** Multiline note when no listed option fits. undefined = user cancelled. */
-async function customNote(ui: ExtensionUIContext, question: string): Promise<string | undefined> {
-	return ui.editor(question, "");
-}
-
-/** Render one question via native pi dialogs. Returns { declined } if the user cancels. */
-async function askQuestion(ui: ExtensionUIContext, q: AskQuestionInput): Promise<AskResult> {
-	const title = q.header ?? q.question;
-	if (!q.multiSelect) {
-		const choice = await ui.select(title, [...q.options.map(optionLabel), CUSTOM_CHOICE]);
-		if (choice === undefined) return { declined: true };
-		if (choice === CUSTOM_CHOICE) {
-			const custom = await customNote(ui, q.question);
-			if (custom === undefined) return { declined: true };
-			return { answer: custom };
-		}
-		return { answer: choice };
-	}
-	const picks: string[] = [];
-	let remaining = q.options.map(optionLabel);
-	for (;;) {
-		const choice = await ui.select(title, [...remaining, CUSTOM_CHOICE, "Done"]);
-		if (choice === undefined) return { declined: true };
-		if (choice === "Done") break;
-		if (choice === CUSTOM_CHOICE) {
-			const custom = await customNote(ui, q.question);
-			if (custom === undefined) return { declined: true };
-			picks.push(custom);
-		} else {
-			picks.push(choice);
-			remaining = remaining.filter((label) => label !== choice);
-		}
-	}
-	return { answer: picks };
 }
 
 export default function planGuard(pi: ExtensionAPI): void {
@@ -154,7 +104,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "ask_smart_plan",
 		label: "Ask (smart-plan)",
-		description: "Show the user one or more multiple-choice questions via native dialogs and return the answers.",
+		description: "Show a custom form: tabs, option descriptions, preview, and an inline note when no option fits.",
 		promptSnippet: "ask_smart_plan: ask the user questions before continuing",
 		promptGuidelines: [
 			"Use ask_smart_plan when you need structured input from the user (choice prompt with options). Offer a custom note path; never invent an answer.",
@@ -166,7 +116,11 @@ export default function planGuard(pi: ExtensionAPI): void {
 					header: Type.Optional(Type.String()),
 					multiSelect: Type.Optional(Type.Boolean()),
 					options: Type.Array(
-						Type.Object({ label: Type.String(), description: Type.Optional(Type.String()) }),
+						Type.Object({
+							label: Type.String(),
+							description: Type.Optional(Type.String()),
+							preview: Type.Optional(Type.String()),
+						}),
 						{ minItems: 2, maxItems: 4 }
 					),
 				}),
@@ -177,17 +131,12 @@ export default function planGuard(pi: ExtensionAPI): void {
 			if (!ctx.hasUI) {
 				return { content: [{ type: "text", text: "No interactive UI; ask in prose." }], details: { ui: false } };
 			}
-			const answers: Record<string, string | string[]> = {};
-			const blocks: string[] = [];
-			for (const q of params.questions) {
-				const result = await askQuestion(ctx.ui, q);
-				if ("declined" in result) {
-					return { content: [{ type: "text", text: "The user declined." }], details: { answers, declined: true } };
-				}
-				answers[q.question] = result.answer;
-				blocks.push(`Q: ${q.question}\nA: ${Array.isArray(result.answer) ? result.answer.join(", ") : result.answer}`);
+			const result = await runAskForm(ctx, params.questions);
+			if ("declined" in result) {
+				return { content: [{ type: "text", text: "The user declined." }], details: { answers: {}, declined: true } };
 			}
-			return { content: [{ type: "text", text: blocks.join("\n") }], details: { answers } };
+			const blocks = Object.entries(result.answers).map(([q, a]) => `Q: ${q}\nA: ${Array.isArray(a) ? a.join(", ") : a}`);
+			return { content: [{ type: "text", text: blocks.join("\n") }], details: { answers: result.answers } };
 		},
 	});
 
