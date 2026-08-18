@@ -15,7 +15,7 @@ Plan mode with a mechanical write guard, plus a goal-scoped workflow that execut
 pi install git:github.com/jnardiello/pi-smart-plan
 ```
 
-Then run `/reload` to pick up the new skills and tools.
+Then run `/reload` to pick up the extension.
 
 ## Usage
 
@@ -25,7 +25,7 @@ Then run `/reload` to pick up the new skills and tools.
 - `ctrl+p` — toggle plan mode.
 - `ask_smart_plan` tool — custom form, tabs for multiple questions. Right pane is a human briefing (`detail`) plus consequences of the highlighted option (`preview`). Long text scrolls with J/K or PgUp/PgDn. "None of these — I'll specify" opens an inline editor. Escape declines the form. No third-party extension required.
 
-The bundled plan skill uses `ask_smart_plan` for its user prompts.
+`/plan` injects the workflow into the session. This package is a pi extension, not a skill.
 
 ### IMPORTANT: remap ctrl+p
 

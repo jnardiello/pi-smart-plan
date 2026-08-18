@@ -22,23 +22,23 @@ Manual: /reload then /plan smoke-goal — the first injected turn contains the w
 
 ## Tasks
 
-- [ ] T1: src/prompts.ts from current SKILL.md
+- [x] T1: src/prompts.ts from current SKILL.md
   deps: []
   owns: [src/prompts.ts]
   done: exports PLAN_WORKFLOW (and maybe planUserMessage(goal)); no YAML frontmatter; wording says extension /plan not /skill:plan
-- [ ] T2: inject from /plan and plan_enter; drop skill dispatch
+- [x] T2: inject from /plan and plan_enter; drop skill dispatch
   deps: [T1]
   owns: [index.ts]
   done: no /skill:plan, no expandPromptTemplates; sendUserMessage(planUserMessage(goal)); tsc exit 0
-- [ ] T3: package.json + delete skills/
+- [x] T3: package.json + delete skills/
   deps: [T2]
   owns: [package.json, skills/plan/SKILL.md]
   done: no pi.skills; git rm skills/; pack has no skills/
-- [ ] T4: README — extension only
+- [x] T4: README — extension only
   deps: []
   owns: [README.md]
   done: no “bundled plan skill”; install/usage describe /plan only
-- [ ] T5: root DoD
+- [x] T5: root DoD
   deps: [T1, T2, T3, T4]
   owns: []
   done: three DoD commands green

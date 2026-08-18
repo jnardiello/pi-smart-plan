@@ -7,6 +7,7 @@
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { runAskForm } from "./src/ask-form.ts";
+import { planUserMessage } from "./src/prompts.ts";
 
 const STORE_KEY = "plan-guard";
 const STATUS_KEY = "plan-guard";
@@ -154,17 +155,11 @@ export default function planGuard(pi: ExtensionAPI): void {
 			if (!enabled) {
 				set(ctx, true, "Plan mode ON — writes are restricted to backlog/.", "warning");
 			}
-			// Verified against pi 0.84.2 docs/skills.md + docs/packages.md: a packaged
-			// skill in ./skills is discovered via pi.skills in package.json and /skill:name
-			// messages expand ONLY when sendUserMessage passes expandPromptTemplates:true
-			// (dist/core/agent-session.js _expandSkillCommand; default is false).
-			// An empty goal is fine: Phase 1 elicits it.
-			const goal = args.trim();
-			const message = goal ? `/skill:plan ${goal}` : "/skill:plan";
+			const message = planUserMessage(args);
 			if (ctx.isIdle()) {
-				pi.sendUserMessage(message, { expandPromptTemplates: true });
+				pi.sendUserMessage(message);
 			} else {
-				pi.sendUserMessage(message, { expandPromptTemplates: true, deliverAs: "followUp" });
+				pi.sendUserMessage(message, { deliverAs: "followUp" });
 			}
 		},
 	});

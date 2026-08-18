@@ -21,15 +21,11 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ],
-    "skills": [
-      "./skills"
     ]
   },
   "files": [
     "index.ts",
     "src",
-    "skills",
     "README.md",
     "LICENSE"
   ],
