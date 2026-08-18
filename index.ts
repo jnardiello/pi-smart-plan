@@ -53,18 +53,25 @@ interface AskQuestionInput {
 
 type AskResult = { declined: true } | { answer: string | string[] };
 
+const CUSTOM_CHOICE = "None of these — I'll specify";
+
 function optionLabel(option: { label: string; description?: string }): string {
 	return option.description ? `${option.label} — ${option.description}` : option.label;
+}
+
+/** Multiline note when no listed option fits. undefined = user cancelled. */
+async function customNote(ui: ExtensionUIContext, question: string): Promise<string | undefined> {
+	return ui.editor(question, "");
 }
 
 /** Render one question via native pi dialogs. Returns { declined } if the user cancels. */
 async function askQuestion(ui: ExtensionUIContext, q: AskQuestionInput): Promise<AskResult> {
 	const title = q.header ?? q.question;
 	if (!q.multiSelect) {
-		const choice = await ui.select(title, [...q.options.map(optionLabel), "Other…"]);
+		const choice = await ui.select(title, [...q.options.map(optionLabel), CUSTOM_CHOICE]);
 		if (choice === undefined) return { declined: true };
-		if (choice === "Other…") {
-			const custom = await ui.input(q.question, "Type your answer…");
+		if (choice === CUSTOM_CHOICE) {
+			const custom = await customNote(ui, q.question);
 			if (custom === undefined) return { declined: true };
 			return { answer: custom };
 		}
@@ -73,11 +80,11 @@ async function askQuestion(ui: ExtensionUIContext, q: AskQuestionInput): Promise
 	const picks: string[] = [];
 	let remaining = q.options.map(optionLabel);
 	for (;;) {
-		const choice = await ui.select(title, [...remaining, "Other…", "Done"]);
+		const choice = await ui.select(title, [...remaining, CUSTOM_CHOICE, "Done"]);
 		if (choice === undefined) return { declined: true };
 		if (choice === "Done") break;
-		if (choice === "Other…") {
-			const custom = await ui.input(q.question, "Type your answer…");
+		if (choice === CUSTOM_CHOICE) {
+			const custom = await customNote(ui, q.question);
 			if (custom === undefined) return { declined: true };
 			picks.push(custom);
 		} else {
@@ -145,12 +152,12 @@ export default function planGuard(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
-		name: "ask",
-		label: "Ask the user questions",
+		name: "ask_smart_plan",
+		label: "Ask (smart-plan)",
 		description: "Show the user one or more multiple-choice questions via native dialogs and return the answers.",
-		promptSnippet: "ask: ask the user questions before continuing",
+		promptSnippet: "ask_smart_plan: ask the user questions before continuing",
 		promptGuidelines: [
-			"Use ask when you need structured input from the user (choice prompt with options). Never show options the user could not answer.",
+			"Use ask_smart_plan when you need structured input from the user (choice prompt with options). Offer a custom note path; never invent an answer.",
 		],
 		parameters: Type.Object({
 			questions: Type.Array(
