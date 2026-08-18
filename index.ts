@@ -198,8 +198,14 @@ export default function planGuard(pi: ExtensionAPI): void {
 	pi.registerShortcut("ctrl+p", {
 		description: "Toggle plan mode",
 		handler: async (ctx) => {
-			const next = !enabled;
-			set(ctx, next, next ? "Plan mode ON — writes are restricted to backlog/." : "Plan mode OFF — edits/writes re-enabled.", next ? "warning" : "info");
+			if (enabled) {
+				set(ctx, false, "Plan mode OFF — edits/writes re-enabled.", "info");
+				return;
+			}
+			set(ctx, true, "Plan mode ON — writes are restricted to backlog/.", "warning");
+			const message = planUserMessage("");
+			if (ctx.isIdle()) pi.sendUserMessage(message);
+			else pi.sendUserMessage(message, { deliverAs: "followUp" });
 		},
 	});
 

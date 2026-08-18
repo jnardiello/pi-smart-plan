@@ -21,15 +21,15 @@ Manual: /reload — ctrl+p starts planning; ask_smart_plan does not prompt y/n.
 
 ## Tasks
 
-- [ ] T1: ctrl+p ON injects planUserMessage
+- [x] T1: ctrl+p ON injects planUserMessage
   deps: []
   owns: [index.ts]
   done: shortcut ON path calls sendUserMessage(planUserMessage("")); tsc exit 0
-- [ ] T2: allowlist + README
+- [x] T2: allowlist + README
   deps: []
   owns: [/Users/jnardiello/.pi/agent/extensions/pi-permission-system/config.json, README.md]
   done: three tools allow; README has the snippet
-- [ ] T3: root DoD
+- [x] T3: root DoD
   deps: [T1, T2]
   owns: []
   done: DoD commands green

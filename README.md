@@ -62,6 +62,18 @@ Exactly two agent commits per goal:
 
 Never push, never publish. Users who want different behavior should say so explicitly.
 
+## Permissions
+
+If you use `@gotgenes/pi-permission-system` (default `*` = ask), allow the extension tools or every form will pause on a y/n prompt:
+
+```json
+"ask_smart_plan": "allow",
+"plan_enter": "allow",
+"plan_exit": "allow"
+```
+
+The extension cannot flip that policy for you.
+
 ## Requirements
 
 - pi 0.84.2+
