@@ -30,11 +30,11 @@ Scan `backlog/` for the active goal. If `backlog/<goal>/` exists: read `plan.md`
 
 - If a `plan_enter` tool exists (pi): call it at the start of scoping to engage the mechanical guard. Elsewhere (Codex/Claude Code) treat read-only as strict discipline: no writes, exploration only.
 - Delegate codebase recon to scout subagents per the harness contract; do not explore inline when it exceeds the delegation gate.
-- Ask the CORE questions in a single `ask_smart_plan` call — 3 questions: scope / non-goals / DoD (single-select options carry label+description; "None of these — I'll specify" opens a multiline note; Escape=declined):
+- Ask the CORE questions in a single `ask_smart_plan` call — 3 questions: scope / non-goals / DoD. Every question MUST include `detail`: a plain-language briefing a human can act on without the chat (context, what is already true, what is at stake, consequences of the main options). No jargon without a gloss. No "as we discussed". Each option: `label`, `description`, and `preview` = what happens if they pick it. "None of these — I'll specify" opens a note; Escape=declined:
   1. exact scope — the outcome, in one sentence
   2. explicit non-goals — what this plan will deliberately NOT do
   3. DoD — executable commands that must pass, not prose ("`npm test && npm run typecheck`", not "tests pass")
-- `ask_smart_plan` supports 1–4 questions per call, single or multiSelect, options with label+description, a multiline custom note when no option fits, and Escape = `declined` (does not abort the turn).
+- `ask_smart_plan` supports 1–4 questions per call, single or multiSelect, `detail` briefing + per-option `preview`, a multiline custom note when no option fits, and Escape = `declined` (does not abort the turn).
 - If `ask_smart_plan` is missing or returns `details.ui === false`, fall back to plain-text questions, one at a time. If it returns `details.declined`, stop and wait for the user.
 - ESCALATE to deep, one-question-at-a-time grilling (recommended answers included) only on a trigger: detected ambiguity, risk surface (security/data/irreversible), or the user asks.
 

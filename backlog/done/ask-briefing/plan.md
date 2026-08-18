@@ -26,19 +26,19 @@ Manual after /reload: one ask_smart_plan with a long `detail` — pane readable,
 
 ## Tasks
 
-- [ ] T1: briefing pane + scroll in src/ask-form.ts
+- [x] T1: briefing pane + scroll in src/ask-form.ts
   deps: []
   owns: [src/ask-form.ts]
   done: detail+option block rendered; J/K or PgUp/PgDn scroll; tsc exit 0
-- [ ] T2: schema detail on questions in index.ts
+- [x] T2: schema detail on questions in index.ts
   deps: [T1]
   owns: [index.ts]
   done: Type.Optional detail on question; passed through to runAskForm; tsc exit 0
-- [ ] T3: skill + README — model must write detail/preview for humans
+- [x] T3: skill + README — model must write detail/preview for humans
   deps: []
   owns: [skills/plan/SKILL.md, README.md]
   done: rg detail in SKILL.md ≥1; README mentions briefing pane
-- [ ] T4: root DoD
+- [x] T4: root DoD
   deps: [T1, T2, T3]
   owns: []
   done: three DoD commands green

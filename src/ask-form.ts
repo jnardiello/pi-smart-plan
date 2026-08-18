@@ -8,6 +8,7 @@ import { Editor, type EditorTheme, Key, matchesKey, visibleWidth, wrapTextWithAn
 export type AskQuestion = {
 	question: string;
 	header?: string;
+	detail?: string;
 	multiSelect?: boolean;
 	options: { label: string; description?: string; preview?: string }[];
 };
@@ -26,6 +27,7 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 		let tab = 0;
 		let optionIndex = 0;
 		let editMode = false;
+		let paneScroll = 0;
 		let cached: string[] | undefined;
 		const answers = new Map<string, string | string[]>();
 		const multiPicks = new Map<string, string[]>();
@@ -59,6 +61,10 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 		function refresh(): void {
 			cached = undefined;
 			tui.requestRender();
+		}
+
+		function resetPane(): void {
+			paneScroll = 0;
 		}
 
 		function finish(): void {
@@ -125,12 +131,14 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 			if (questions.length > 1 && (matchesKey(data, Key.tab) || matchesKey(data, Key.right))) {
 				tab = (tab + 1) % totalTabs;
 				optionIndex = 0;
+				resetPane();
 				refresh();
 				return;
 			}
 			if (questions.length > 1 && (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left))) {
 				tab = (tab - 1 + totalTabs) % totalTabs;
 				optionIndex = 0;
+				resetPane();
 				refresh();
 				return;
 			}
@@ -146,11 +154,23 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 
 			if (matchesKey(data, Key.up)) {
 				optionIndex = Math.max(0, optionIndex - 1);
+				resetPane();
 				refresh();
 				return;
 			}
 			if (matchesKey(data, Key.down)) {
 				optionIndex = Math.min(opts.length - 1, optionIndex + 1);
+				resetPane();
+				refresh();
+				return;
+			}
+			if (data === "j" || data === "J" || matchesKey(data, Key.pageDown)) {
+				paneScroll += data === "j" || data === "J" ? 1 : 5;
+				refresh();
+				return;
+			}
+			if (data === "k" || data === "K" || matchesKey(data, Key.pageUp)) {
+				paneScroll = Math.max(0, paneScroll - (data === "k" || data === "K" ? 1 : 5));
 				refresh();
 				return;
 			}
@@ -219,6 +239,12 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 			}
 		}
 
+		function padVisible(s: string, width: number): string {
+			const vis = visibleWidth(s);
+			if (vis >= width) return s;
+			return s + " ".repeat(width - vis);
+		}
+
 		function render(width: number): string[] {
 			if (cached) return cached;
 			const w = Math.max(1, width);
@@ -269,7 +295,6 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 			lines.push("");
 
 			const selected = opts[optionIndex];
-			const previewText = selected?.preview || selected?.description || "";
 
 			const body: string[] = [];
 			for (let i = 0; i < opts.length; i++) {
@@ -285,21 +310,44 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 				}
 			}
 
-			if (wide && previewText) {
-				const previewWidth = w - listWidth - 3;
-				const previewLines = wrapTextWithAnsi(theme.fg("dim", previewText), Math.max(8, previewWidth));
-				const rows = Math.max(body.length, previewLines.length);
-				for (let r = 0; r < rows; r++) {
-					const left = (body[r] ?? "").padEnd(listWidth);
-					const right = previewLines[r] ?? "";
-					lines.push(`${left} │ ${right}`);
+			const paneWidth = wide ? Math.max(8, w - listWidth - 3) : w;
+			const briefing: string[] = [];
+			if (q.detail?.trim()) {
+				addPrefixed(briefing, "", theme.fg("text", q.detail.trim()), paneWidth);
+			} else {
+				addPrefixed(briefing, "", theme.fg("dim", "No briefing on this question."), paneWidth);
+			}
+			if (selected && !selected.custom) {
+				briefing.push("");
+				addPrefixed(briefing, "", theme.fg("accent", `If you pick “${selected.label}”:`), paneWidth);
+				const consequence = (selected.preview || selected.description || "").trim();
+				if (consequence) addPrefixed(briefing, "", theme.fg("muted", consequence), paneWidth);
+				else addPrefixed(briefing, "", theme.fg("dim", "No extra consequences written for this option."), paneWidth);
+			} else if (selected?.custom) {
+				briefing.push("");
+				addPrefixed(briefing, "", theme.fg("muted", "Write your own answer in the note editor."), paneWidth);
+			}
+			const viewport = Math.max(body.length, 6);
+			const maxScroll = Math.max(0, briefing.length - viewport);
+			if (paneScroll > maxScroll) paneScroll = maxScroll;
+			const view = briefing.slice(paneScroll, paneScroll + viewport);
+			while (view.length < viewport) view.push("");
+			const more = paneScroll < maxScroll || paneScroll > 0;
+
+			if (wide) {
+				const rule = theme.fg("dim", "│");
+				for (let r = 0; r < viewport; r++) {
+					const left = padVisible(body[r] ?? "", listWidth);
+					lines.push(`${left} ${rule} ${view[r] ?? ""}`);
+				}
+				if (more) {
+					addPrefixed(lines, padVisible("", listWidth) + " ", theme.fg("dim", `↕ ${paneScroll + 1}–${paneScroll + view.length}/${briefing.length}  J/K or PgUp/PgDn`), w);
 				}
 			} else {
 				lines.push(...body);
-				if (!wide && previewText) {
-					lines.push("");
-					addPrefixed(lines, " ", theme.fg("dim", previewText), w);
-				}
+				lines.push("");
+				lines.push(...view);
+				if (more) addPrefixed(lines, " ", theme.fg("dim", "J/K or PgUp/PgDn to scroll briefing"), w);
 			}
 
 			if (editMode) {
@@ -315,7 +363,7 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 				? "Enter submit note • Esc back to list"
 				: q.multiSelect
 					? "↑↓ • Space toggle • Enter next • Esc cancel"
-					: "↑↓ • Enter select • Esc cancel" + (questions.length > 1 ? " • Tab questions" : "");
+					: "↑↓ options • J/K briefing • Enter • Esc" + (questions.length > 1 ? " • Tab" : "");
 			addPrefixed(lines, " ", theme.fg("dim", hint), w);
 			lines.push(theme.fg("accent", "─".repeat(w)));
 			cached = lines;

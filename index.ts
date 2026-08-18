@@ -104,16 +104,22 @@ export default function planGuard(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "ask_smart_plan",
 		label: "Ask (smart-plan)",
-		description: "Show a custom form: tabs, option descriptions, preview, and an inline note when no option fits.",
+		description: "Show a custom form: tabs, a human briefing pane, and an inline note when no option fits.",
 		promptSnippet: "ask_smart_plan: ask the user questions before continuing",
 		promptGuidelines: [
-			"Use ask_smart_plan when you need structured input from the user (choice prompt with options). Offer a custom note path; never invent an answer.",
+			"Use ask_smart_plan for structured user decisions. Always fill detail with a plain-language briefing (context, facts, consequences; no jargon, no assumed prior turns). Fill each option preview with what happens if that option is chosen. Offer a custom note path; never invent an answer.",
 		],
 		parameters: Type.Object({
 			questions: Type.Array(
 				Type.Object({
 					question: Type.String(),
 					header: Type.Optional(Type.String()),
+					detail: Type.Optional(
+						Type.String({
+							description:
+								"Plain-language briefing for a human: context, facts, consequences. No jargon. No assumed prior context.",
+						}),
+					),
 					multiSelect: Type.Optional(Type.Boolean()),
 					options: Type.Array(
 						Type.Object({

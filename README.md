@@ -23,7 +23,7 @@ Then run `/reload` to pick up the new skills and tools.
 - `/plan-guard status|on|off` — control the mechanical write guard outside a plan.
 - `plan_enter` / `plan_exit` tools — engage / release the write guard programmatically.
 - `ctrl+p` — toggle plan mode.
-- `ask_smart_plan` tool — custom form, all questions as tabs in one call. Each tab has label and description; side preview renders the form when space allows. "None of these — I'll specify" opens an inline editor. Escape declines the form; Escape inside the editor just leaves the note. No third-party extension required.
+- `ask_smart_plan` tool — custom form, tabs for multiple questions. Right pane is a human briefing (`detail`) plus consequences of the highlighted option (`preview`). Long text scrolls with J/K or PgUp/PgDn. "None of these — I'll specify" opens an inline editor. Escape declines the form. No third-party extension required.
 
 The bundled plan skill uses `ask_smart_plan` for its user prompts.
 
