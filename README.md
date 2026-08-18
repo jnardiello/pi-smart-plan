@@ -23,6 +23,9 @@ Then run `/reload` to pick up the new skills and tools.
 - `/plan-guard status|on|off` — control the mechanical write guard outside a plan.
 - `plan_enter` / `plan_exit` tools — engage / release the write guard programmatically.
 - `ctrl+p` — toggle plan mode.
+- `ask` tool — first-party sequential native picker: shows a numbered choice list, waits on the user's selection, and Escape declines. No third-party extension required.
+
+The bundled plan skill uses `ask` rather than `ask_user_question` for its user prompts.
 
 ### IMPORTANT: remap ctrl+p
 

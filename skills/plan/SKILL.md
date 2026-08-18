@@ -30,12 +30,13 @@ Scan `backlog/` for the active goal. If `backlog/<goal>/` exists: read `plan.md`
 
 - If a `plan_enter` tool exists (pi): call it at the start of scoping to engage the mechanical guard. Elsewhere (Codex/Claude Code) treat read-only as strict discipline: no writes, exploration only.
 - Delegate codebase recon to scout subagents per the harness contract; do not explore inline when it exceeds the delegation gate.
-- Ask the CORE questions in ONE `ask_user_question` form (single-select each, with a freeform escape):
+- Ask the CORE questions in a single `ask` call — 3 questions: scope / non-goals / DoD (single-select options carry label+description; typeable Other; Escape=declined):
   1. exact scope — the outcome, in one sentence
   2. explicit non-goals — what this plan will deliberately NOT do
   3. DoD — executable commands that must pass, not prose ("`npm test && npm run typecheck`", not "tests pass")
+- `ask` supports 1–4 questions per call, single or multiSelect, options with label+description, a freeform Other, and Escape = `declined` (does not abort the turn).
+- If `ask` is missing or returns `details.ui === false`, fall back to plain-text questions, one at a time. If it returns `details.declined`, stop and wait for the user.
 - ESCALATE to deep, one-question-at-a-time grilling (recommended answers included) only on a trigger: detected ambiguity, risk surface (security/data/irreversible), or the user asks.
-- If no `ask_user_question` tool is available, ask structured questions in plain text, one at a time.
 
 ## PHASE 2 — PLAN AUTHORING
 
@@ -73,7 +74,7 @@ Task rules (DAG-as-data, machine-greppable):
 
 ## PHASE 3 — APPROVAL
 
-Present the full plan + derived waves via `ask_user_question` (options: **Approve** / **Edit** / **Re-grill**). Edit → revise plan and re-present; Re-grill → return to Phase 1.
+Present the full plan + derived waves via `ask` (options: **Approve** / **Edit** / **Re-grill**, each with label+description). Edit → revise plan and re-present; Re-grill → return to Phase 1.
 
 On **Approve**:
 1. Commit scoped to `backlog/<goal>/` only, message `plan(<goal>): approved`.
@@ -89,7 +90,7 @@ On **Approve**:
 
 ## RE-ENTRY THRESHOLDS
 
-Stop execution and ask the user (`ask_user_question`) when:
+Stop execution and ask the user via `ask` when:
 - scope or DoD must change;
 - a new or changed task needs paths outside the approved union of `owns`;
 - a product or architecture decision is missing.

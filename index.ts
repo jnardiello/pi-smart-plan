@@ -4,7 +4,7 @@
  * <cwd>/backlog/ directory. Only the user (native confirm, ctrl+p toggle) or the
  * /plan-guard command can exit; the model has no unilateral way out.
  */
-import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const STORE_KEY = "plan-guard";
@@ -42,6 +42,50 @@ function insideBacklog(cwd: string, rawPath: unknown): boolean {
 
 function syncStatus(ctx: ExtensionContext): void {
 	ctx.ui.setStatus(STATUS_KEY, enabled ? "PLAN" : undefined);
+}
+
+interface AskQuestionInput {
+	question: string;
+	header?: string;
+	multiSelect?: boolean;
+	options: { label: string; description?: string }[];
+}
+
+type AskResult = { declined: true } | { answer: string | string[] };
+
+function optionLabel(option: { label: string; description?: string }): string {
+	return option.description ? `${option.label} — ${option.description}` : option.label;
+}
+
+/** Render one question via native pi dialogs. Returns { declined } if the user cancels. */
+async function askQuestion(ui: ExtensionUIContext, q: AskQuestionInput): Promise<AskResult> {
+	const title = q.header ?? q.question;
+	if (!q.multiSelect) {
+		const choice = await ui.select(title, [...q.options.map(optionLabel), "Other…"]);
+		if (choice === undefined) return { declined: true };
+		if (choice === "Other…") {
+			const custom = await ui.input(q.question, "Type your answer…");
+			if (custom === undefined) return { declined: true };
+			return { answer: custom };
+		}
+		return { answer: choice };
+	}
+	const picks: string[] = [];
+	let remaining = q.options.map(optionLabel);
+	for (;;) {
+		const choice = await ui.select(title, [...remaining, "Other…", "Done"]);
+		if (choice === undefined) return { declined: true };
+		if (choice === "Done") break;
+		if (choice === "Other…") {
+			const custom = await ui.input(q.question, "Type your answer…");
+			if (custom === undefined) return { declined: true };
+			picks.push(custom);
+		} else {
+			picks.push(choice);
+			remaining = remaining.filter((label) => label !== choice);
+		}
+	}
+	return { answer: picks };
 }
 
 export default function planGuard(pi: ExtensionAPI): void {
@@ -97,6 +141,46 @@ export default function planGuard(pi: ExtensionAPI): void {
 				content: [{ type: "text", text: "The user declined to exit plan mode. Keep planning and write only under backlog/." }],
 				details: { enabled },
 			};
+		},
+	});
+
+	pi.registerTool({
+		name: "ask",
+		label: "Ask the user questions",
+		description: "Show the user one or more multiple-choice questions via native dialogs and return the answers.",
+		promptSnippet: "ask: ask the user questions before continuing",
+		promptGuidelines: [
+			"Use ask when you need structured input from the user (choice prompt with options). Never show options the user could not answer.",
+		],
+		parameters: Type.Object({
+			questions: Type.Array(
+				Type.Object({
+					question: Type.String(),
+					header: Type.Optional(Type.String()),
+					multiSelect: Type.Optional(Type.Boolean()),
+					options: Type.Array(
+						Type.Object({ label: Type.String(), description: Type.Optional(Type.String()) }),
+						{ minItems: 2, maxItems: 4 }
+					),
+				}),
+				{ minItems: 1, maxItems: 4 }
+			),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			if (!ctx.hasUI) {
+				return { content: [{ type: "text", text: "No interactive UI; ask in prose." }], details: { ui: false } };
+			}
+			const answers: Record<string, string | string[]> = {};
+			const blocks: string[] = [];
+			for (const q of params.questions) {
+				const result = await askQuestion(ctx.ui, q);
+				if ("declined" in result) {
+					return { content: [{ type: "text", text: "The user declined." }], details: { answers, declined: true } };
+				}
+				answers[q.question] = result.answer;
+				blocks.push(`Q: ${q.question}\nA: ${Array.isArray(result.answer) ? result.answer.join(", ") : result.answer}`);
+			}
+			return { content: [{ type: "text", text: blocks.join("\n") }], details: { answers } };
 		},
 	});
 

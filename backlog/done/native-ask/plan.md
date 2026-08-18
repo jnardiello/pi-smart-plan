@@ -22,19 +22,19 @@ Manual (user, after /reload): an `ask` call; Escape declines without killing the
 
 ## Tasks
 
-- [ ] T1: register `ask` in index.ts
+- [x] T1: register `ask` in index.ts
   deps: []
   owns: [index.ts]
   done: tsc -p /tmp/plan-guard-tsconfig/tsconfig-smart-plan.json → exit 0
-- [ ] T2: point the plan skill at `ask`
+- [x] T2: point the plan skill at `ask`
   deps: []
   owns: [skills/plan/SKILL.md]
   done: rg -n 'ask_user_question' skills/plan/SKILL.md → no matches
-- [ ] T3: document `ask` in README
+- [x] T3: document `ask` in README
   deps: []
   owns: [README.md]
   done: rg -n '`ask`' README.md → ≥1
-- [ ] T4: root verification of DoD commands
+- [x] T4: root verification of DoD commands
   deps: [T1, T2, T3]
   owns: []
   done: the three DoD commands above all green
