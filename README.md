@@ -12,6 +12,8 @@ Plan mode with a mechanical write guard, plus a goal-scoped workflow that execut
 ## Install
 
 ```
+pi install npm:@jnardiello/pi-smart-plan
+# or from git:
 pi install git:github.com/jnardiello/pi-smart-plan
 ```
 
