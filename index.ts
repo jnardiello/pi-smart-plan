@@ -1,45 +1,47 @@
 /**
  * pi-smart-plan — read-only plan mode for pi.
- * While active, edit/write are blocked unless the target path resolves inside the
- * <cwd>/backlog/ directory. Only the user (native confirm, ctrl+p toggle) or the
- * /plan-guard command can exit; the model has no unilateral way out.
+ * While active, file edits/writes are blocked unconditionally (no path exceptions).
+ * The plan is written into the extension-owned external store via plan_save /
+ * journal_append — the model never handles store paths. Only the user (native
+ * confirm, ctrl+p toggle) or the /plan-guard command can exit; the model has no
+ * unilateral way out.
  */
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { runAskForm } from "./src/ask-form.ts";
 import { planUserMessage } from "./src/prompts.ts";
+import { savePlan, appendJournal, recall, completeGoal, PlanStoreValidationError } from "./src/plan-store.ts";
 
 const STORE_KEY = "plan-guard";
 const STATUS_KEY = "plan-guard";
-const ALLOWED_SEGMENT = "backlog";
+const MESSAGE_TYPE = "smart-plan";
+const FALLBACK_GOAL = "goal da definire";
 const BLOCK_REASON =
-	"Plan mode is active — you may only write backlog/<goal>/plan.md and " +
-	"backlog/<goal>/journal.md. Keep planning, or call plan_exit (user confirmation required).";
+	"Plan mode is active — file edits are disabled. Write the plan via plan_save and " +
+	"journal_append; repo changes wait until you exit plan mode (plan_exit, user confirmation required).";
+
+/** Error text for a failed store tool. Validation errors (safe, no paths) are
+ * forwarded verbatim; anything else (fs errors with absolute store paths embedded)
+ * maps to a generic message so store locations never leak to the model. */
+function safeError(operation: string, error: unknown): string {
+	const message = error instanceof PlanStoreValidationError ? error.message : "plan store I/O error";
+	return `${operation} failed: ${message}`;
+}
 
 let enabled = false;
 
-/** Absolute, normalized path. Built-ins strip a leading "@" before resolving paths. */
-function absolutize(cwd: string, raw: string): string {
-	const stripped = raw.startsWith("@") ? raw.slice(1) : raw;
-	const joined = stripped.startsWith("/") ? stripped : `${cwd}/${stripped}`;
-	const parts: string[] = [];
-	for (const segment of joined.split("/")) {
-		if (segment === "" || segment === ".") continue;
-		if (segment === "..") {
-			parts.pop();
-			continue;
-		}
-		parts.push(segment);
+/** Deliver a plan request as a custom message: full workflow content goes to the LLM,
+ * the TUI shows only the single-line renderer. Idle → trigger a turn immediately;
+ * busy → queue as a non-interrupting followUp. */
+function sendPlan(pi: ExtensionAPI, ctx: ExtensionContext, args: string): void {
+	const message = planUserMessage(args);
+	const goal = args.trim();
+	if (ctx.isIdle()) {
+		pi.sendMessage({ customType: MESSAGE_TYPE, content: message, display: true, details: { goal } }, { triggerTurn: true });
+	} else {
+		pi.sendMessage({ customType: MESSAGE_TYPE, content: message, display: true, details: { goal } }, { deliverAs: "followUp" });
 	}
-	return parts.join("/");
-}
-
-/** True when the resolved absolute path is inside "<resolved cwd>/backlog/". */
-function insideBacklog(cwd: string, rawPath: unknown): boolean {
-	if (typeof rawPath !== "string") return false;
-	const resolvedPath = absolutize(cwd, rawPath);
-	const cwdBacklog = absolutize(cwd, ALLOWED_SEGMENT); // <resolved cwd>/backlog
-	return resolvedPath === cwdBacklog || resolvedPath.startsWith(cwdBacklog + "/");
 }
 
 function syncStatus(ctx: ExtensionContext): void {
@@ -54,20 +56,28 @@ export default function planGuard(pi: ExtensionAPI): void {
 		ctx.ui.notify(note, type);
 	}
 
+	pi.registerMessageRenderer(MESSAGE_TYPE, (message, { outputPad }, theme) => {
+		const goal = (message.details as { goal?: string } | undefined)?.goal?.trim();
+		const label = `/plan — ${goal ? goal : FALLBACK_GOAL}`;
+		const box = new Box(outputPad, 1, (t) => theme.bg("customMessageBg", t));
+		box.addChild(new Text(theme.fg("customMessageText", label), 0, 0));
+		return box;
+	});
+
 	pi.registerTool({
 		name: "plan_enter",
 		label: "Enter plan mode",
-		description: "Activate plan mode: edits/writes outside backlog/ are blocked until the user confirms exit.",
-		promptSnippet: "plan_enter: enter read-only plan mode (only backlog/ may be written)",
-		promptGuidelines: ["Use plan_enter to start planning; during plan mode write only plan.md / journal.md under backlog/<goal>/."],
+		description: "Activate plan mode: file edits/writes are blocked until the user confirms exit.",
+		promptSnippet: "plan_enter: enter read-only plan mode (write only via plan_save/journal_append)",
+		promptGuidelines: ["Use plan_enter to start planning; during plan mode write only via plan_save / journal_append into the external plan store."],
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			if (enabled) {
 				return { content: [{ type: "text", text: "Plan mode is already active." }], details: { enabled } };
 			}
-			set(ctx, true, "Plan mode ON — writes are restricted to backlog/.", "warning");
+			set(ctx, true, "Plan mode ON — file edits disabled; write the plan via plan_save.", "warning");
 			return {
-				content: [{ type: "text", text: "Plan mode active. You may only write backlog/<goal>/plan.md and backlog/<goal>/journal.md." }],
+				content: [{ type: "text", text: "Plan mode active. File edits are disabled; write the plan via plan_save and journal_append." }],
 				details: { enabled },
 			};
 		},
@@ -96,7 +106,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 				return { content: [{ type: "text", text: "Plan mode exited." }], details: { enabled } };
 			}
 			return {
-				content: [{ type: "text", text: "The user declined to exit plan mode. Keep planning and write only under backlog/." }],
+				content: [{ type: "text", text: "The user declined to exit plan mode. Keep planning; file edits stay disabled until plan_exit." }],
 				details: { enabled },
 			};
 		},
@@ -147,20 +157,96 @@ export default function planGuard(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerTool({
+		name: "plan_save",
+		label: "Save plan",
+		description: "Write (overwrite) plan.md for a goal in the external plan store.",
+		promptSnippet: "plan_save: persist the approved plan for a goal",
+		promptGuidelines: ["Use plan_save to write the plan; the store lives outside the repo — never reference its paths."],
+		parameters: Type.Object({
+			goal: Type.String(),
+			content: Type.String(),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			try {
+				savePlan(ctx.cwd, params.goal, params.content);
+				return { content: [{ type: "text", text: `Plan saved for ${params.goal}.` }], details: { goal: params.goal } };
+			} catch (error) {
+				return { content: [{ type: "text", text: safeError("plan_save", error) }], details: {}, isError: true };
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "journal_append",
+		label: "Append journal",
+		description: "Append timestamped lines to journal.md for a goal in the external plan store.",
+		promptSnippet: "journal_append: record decisions/events in the goal journal",
+		promptGuidelines: ["Use journal_append to record decisions, deviations, and events; journal is append-only. Never reference store paths."],
+		parameters: Type.Object({
+			goal: Type.String(),
+			lines: Type.String(),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			try {
+				appendJournal(ctx.cwd, params.goal, params.lines);
+				return { content: [{ type: "text", text: `Journal updated for ${params.goal}.` }], details: { goal: params.goal } };
+			} catch (error) {
+				return { content: [{ type: "text", text: safeError("journal_append", error) }], details: {}, isError: true };
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "plan_recall",
+		label: "Recall plans",
+		description: "Search the external plan store for this repo's goals; returns content (plan + journal tail).",
+		promptSnippet: "plan_recall: retrieve prior plan/journal content for this repo",
+		promptGuidelines: ["Use plan_recall when the user asks about prior planned work on a topic; return the retrieved content, not a path."],
+		parameters: Type.Object({
+			query: Type.Optional(Type.String()),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			try {
+				const text = recall(ctx.cwd, params.query);
+				return { content: [{ type: "text", text }], details: {} };
+			} catch (error) {
+				return { content: [{ type: "text", text: safeError("plan_recall", error) }], details: {}, isError: true };
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "plan_complete",
+		label: "Complete goal",
+		description: "Move a goal to the completed section of the external plan store.",
+		promptSnippet: "plan_complete: mark a goal done (moves it to done/)",
+		promptGuidelines: ["Use plan_complete only after all DoD checks pass; re-opening a goal happens automatically on the next plan_save."],
+		parameters: Type.Object({
+			goal: Type.String(),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			try {
+				const completed = completeGoal(ctx.cwd, params.goal);
+				return {
+					content: [{ type: "text", text: completed ? `Goal ${params.goal} completed.` : `No active goal ${params.goal}.` }],
+					details: { goal: params.goal, completed },
+				};
+			} catch (error) {
+				return { content: [{ type: "text", text: safeError("plan_complete", error) }], details: {}, isError: true };
+			}
+		},
+	});
+
 	pi.registerCommand("plan", {
 		description: "Goal-scoped planning: /plan <goal>",
 		handler: async (args, ctx) => {
 			// First-class entry point: the user typed the command, so activating the
 			// guard needs no further confirmation.
 			if (!enabled) {
-				set(ctx, true, "Plan mode ON — writes are restricted to backlog/.", "warning");
+				set(ctx, true, "Plan mode ON — file edits disabled; write the plan via plan_save.", "warning");
 			}
-			const message = planUserMessage(args);
-			if (ctx.isIdle()) {
-				pi.sendUserMessage(message);
-			} else {
-				pi.sendUserMessage(message, { deliverAs: "followUp" });
-			}
+			sendPlan(pi, ctx, args);
 		},
 	});
 
@@ -177,7 +263,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 					ctx.ui.notify("Plan mode is already ON.", "info");
 					return;
 				}
-				set(ctx, true, "Plan mode ON — writes are restricted to backlog/.", "warning");
+				set(ctx, true, "Plan mode ON — file edits disabled; write the plan via plan_save.", "warning");
 				return;
 			}
 			if (action === "off") {
@@ -202,19 +288,17 @@ export default function planGuard(pi: ExtensionAPI): void {
 				set(ctx, false, "Plan mode OFF — edits/writes re-enabled.", "info");
 				return;
 			}
-			set(ctx, true, "Plan mode ON — writes are restricted to backlog/.", "warning");
-			const message = planUserMessage("");
-			if (ctx.isIdle()) pi.sendUserMessage(message);
-			else pi.sendUserMessage(message, { deliverAs: "followUp" });
+			set(ctx, true, "Plan mode ON — file edits disabled; write the plan via plan_save.", "warning");
+			sendPlan(pi, ctx, "");
 		},
 	});
 
-	// Block mutating tool calls while plan mode is active.
+	// Block mutating tool calls while plan mode is active — unconditionally, no
+	// path exceptions: the plan is written via plan_save/journal_append instead.
 	// bash is deliberately NOT blocked (accepted residual risk per brief).
 	pi.on("tool_call", async (event, ctx) => {
 		if (!enabled) return undefined;
 		if (!isToolCallEventType("edit", event) && !isToolCallEventType("write", event)) return undefined;
-		if (insideBacklog(ctx.cwd, event.input.path)) return undefined;
 		return { block: true, reason: BLOCK_REASON };
 	});
 

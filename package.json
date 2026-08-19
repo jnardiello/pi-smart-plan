@@ -1,7 +1,7 @@
 {
   "name": "pi-smart-plan",
   "version": "0.1.0",
-  "description": "Read-only plan mode for pi: /plan <goal> dispatches the bundled plan skill, and edits/writes are blocked outside backlog/ until the user confirms exit",
+  "description": "Plan mode for pi: file edits are blocked while planning; plans and journals live in an extension-owned store outside the repo",
   "type": "module",
   "keywords": [
     "pi-package",

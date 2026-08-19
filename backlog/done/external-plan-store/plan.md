@@ -45,19 +45,19 @@ Manual: /reload in pi — /plan writes plan via plan_save into ~/.pi/agent/smart
 
 ## Tasks
 
-- [ ] T1: Plan store module + tool implementations
+- [x] T1: Plan store module + tool implementations
   deps: []
   owns: [src/plan-store.ts]
   done: bun build --no-bundle src/plan-store.ts passes; exports store paths + save/append/recall/complete functions
-- [ ] T2: Workflow prompt rewrite (external store, explicit recall, one-commit policy, worker path rule)
+- [x] T2: Workflow prompt rewrite (external store, explicit recall, one-commit policy, worker path rule)
   deps: []
   owns: [src/prompts.ts]
   done: bun build --no-bundle src/prompts.ts passes; no mention of backlog/ as artifact location; tool names match T1 signatures pinned above
-- [ ] T3: Wire tools + simplify guard in index.ts
+- [x] T3: Wire tools + simplify guard in index.ts
   deps: [T1]
   owns: [index.ts]
   done: bun build --no-bundle index.ts passes; plan_save/journal_append/plan_recall/plan_complete registered; tool_call handler blocks edit/write unconditionally in plan mode; absolutize/insideBacklog removed
-- [ ] T4: README update (usage, storage location, recall, commit policy)
+- [x] T4: README update (usage, storage location, recall, commit policy)
   deps: [T2, T3]
   owns: [README.md]
   done: README describes external store + new tools; no stale backlog/ artifact docs
