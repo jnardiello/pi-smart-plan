@@ -1,25 +1,66 @@
 /**
  * pi-smart-plan — read-only plan mode for pi.
- * While active, file edits/writes are blocked unconditionally (no path exceptions).
- * The plan is written into the extension-owned external store via plan_save /
- * journal_append — the model never handles store paths. Only the user (native
- * confirm, ctrl+p toggle) or the /plan-guard command can exit; the model has no
- * unilateral way out.
+ *
+ * Plan mode is OWNER-ONLY: it can be engaged exclusively by the user
+ * (shift+tab toggle, /plan, /plan-guard on, --plan flag). The model has no
+ * tool to activate it and no unilateral way out — plan_exit always requires
+ * an affirmative user confirmation through the native dialog.
+ *
+ * While active the session is truly read-only:
+ * - edit/write are REMOVED from the active tool set (the model cannot see them);
+ * - bash is restricted to a read-only allowlist (src/bash-guard.ts);
+ * - state-mutating tools from other extensions (subagent spawn, chrome
+ *   interaction) are removed and additionally blocked as a backstop;
+ * - the only write path is the extension-owned external store via
+ *   plan_save / journal_append / plan_complete — the model never handles
+ *   store paths.
+ *
+ * The plan is written into the external store via plan_save / journal_append.
+ * ctrl+p sends a short goal-elicitation prompt; the full goal workflow is
+ * injected only by /plan.
  */
+import { execFileSync } from "node:child_process";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { runAskForm } from "./src/ask-form.ts";
-import { planUserMessage } from "./src/prompts.ts";
-import { savePlan, appendJournal, recall, completeGoal, PlanStoreValidationError } from "./src/plan-store.ts";
+import { GLOBAL_CONSTRAINTS, PHASE_PROMPTS, planBootstrapMessage } from "./src/prompts.ts";
+import { PHASES, type Phase } from "./src/plan-validate.ts";
+import { isReadOnlyCommand } from "./src/bash-guard.ts";
+import { savePlan, appendJournal, recall, completeGoal, currentPhase, getDoD, goalSummaries, nextTasks, updateTaskStatus, PlanStoreValidationError } from "./src/plan-store.ts";
 
 const STORE_KEY = "plan-guard";
 const STATUS_KEY = "plan-guard";
 const MESSAGE_TYPE = "smart-plan";
-const FALLBACK_GOAL = "goal da definire";
-const BLOCK_REASON =
-	"Plan mode is active — file edits are disabled. Write the plan via plan_save and " +
-	"journal_append; repo changes wait until you exit plan mode (plan_exit, user confirmation required).";
+const BASH_BLOCK_REASON =
+	"Plan mode is active — bash is limited to read-only commands (ls, rg, cat, git status/diff/log, …). " +
+	"Persist plans via plan_save / journal_append; repo changes wait until the user exits plan mode (plan_exit).";
+
+/** While plan mode is on the session is DEFAULT-DENY: only these tools run —
+ * read-only built-ins for codebase investigation, the planning store tools
+ * (the only writes allowed, into the external plans folder), and web research
+ * for understanding the problem. Everything else — write built-ins,
+ * subagents, chrome, unknown or future third-party tools — is blocked.
+ * Extend this set deliberately if a specific tool is ever needed. */
+const PLAN_MODE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
+	"read",
+	"bash",
+	"grep",
+	"find",
+	"ls",
+	"ask_smart_plan",
+	"plan_exit",
+	"plan_save",
+	"journal_append",
+	"plan_recall",
+	"plan_complete",
+	"plan_next",
+	"plan_task_update",
+	"web_search",
+	"source_check",
+	"fetch_content",
+	"get_search_content",
+]);
 
 /** Error text for a failed store tool. Validation errors (safe, no paths) are
  * forwarded verbatim; anything else (fs errors with absolute store paths embedded)
@@ -31,16 +72,15 @@ function safeError(operation: string, error: unknown): string {
 
 let enabled = false;
 
-/** Deliver a plan request as a custom message: full workflow content goes to the LLM,
- * the TUI shows only the single-line renderer. Idle → trigger a turn immediately;
+/** Deliver a plan request as a custom message: content goes to the LLM, the
+ * TUI shows only the single-line renderer. Idle → trigger a turn immediately;
  * busy → queue as a non-interrupting followUp. */
-function sendPlan(pi: ExtensionAPI, ctx: ExtensionContext, args: string): void {
-	const message = planUserMessage(args);
-	const goal = args.trim();
+function sendPlan(pi: ExtensionAPI, ctx: ExtensionContext, content: string, goal: string, source: "command" | "shortcut"): void {
+	const payload = { customType: MESSAGE_TYPE, content, display: true, details: { goal, source } };
 	if (ctx.isIdle()) {
-		pi.sendMessage({ customType: MESSAGE_TYPE, content: message, display: true, details: { goal } }, { triggerTurn: true });
+		pi.sendMessage(payload, { triggerTurn: true });
 	} else {
-		pi.sendMessage({ customType: MESSAGE_TYPE, content: message, display: true, details: { goal } }, { deliverAs: "followUp" });
+		pi.sendMessage(payload, { deliverAs: "followUp" });
 	}
 }
 
@@ -48,39 +88,114 @@ function syncStatus(ctx: ExtensionContext): void {
 	ctx.ui.setStatus(STATUS_KEY, enabled ? "PLAN" : undefined);
 }
 
+const WIDGET_KEY = "smart-plan";
+
+/** Heat ramp for the phase bar: starts neutral gray, warms up to vivid
+ * orange as the plan approaches completion (fixed xterm-256 hues, deliberately
+ * theme-independent). Transparency effect: upcoming cells show their future
+ * hue at low density (░░), reached ones burn at full density (██). */
+const PHASE_HEAT: Record<Phase, number> = {
+	discovery: 243, // neutral gray
+	hld: 137, // muted brown-orange
+	decompose: 179, // tan-orange
+	ablate: 172, // dark orange
+	present: 208, // orange
+	execute: 214, // bright orange
+};
+
+const RESET = "\x1b[0m";
+const heatFg = (code: number) => `\x1b[38;5;${code}m`;
+
+/** Mini-pixel bar: one double-width cell per phase in its heat color.
+ * Reached phases render as bright ██ (current = bold), upcoming as ░░ in the
+ * same hue — the full gradient is always visible, position always readable. */
+function buildHeatBar(current: Phase | null): string {
+	const currentIdx = current === null ? PHASES.length : PHASES.indexOf(current);
+	const cells = PHASES.map((phase, i) => {
+		const color = heatFg(PHASE_HEAT[phase]);
+		if (i < currentIdx) return `${color}██${RESET}`;
+		if (i === currentIdx) return `\x1b[1m${color}██${RESET}`;
+		return `${color}░░${RESET}`;
+	}).join("");
+	return `${heatFg(240)}▐${RESET}${cells}${heatFg(240)}▌${RESET}`;
+}
+
+/** Live task tracking (Codex update_plan parity): goals, phase, progress and
+ * ready frontier rendered as a TUI widget while plan mode is active. */
+/** Live state-machine view (Codex update_plan parity): themed phase pipeline
+ * plus per-goal progress and ready frontier, rendered above the editor. */
+function refreshWidget(ctx: ExtensionContext): void {
+	if (!enabled) {
+		ctx.ui.setWidget(WIDGET_KEY, undefined);
+		return;
+	}
+	ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => {
+		const lines: string[] = [];
+		const current = currentPhase(ctx.cwd, true)?.phase ?? "discovery";
+		lines.push(theme.fg("accent", theme.bold("◈ PLAN MODE")) + theme.fg("muted", " · read-only"));
+		lines.push(`${buildHeatBar(current)}  ${theme.fg("accent", theme.bold(current))}`);
+		const goals = goalSummaries(ctx.cwd, enabled);
+		for (const goal of goals) lines.push(theme.fg("muted", `  ${goal}`));
+		if (current === "discovery" && goals.length === 0) {
+			lines.push(theme.fg("muted", "  → tell me what you want to design together"));
+		}
+		return { render: () => lines, invalidate: () => {} };
+	});
+}
+
+/** Progressive disclosure: inject ONLY the current phase's instructions (+
+ * global constraints). While the guard is off, keep the execute block alive
+ * while an approved goal is still in flight (execution/delivery). */
+function planInjection(cwd: string): string | undefined {
+	if (enabled) {
+		const current = currentPhase(cwd, true);
+		const phase = current?.phase ?? "discovery";
+		return `${GLOBAL_CONSTRAINTS}\n\n${PHASE_PROMPTS[phase]}`;
+	}
+	const current = currentPhase(cwd, false);
+	if (current?.phase === "execute") return `${GLOBAL_CONSTRAINTS}\n\n${PHASE_PROMPTS.execute}`;
+	return undefined;
+}
+
 export default function planGuard(pi: ExtensionAPI): void {
+	/** Active-tool snapshot taken on first engagement, restored on exit. */
+	let toolsBeforePlanMode: string[] | undefined;
+
+	pi.registerFlag("plan", {
+		description: "Start with the read-only plan guard engaged",
+		type: "boolean",
+		default: false,
+	});
+
+	function restrictTools(): void {
+		if (toolsBeforePlanMode === undefined) toolsBeforePlanMode = pi.getActiveTools();
+		pi.setActiveTools(toolsBeforePlanMode.filter((name) => PLAN_MODE_ALLOWED_TOOLS.has(name)));
+	}
+
+	function restoreTools(): void {
+		if (toolsBeforePlanMode !== undefined) pi.setActiveTools(toolsBeforePlanMode);
+		toolsBeforePlanMode = undefined;
+	}
+
 	function set(ctx: ExtensionContext, next: boolean, note: string, type: "info" | "warning"): void {
 		enabled = next;
-		pi.appendEntry(STORE_KEY, { enabled }); // persist for reload/resume
+		if (next) restrictTools();
+		else restoreTools();
+		pi.appendEntry(STORE_KEY, { enabled, tools: toolsBeforePlanMode }); // persist for reload/resume
 		syncStatus(ctx);
+		refreshWidget(ctx);
 		ctx.ui.notify(note, type);
 	}
 
 	pi.registerMessageRenderer(MESSAGE_TYPE, (message, { outputPad }, theme) => {
-		const goal = (message.details as { goal?: string } | undefined)?.goal?.trim();
-		const label = `/plan — ${goal ? goal : FALLBACK_GOAL}`;
+		const details = message.details as { goal?: string; source?: string } | undefined;
+		const goal = details?.goal?.trim();
+		const title = theme.fg("customMessageLabel", "◈ PLAN") + theme.fg("customMessageText", goal ? ` — ${goal}` : " — goal da definire");
+		const sub = theme.fg("muted", "read-only ") + buildHeatBar(null);
 		const box = new Box(outputPad, 1, (t) => theme.bg("customMessageBg", t));
-		box.addChild(new Text(theme.fg("customMessageText", label), 0, 0));
+		box.addChild(new Text(title, 0, 0));
+		box.addChild(new Text(sub, 0, 0));
 		return box;
-	});
-
-	pi.registerTool({
-		name: "plan_enter",
-		label: "Enter plan mode",
-		description: "Activate plan mode: file edits/writes are blocked until the user confirms exit.",
-		promptSnippet: "plan_enter: enter read-only plan mode (write only via plan_save/journal_append)",
-		promptGuidelines: ["Use plan_enter to start planning; during plan mode write only via plan_save / journal_append into the external plan store."],
-		parameters: Type.Object({}),
-		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			if (enabled) {
-				return { content: [{ type: "text", text: "Plan mode is already active." }], details: { enabled } };
-			}
-			set(ctx, true, "Plan mode ON — file edits disabled; write the plan via plan_save.", "warning");
-			return {
-				content: [{ type: "text", text: "Plan mode active. File edits are disabled; write the plan via plan_save and journal_append." }],
-				details: { enabled },
-			};
-		},
 	});
 
 	pi.registerTool({
@@ -100,9 +215,13 @@ export default function planGuard(pi: ExtensionAPI): void {
 					details: { enabled },
 				};
 			}
-			const confirmed = await ctx.ui.confirm("Plan mode", "Exit plan mode?");
+			const summaries = goalSummaries(ctx.cwd, enabled);
+			const context = summaries.length > 0
+				? `\n\nActive plans:\n${summaries.map((line) => `• ${line}`).join("\n")}`
+				: "\n\nWARNING: no plan has been saved yet (nothing written via plan_save).";
+			const confirmed = await ctx.ui.confirm("Plan mode", `Exit plan mode?${context}`);
 			if (confirmed) {
-				set(ctx, false, "Plan mode OFF — edits/writes re-enabled.", "info");
+				set(ctx, false, "◈ Plan mode OFF — full access restored.", "info");
 				return { content: [{ type: "text", text: "Plan mode exited." }], details: { enabled } };
 			}
 			return {
@@ -143,6 +262,12 @@ export default function planGuard(pi: ExtensionAPI): void {
 				}),
 				{ minItems: 1, maxItems: 4 }
 			),
+			releasePlanGuardOnAnswer: Type.Optional(
+				Type.Boolean({
+					description:
+						"Set true ONLY on the final plan-approval form: when the user answers without declining, the read-only plan guard is released in the same interaction (single approval gate).",
+				}),
+			),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			if (!ctx.hasUI) {
@@ -153,6 +278,11 @@ export default function planGuard(pi: ExtensionAPI): void {
 				return { content: [{ type: "text", text: "The user declined." }], details: { answers: {}, declined: true } };
 			}
 			const blocks = Object.entries(result.answers).map(([q, a]) => `Q: ${q}\nA: ${Array.isArray(a) ? a.join(", ") : a}`);
+			if (params.releasePlanGuardOnAnswer === true && enabled) {
+				set(ctx, false, "Plan approved — plan mode OFF, full access restored.", "info");
+				blocks.push("(Approved: plan mode released — proceed with execution.)");
+				return { content: [{ type: "text", text: blocks.join("\n") }], details: { answers: result.answers, released: true } };
+			}
 			return { content: [{ type: "text", text: blocks.join("\n") }], details: { answers: result.answers } };
 		},
 	});
@@ -170,6 +300,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			try {
 				savePlan(ctx.cwd, params.goal, params.content);
+				refreshWidget(ctx);
 				return { content: [{ type: "text", text: `Plan saved for ${params.goal}.` }], details: { goal: params.goal } };
 			} catch (error) {
 				return { content: [{ type: "text", text: safeError("plan_save", error) }], details: {}, isError: true };
@@ -217,6 +348,85 @@ export default function planGuard(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
+		name: "plan_next",
+		label: "Ready frontier",
+		description: "Mechanically computed ready frontier for a goal: pending tasks whose deps are all done.",
+		promptSnippet: "plan_next: get the ready frontier (tasks dispatchable now)",
+		promptGuidelines: ["Use plan_next during execution instead of eyeballing deps from memory."],
+		parameters: Type.Object({
+			goal: Type.String(),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			try {
+				const text = nextTasks(ctx.cwd, params.goal);
+				return { content: [{ type: "text", text }], details: { goal: params.goal } };
+			} catch (error) {
+				return { content: [{ type: "text", text: safeError("plan_next", error) }], details: {}, isError: true };
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "plan_task_update",
+		label: "Update task status",
+		description: "Set a task's status (pending | in_progress | blocked | done) server-side. Claiming (in_progress) snapshots dirty files; closing (done) verifies the delta stayed inside the task's owns and enforces dependency discipline.",
+		promptSnippet: "plan_task_update: set task status; done is owns- and dep-checked",
+		promptGuidelines: [
+			"Claim a task with in_progress before working on it; close it with done only after running its done check yourself. Never rewrite the whole plan via plan_save just to tick a checkbox.",
+		],
+		parameters: Type.Object({
+			goal: Type.String(),
+			taskId: Type.String(),
+			status: Type.String({ description: "pending | in_progress | blocked | done" }),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			try {
+				const text = updateTaskStatus(ctx.cwd, params.goal, params.taskId, params.status);
+				refreshWidget(ctx);
+				return { content: [{ type: "text", text }], details: { goal: params.goal, taskId: params.taskId, status: params.status } };
+			} catch (error) {
+				return { content: [{ type: "text", text: safeError("plan_task_update", error) }], details: {}, isError: true };
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "plan_verify",
+		label: "Verify DoD",
+		description: "Run every DoD command of a goal's plan and report pass/fail — the mechanical delivery gate.",
+		promptSnippet: "plan_verify: run all DoD commands of a goal and report pass/fail",
+		promptGuidelines: ["Run plan_verify before claiming delivery; every command must pass."],
+		parameters: Type.Object({
+			goal: Type.String(),
+			timeoutMs: Type.Optional(Type.Number({ description: "Per-command timeout in ms (default 120000)" })),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			try {
+				const commands = getDoD(ctx.cwd, params.goal);
+				if (commands.length === 0) {
+					return { content: [{ type: "text", text: `No DoD commands in the plan for "${params.goal}".` }], details: { passed: false } };
+				}
+				const timeout = params.timeoutMs ?? 120_000;
+				const results = commands.map((command) => {
+					const started = Date.now();
+					try {
+						execFileSync("sh", ["-c", command], { cwd: ctx.cwd, encoding: "utf8", timeout, stdio: ["ignore", "pipe", "pipe"] });
+						return { command, ok: true, ms: Date.now() - started };
+					} catch {
+						return { command, ok: false, ms: Date.now() - started };
+					}
+				});
+				const failed = results.filter((r) => !r.ok).length;
+				const body = results.map((r) => `${r.ok ? "PASS" : "FAIL"} (${r.ms}ms) ${r.command}`).join("\n");
+				const headline = failed === 0 ? `DoD: ${results.length}/${results.length} PASS.` : `DoD FAILED: ${failed}/${results.length} failed.`;
+				return { content: [{ type: "text", text: `${headline}\n${body}` }], details: { passed: failed === 0 }, isError: failed > 0 };
+			} catch (error) {
+				return { content: [{ type: "text", text: safeError("plan_verify", error) }], details: {}, isError: true };
+			}
+		},
+	});
+
+	pi.registerTool({
 		name: "plan_complete",
 		label: "Complete goal",
 		description: "Move a goal to the completed section of the external plan store.",
@@ -228,6 +438,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			try {
 				const completed = completeGoal(ctx.cwd, params.goal);
+				refreshWidget(ctx);
 				return {
 					content: [{ type: "text", text: completed ? `Goal ${params.goal} completed.` : `No active goal ${params.goal}.` }],
 					details: { goal: params.goal, completed },
@@ -246,7 +457,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 			if (!enabled) {
 				set(ctx, true, "Plan mode ON — file edits disabled; write the plan via plan_save.", "warning");
 			}
-			sendPlan(pi, ctx, args);
+			sendPlan(pi, ctx, planBootstrapMessage(args), args.trim(), "command");
 		},
 	});
 
@@ -271,48 +482,86 @@ export default function planGuard(pi: ExtensionAPI): void {
 					ctx.ui.notify("Plan mode is already OFF.", "info");
 					return;
 				}
-				set(ctx, false, "Plan mode OFF — edits/writes re-enabled.", "info");
+				set(ctx, false, "◈ Plan mode OFF — full access restored.", "info");
 				return;
 			}
 			ctx.ui.notify("Usage: /plan-guard status|on|off", "warning");
 		},
 	});
 
-	// Persistent ctrl+p shortcut: user-only ON/OFF toggle. ctrl+p is normally
-	// bound to the built-in model cycle; freeing it may require remapping
-	// (app.model.cycleForward to ctrl+alt+p) — see README.
-	pi.registerShortcut("ctrl+p", {
-		description: "Toggle plan mode",
-		handler: async (ctx) => {
-			if (enabled) {
-				set(ctx, false, "Plan mode OFF — edits/writes re-enabled.", "info");
-				return;
-			}
-			set(ctx, true, "Plan mode ON — file edits disabled; write the plan via plan_save.", "warning");
-			sendPlan(pi, ctx, "");
+	pi.registerCommand("plan-status", {
+		description: "Dump plan-mode state (goals, phases, frontier) — no LLM turn",
+		handler: async (_args, ctx) => {
+			const lines = goalSummaries(ctx.cwd, enabled);
+			ctx.ui.notify(lines.length > 0 ? lines.join("\n") : "No active goals.", enabled ? "warning" : "info");
 		},
 	});
 
-	// Block mutating tool calls while plan mode is active — unconditionally, no
-	// path exceptions: the plan is written via plan_save/journal_append instead.
-	// bash is deliberately NOT blocked (accepted residual risk per brief).
-	pi.on("tool_call", async (event, ctx) => {
-		if (!enabled) return undefined;
-		if (!isToolCallEventType("edit", event) && !isToolCallEventType("write", event)) return undefined;
-		return { block: true, reason: BLOCK_REASON };
+	// Owner-only toggle on shift+tab (Claude Code motor memory). Requires the
+	// built-in app.thinking.cycle to be remapped away from shift+tab in
+	// keybindings.json (see README). ON: engage the read-only guard and notify
+	// the owner — NO LLM turn fires. The planning conversation starts when the
+	// owner states what to design together; per-phase instructions reach the
+	// model via before_agent_start injection.
+	pi.registerShortcut("shift+tab", {
+		description: "Toggle plan mode (read-only)",
+		handler: async (ctx) => {
+			if (enabled) {
+				set(ctx, false, "◈ Plan mode OFF — full access restored.", "info");
+				return;
+			}
+			set(ctx, true, "◈ Plan mode ON — read-only. Tell the model what you want to design together.", "warning");
+		},
 	});
 
-	// Restore guard state on startup/reload/new/resume/fork.
+	// Read-only enforcement while plan mode is active.
+	// 1) bash: allowlist of read-only commands (src/bash-guard.ts).
+	// 2) DEFAULT-DENY for everything else: only reading, planning-store tools
+	//    and web research run — unknown or third-party tools are blocked too.
+	pi.on("tool_call", async (event, _ctx) => {
+		if (!enabled) return undefined;
+		if (isToolCallEventType("bash", event)) {
+			if (!isReadOnlyCommand(event.input.command)) {
+				return { block: true, reason: BASH_BLOCK_REASON };
+			}
+			return undefined;
+		}
+		if (!PLAN_MODE_ALLOWED_TOOLS.has(event.toolName)) {
+			return {
+				block: true,
+				reason: `Plan mode is active — "${event.toolName}" is not available while planning (only reading, planning-store tools and web research are allowed). Repo changes wait until the user exits plan mode.`,
+			};
+		}
+		return undefined;
+	});
+
+	// Per-turn phase injection: only the current state-machine phase (+ global
+	// constraints) reaches the model. Appended to the system prompt, not stored.
+	pi.on("before_agent_start", async (event, ctx) => {
+		const injection = planInjection(ctx.cwd);
+		if (!injection) return undefined;
+		return { systemPrompt: `${event.systemPrompt}\n\n${injection}` };
+	});
+
+	// Restore guard state on startup/reload/new/resume/fork, re-applying the
+	// restricted tool set when the guard was active.
 	pi.on("session_start", async (_event, ctx) => {
-		let restored = false;
+		let restored: { enabled: boolean; tools?: string[] } | undefined;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom" && entry.customType === STORE_KEY) {
-				const data = entry.data as { enabled?: boolean } | undefined;
-				enabled = data?.enabled ?? false;
-				restored = true;
+				const data = entry.data as { enabled?: boolean; tools?: string[] } | undefined;
+				restored = { enabled: data?.enabled ?? false, tools: data?.tools };
 			}
 		}
-		if (!restored) enabled = false;
+		enabled = restored?.enabled ?? false;
+		toolsBeforePlanMode = restored?.tools;
+		if (!enabled && pi.getFlag("plan") === true) {
+			enabled = true;
+			pi.appendEntry(STORE_KEY, { enabled, tools: undefined });
+		}
+		if (enabled) restrictTools();
+		else restoreTools();
 		syncStatus(ctx);
+		refreshWidget(ctx);
 	});
 }

@@ -1,33 +1,48 @@
 /**
- * External plan store (T1).
- * Plan/journal artifacts move out of the repo into the extension-owned store at
- * <agentDir>/smart-plan/<repo-slug>/<goal>/. The model never touches those paths:
- * all I/O goes through the pure store functions below, and they return CONTENT,
- * never bare paths for the model to re-read.
+ * External plan store.
+ * Plan/journal artifacts live in an EPHEMERAL extension-owned store under the
+ * system temp dir: <tmpdir>/pi-smart-plan-<uid>/<repo-slug>/<goal>/ — per-user
+ * (uid suffix + 0700 dirs, plans never world-readable) and wiped on reboot by
+ * design. The model never touches those paths: all I/O goes through the pure
+ * store functions below, and they return CONTENT, never bare paths.
  *
  * Position = state: active goals live at <root>/<goal>, completed ones at
  * <root>/done/<goal>. Re-opening a goal moves it back to active.
  */
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, readdirSync, statSync, appendFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import {
+	applyWavesSection,
+	buildWavesSection,
+	computeLayers,
+	flipCheckbox,
+	inferPhase,
+	ownsCovers,
+	parseDoD,
+	parseTasks,
+	readyFrontier,
+	validatePhaseTransition,
+	validateTaskGraph,
+	validationErrorMessage,
+	type Phase,
+} from "./plan-validate.ts";
 
 const GOAL_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const JOURNAL_TAIL = 20;
-
-/** Agent config directory (e.g. ~/.pi/agent) — exported by the peer package. */
-function agentDirOf(): string {
-	return getAgentDir();
-}
+const STORE_DIR_MODE = 0o700;
 
 /** Absolute cwd with `/` → `-`, pi sessions-dir style: /Users/x/repo → -Users-x-repo. */
 function repoSlug(cwd: string): string {
 	return resolve(cwd).replaceAll("/", "-");
 }
 
-/** Root of this repo's store: <agentDir>/smart-plan/<repo-slug>. */
+/** Root of this repo's store: <tmpdir>/pi-smart-plan-<uid>/<repo-slug>.
+ * Per-user subdir keeps plans private even though the parent is world-writable. */
 function storeRoot(cwd: string): string {
-	return join(agentDirOf(), "smart-plan", repoSlug(cwd));
+	const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+	return join(tmpdir(), `pi-smart-plan-${uid}`, repoSlug(cwd));
 }
 
 function activeGoalDir(cwd: string, goal: string): string {
@@ -80,23 +95,38 @@ function ensureActiveGoalDir(cwd: string, goal: string): string {
 	if (!existsSync(goalDir)) {
 		const doneDir = doneGoalDir(cwd, goal);
 		if (existsSync(doneDir)) {
-			mkdirSync(storeRoot(cwd), { recursive: true });
+			mkdirSync(storeRoot(cwd), { recursive: true, mode: STORE_DIR_MODE });
 			renameSync(doneDir, goalDir);
 		}
 	}
-	mkdirSync(goalDir, { recursive: true });
+	mkdirSync(goalDir, { recursive: true, mode: STORE_DIR_MODE });
 	return goalDir;
 }
 
 /**
- * Write (overwrite) <root>/<goal>/plan.md. If the goal currently exists only in
- * done/, move it back to active first (re-opening). Returns the written path for
- * internal log/notify use — never surface it to the model.
+ * Write (overwrite) <root>/<goal>/plan.md after mechanical DAG validation:
+ * duplicate IDs, unknown deps, cycles, overlapping owns within a wave and
+ * missing done checks reject the save with a precise error. The derived
+ * `## Review — waves` section is regenerated server-side on every save.
+ * Plans without a `## Tasks` block are treated as drafts and saved as-is.
+ * If the goal currently exists only in done/, move it back to active first.
+ * Returns the written path for internal log/notify use — never surface it to
+ * the model.
  */
 export function savePlan(cwd: string, goal: string, content: string): string {
+	validateGoal(goal);
+	let finalContent = content;
+	const tasks = parseTasks(content);
+	if (tasks.length > 0) {
+		const issues = validateTaskGraph(tasks);
+		if (issues.length > 0) throw new PlanStoreValidationError(validationErrorMessage(issues));
+		finalContent = applyWavesSection(content, buildWavesSection(tasks, computeLayers(tasks)!));
+	}
+	const phaseIssues = validatePhaseTransition(content);
+	if (phaseIssues.length > 0) throw new PlanStoreValidationError(validationErrorMessage(phaseIssues));
 	const goalDir = ensureActiveGoalDir(cwd, goal);
 	const planPath = join(goalDir, "plan.md");
-	writeFileSync(planPath, content, "utf8");
+	writeFileSync(planPath, finalContent, "utf8");
 	return planPath;
 }
 
@@ -223,7 +253,170 @@ export function completeGoal(cwd: string, goal: string): boolean {
 	const goalDir = activeGoalDir(cwd, goal);
 	if (!existsSync(goalDir)) return false;
 	const doneDir = doneGoalDir(cwd, goal);
-	mkdirSync(join(storeRoot(cwd), "done"), { recursive: true });
+	mkdirSync(join(storeRoot(cwd), "done"), { recursive: true, mode: STORE_DIR_MODE });
 	renameSync(goalDir, doneDir);
 	return true;
+}
+
+/** True when at least one active goal in this repo's store has a plan.md. */
+export function hasActivePlans(cwd: string): boolean {
+	const root = storeRoot(cwd);
+	for (const name of listGoalDirs(root)) {
+		if (name !== "done" && existsSync(join(root, name, "plan.md"))) return true;
+	}
+	return false;
+}
+
+/** One summary line per active goal: phase, progress, ready frontier (widget/dialog). */
+export function goalSummaries(cwd: string, guardOn: boolean): string[] {
+	const root = storeRoot(cwd);
+	const lines: string[] = [];
+	for (const name of listGoalDirs(root)) {
+		if (name === "done") continue;
+		const content = readOptional(join(root, name, "plan.md"));
+		const tasks = parseTasks(content);
+		if (tasks.length === 0) {
+			lines.push(`${name} [${inferPhase(content, guardOn)}] (no tasks yet)`);
+			continue;
+		}
+		const done = tasks.filter((t) => t.done).length;
+		const ready = readyFrontier(tasks).map((t) => t.id).join(", ");
+		lines.push(`${name} [${inferPhase(content, guardOn)}] ${done}/${tasks.length} done · ready: ${ready || "—"}`);
+	}
+	return lines;
+}
+
+/** First active goal with its inferred phase — drives per-turn prompt injection.
+ * Ties broken by most-recently-modified plan.md (the goal being worked on). */
+export function currentPhase(cwd: string, guardOn: boolean): { goal: string; phase: Phase } | null {
+	const root = storeRoot(cwd);
+	let best: { goal: string; phase: Phase; mtime: number } | null = null;
+	for (const name of listGoalDirs(root)) {
+		if (name === "done") continue;
+		const planPath = join(root, name, "plan.md");
+		const content = readOptional(planPath);
+		if (!content) continue;
+		let mtime = 0;
+		try {
+			mtime = statSync(planPath).mtimeMs;
+		} catch {
+			mtime = 0;
+		}
+		if (!best || mtime > best.mtime) best = { goal: name, phase: inferPhase(content, guardOn), mtime };
+	}
+	return best ? { goal: best.goal, phase: best.phase } : null;
+}
+
+/**
+ * Mechanically computed ready frontier for a goal: pending tasks whose deps
+ * are all done. Returns CONTENT (never paths); throws when no plan exists.
+ */
+export function nextTasks(cwd: string, goal: string): string {
+	validateGoal(goal);
+	const content = readOptional(join(activeGoalDir(cwd, goal), "plan.md"));
+	if (!content) {
+		throw new PlanStoreValidationError(`no active plan for goal "${goal}" — save one first via plan_save`);
+	}
+	const tasks = parseTasks(content);
+	if (tasks.length === 0) {
+		return `Plan for "${goal}" has no Tasks section yet.`;
+	}
+	const doneCount = tasks.filter((t) => t.done).length;
+	const frontier = readyFrontier(tasks);
+	const lines = [`Goal "${goal}": ${doneCount}/${tasks.length} tasks done.`];
+	if (frontier.length === 0) {
+		lines.push("Ready frontier: none — every remaining task has unmet deps (re-plan or close deps first).");
+	} else {
+		lines.push(`Ready frontier (${frontier.length}) — dispatch these now:`);
+		for (const task of frontier) {
+			lines.push(`- ${task.id}: ${task.title}`);
+			lines.push(`  owns: [${task.owns.join(", ")}]`);
+		}
+	}
+	return lines.join("\n");
+}
+
+// --- task lifecycle: owns verification + dependency discipline ---------------
+
+/** Dirty files (modified + untracked, renames split) relative to repo root.
+ * Returns null outside a git worktree or when git fails — callers degrade to
+ * the weaker all-owns check. */
+function gitDirtyFiles(cwd: string): string[] | null {
+	try {
+		if (!existsSync(join(cwd, ".git"))) return null;
+		const out = execFileSync("git", ["status", "--porcelain"], {
+			cwd,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		return out
+			.split("\n")
+			.filter((line) => line.trim().length > 0)
+			.flatMap((line) => line.slice(3).trim().replace(/^"|"$/g, "").split(" -> "));
+	} catch {
+		return null;
+	}
+}
+
+/** Dirty-file baseline captured when a task is claimed (in_progress). */
+const taskSnapshots = new Map<string, string[]>();
+const snapshotKey = (goal: string, taskId: string) => `${goal}::${taskId}`;
+
+/**
+ * Set a task's status server-side. Claiming (in_progress) snapshots dirty
+ * files; closing (done) verifies the delta stayed inside the task's owns and
+ * that every dependency is already done. The checkbox is flipped surgically —
+ * the rest of the plan is never touched. Transitions are journaled.
+ */
+export function updateTaskStatus(cwd: string, goal: string, taskId: string, status: string): string {
+	validateGoal(goal);
+	if (!(status === "pending" || status === "in_progress" || status === "blocked" || status === "done")) {
+		throw new PlanStoreValidationError(`invalid status "${status}" — use pending | in_progress | blocked | done`);
+	}
+	const planPath = join(activeGoalDir(cwd, goal), "plan.md");
+	const content = readOptional(planPath);
+	if (!content) throw new PlanStoreValidationError(`no active plan for goal "${goal}" — save one first via plan_save`);
+	const tasks = parseTasks(content);
+	const task = tasks.find((t) => t.id === taskId);
+	if (!task) throw new PlanStoreValidationError(`unknown task "${taskId}" in goal "${goal}"`);
+
+	if (status === "done") {
+		const undone = task.deps.filter((dep) => tasks.find((t) => t.id === dep)?.done !== true);
+		if (undone.length > 0) {
+			throw new PlanStoreValidationError(`task ${taskId}: dependencies not done yet (${undone.join(", ")}) — close them first`);
+		}
+		const dirty = gitDirtyFiles(cwd);
+		if (dirty) {
+			const base = taskSnapshots.get(snapshotKey(goal, taskId));
+			const scope = base ? dirty.filter((file) => !base.includes(file)) : dirty;
+			const checkAgainst = base ? task.owns : tasks.flatMap((t) => t.owns);
+			const violations = scope.filter((file) => !ownsCovers(file, checkAgainst));
+			if (violations.length > 0) {
+				taskSnapshots.delete(snapshotKey(goal, taskId));
+				appendJournal(cwd, goal, `task ${taskId} DONE REJECTED — files outside owns: ${violations.join(", ")}`);
+				throw new PlanStoreValidationError(
+					`task ${taskId}: changed files outside its owns [${checkAgainst.join(", ")}]: ${violations.join(", ")} — fix or escalate to the owner`,
+				);
+			}
+		}
+	}
+
+	const updated = flipCheckbox(content, taskId, status === "done");
+	if (updated === null) throw new PlanStoreValidationError(`task line for "${taskId}" not found in the plan`);
+	writeFileSync(planPath, updated, "utf8");
+
+	if (status === "in_progress") {
+		taskSnapshots.set(snapshotKey(goal, taskId), gitDirtyFiles(cwd) ?? []);
+	} else {
+		taskSnapshots.delete(snapshotKey(goal, taskId));
+	}
+	if (status === "done") appendJournal(cwd, goal, `task ${taskId} closed (owns verified)`);
+	return `Task ${taskId} → ${status}${status === "done" ? " (owns + deps verified)" : ""}.`;
+}
+
+/** Executable DoD commands of a goal's plan (mechanical delivery gate). */
+export function getDoD(cwd: string, goal: string): string[] {
+	const content = readOptional(join(activeGoalDir(cwd, goal), "plan.md"));
+	if (!content) throw new PlanStoreValidationError(`no active plan for goal "${goal}" — save one first via plan_save`);
+	return parseDoD(content);
 }
