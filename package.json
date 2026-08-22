@@ -1,6 +1,6 @@
 {
   "name": "@jnardiello/pi-smart-plan",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Plan mode for pi: file edits are blocked while planning; plans and journals live in an extension-owned store outside the repo",
   "type": "module",
   "keywords": [

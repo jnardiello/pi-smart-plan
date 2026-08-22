@@ -10,8 +10,68 @@ Plan mode with a mechanical write guard, plus a goal-scoped workflow that execut
 - **True read-only** while planning — **default-deny**: only reading (read/grep/find/ls), bash restricted to read-only commands, web research and the planning-store tools run while planning; everything else (write built-ins, subagents, chrome, unknown or future third-party tools) is blocked. The only writes go into the plans folder via the store tools (`plan_save`, `journal_append`, `plan_complete`).
 - **Goal-scoped workflow** writes a DAG-as-data plan into an ephemeral extension-owned store under the system temp dir, derives execution waves, runs up to 4 parallel subagents per wave with disjoint `owns` and one writer per checkout, then a single delivery commit. One active goal per session, zero footprint in the repo.
 - **Mechanical DAG validation**: `plan_save` rejects plans with duplicate task IDs, unknown deps, dependency cycles, overlapping `owns` within the same wave, or missing `done:` checks — and regenerates the derived waves section server-side. `plan_next` returns the ready frontier (tasks dispatchable now) computed from the graph, never eyeballed.
-- **A six-phase plan state machine, inspired by Claude Code and Codex but stricter**: `discovery` (read-only co-design: goal elicitation, heavy recon, product/tech decisions logged) → `hld` (High-Level Design confirmed by the user BEFORE any task is written) → `decompose` (DAG tasks, mechanically validated) → `ablate` (self-review for simplicity: cut edge-case handling, keep the main case minimal) → `present` (final approval form) → `execute`. Two explicit user gates; small goals may fuse them into one, declared explicitly. Rejections route by reason (scope → discovery, structure → ablate, wrong HLD → hld). Only the approval click releases the guard.
+- **A six-phase plan state machine, inspired by Claude Code and Codex but stricter**: `discovery` (read-only co-design: goal elicitation, targeted recon, product/tech decisions logged — plus an opt-in challenge deep-dive that questions your implementation ideas) → `hld` (High-Level Design confirmed by the user BEFORE any task is written) → `decompose` (DAG tasks, mechanically validated) → `ablate` (self-review for simplicity: cut edge-case handling, keep the main case minimal) → `present` (final approval form) → `execute`. Two explicit user gates; small goals may fuse them into one, declared explicitly. Rejections route by reason (scope → discovery, structure → ablate, wrong HLD → hld). Only the approval click releases the guard.
 - **Progressive disclosure**: instead of one giant workflow prompt, each turn injects only the current phase's instructions plus global constraints — the model always sees the contract of the moment.
+
+## Lifecycle: the six phases
+
+Plan mode runs as a small state machine. Every turn injects only the instructions of the current phase, so the agent always knows exactly what it should be doing. The widget's heat bar shows where you are, and an optional `phase:` line in the plan tracks it explicitly.
+
+```
+discovery → hld → decompose → ablate → present → execute
+```
+
+> **True in every phase**: default-deny tool policy (only reading, planning tools and web research); writes only into the plans folder; activation is owner-only; the guard releases only through your approval click on a fully visible plan. EVERY question arrives as an interactive form — never buried in prose.
+
+### 1. `discovery` — understand before designing
+
+- **Entered by**: activating plan mode (`shift+tab`, `/plan`, `/plan-guard on`, `--plan`).
+- **What happens**: the agent first asks what you want to design together — it never explores without a goal. Once you state one: targeted recon scoped to that goal, product and technical decision support (questions arrive as ask_smart_plan forms with options and consequences). Every settled decision is logged in `## Decisions` with its rationale. When scope + DoD are settled you choose: **challenge your implementation ideas first** — one provocative question per turn until everything is clear (or go straight ahead).
+- **You'll see**: the widget on ● discovery, the agent's questions, zero code changes.
+- **Expected from you**: state the goal, answer, decide.
+- **Exits when**: scope + DoD are settled — the agent posts an HLD summary and asks you to confirm it.
+
+### 2. `hld` — the High-Level Design gate
+
+- **Entered by**: the HLD summary being posted.
+- **What happens**: nothing until you decide. The agent waits.
+- **You'll see**: an HLD summary and a Confirm HLD / Revise form. This is NOT the final approval — the guard stays on.
+- **Expected from you**: confirm, or ask for changes.
+- **Exits when**: confirmed — `## HLD` (dated) and `## Decisions` are written into the plan, phase moves to decompose, the transition lands in the journal. A re-confirmed revision journals what changed versus the previous version.
+
+### 3. `decompose` — from design to task DAG
+
+- **Entered by**: your HLD confirmation.
+- **What happens**: the agent turns the HLD into tasks (`deps` / `owns` / `done` per task). plan_save validates mechanically — unique IDs, resolvable acyclic deps, disjoint owns within a wave, done checks present — and regenerates the waves section server-side.
+- **You'll see**: the widget on ● decompose; precise errors if the DAG is invalid.
+- **Expected from you**: nothing (internal phase), though you can watch the plan evolve.
+- **Exits when**: the DAG is complete.
+
+### 4. `ablate` — silent simplification review
+
+- **Entered by**: DAG completion.
+- **What happens**: the agent re-reads the plan as its harshest critic — cuts edge-case handling, merges vanity tasks, simplifies wording until a human can skim it. SILENT: no chat narration; all I/O through store tools. Every cut is journaled.
+- **You'll see**: almost nothing — the widget on ● ablate and journal entries accumulating.
+- **Expected from you**: nothing.
+- **Exits when**: the plan is minimal and readable.
+
+### 5. `present` — final approval
+
+- **Entered by**: distillation complete.
+- **What happens**, strictly in order: (1) a one-line recap of what ablation cut; (2) the human abstraction — what changes, why it matters, priorities; (3) the complete technical plan: Scope, Non-goals, DoD commands, every task with deps/owns/done, derived waves. Then the approval form opens (Approve / Edit / Reject-with-reason).
+- **You'll see**: the entire plan in chat before any approval UI exists.
+- **Expected from you**: read, then decide.
+- **Exits when**: Approve releases the guard and moves to execute. Reject routes by reason — scope change → discovery, structure/complexity → ablate, wrong HLD → hld. Edit → revised and re-presented.
+
+### 6. `execute` — implementation
+
+- **Entered by**: your approval click — the only thing that ever releases the guard.
+- **What happens**: the ready frontier comes from plan_next; up to 4 parallel workers per wave with disjoint owns; every task is verified in the root (done check plus git-backed owns delta check) before being marked done; journal entries per event; re-entry questions when scope changes mid-flight.
+- **You'll see**: per-task progress in the widget, worker activity, journal entries.
+- **Expected from you**: answers to re-entry questions, final review.
+- **Exits when**: all DoD commands pass via plan_verify — then plan_complete and exactly ONE delivery commit (only if you asked for it).
+
+> **Small goals**: the agent may propose fusing the HLD gate into the final approval — declared explicitly in the form, and the complete task list is still posted in chat BEFORE anything is approved.
 
 ## Install
 

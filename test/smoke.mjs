@@ -102,8 +102,14 @@ for (const h of ["tool_call", "before_agent_start", "session_start"])
 	check(`handler ${h}`, registered.handlers.has(h));
 
 console.log("\n[state machine prompt structure]");
-check("6 phases defined", Object.keys(PHASE_PROMPTS).length === 6 && PHASES.length === 6);
+check("global mission: deliverable is THE PLAN", GLOBAL_CONSTRAINTS.includes("MISSION (global)") && GLOBAL_CONSTRAINTS.includes("never code, never setup"));
+check("every question goes through forms (global rule)", GLOBAL_CONSTRAINTS.includes("EVERY question to the owner goes through an ") );
+check("all phases declare LOCAL MISSION", Object.values(PHASE_PROMPTS).filter((p) => p.includes("LOCAL MISSION:")).length === 6);
+check("discovery offers the idea-challenge loop", PHASE_PROMPTS.discovery.includes("CHALLENGE their implementation ideas") && PHASE_PROMPTS.discovery.includes("ONE challenge per turn") && PHASE_PROMPTS.discovery.includes("Check in every ~5 challenges"));
+check("challenge ALWAYS via form + naming ban", PHASE_PROMPTS.discovery.includes("ALWAYS delivered as an ask_smart_plan form — never open prose") && PHASE_PROMPTS.discovery.includes('NEVER call it "grill"'));
+check("discovery fences external charters", PHASE_PROMPTS.discovery.includes("FENCE:") && PHASE_PROMPTS.discovery.includes("build documents, not software"));
 check("discovery is goal-gated", PHASE_PROMPTS.discovery.includes("goal-gated") && PHASE_PROMPTS.discovery.includes("No goal stated yet? Your ONLY move is to ask"));
+check("discovery questions go through forms, never prose", PHASE_PROMPTS.discovery.includes("EVERY question to the owner goes through an") && PHASE_PROMPTS.discovery.includes("No prose questions, ever"));
 check("ablate is SILENT", PHASE_PROMPTS.ablate.includes("SILENT internal review") && PHASE_PROMPTS.ablate.includes("do not narrate"));
 check("present: chat BEFORE approval form", PHASE_PROMPTS.present.includes("SHOW THE PLAN FIRST") && PHASE_PROMPTS.present.indexOf("SHOW THE PLAN FIRST") < PHASE_PROMPTS.present.indexOf("releasePlanGuardOnAnswer"));
 check("present: human abstraction first + fusion rule", PHASE_PROMPTS.present.includes("HUMAN ABSTRACTION") && PHASE_PROMPTS.present.includes("fused small-goal gates"));

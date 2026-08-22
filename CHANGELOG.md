@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.0
+
+- **Two-level missions**: global — in plan mode the only deliverable is THE PLAN, never code/setup/implementation promises; local — every phase declares the deliverables the NEXT phase consumes, which is also its exit criterion.
+- **Every question is a form**: any question to the owner — decisions, clarifications, even the opening "what do we design?" — arrives as an ask_smart_plan form with candidate directions and a custom-note escape. No prose questions, ever.
+- **Challenge deep-dive inside discovery (opt-in)**: when scope + DoD are settled, a form asks whether the owner wants to CHALLENGE their implementation ideas before the HLD. If accepted: ONE challenge per turn, ALWAYS delivered as an ask_smart_plan form (never open prose) — rotating across assumptions, alternatives, failure modes, contrarian positions; check-ins every ~5 challenges, stop always available, insights journaled; the wrap-up synthesis feeds the HLD. The word "grill" is banned from all output (rounds are labeled "Challenge #N").
+- **Charter fence in discovery**: proposals/charters pasted from other contexts are input to understand and challenge — never a work order; the agent builds documents, not software.
+
+## 0.6.1
+
+- **Lifecycle documentation**: the README now documents all six phases in detail — entry conditions, what happens, what you'll see, what's expected from you, exit conditions and written artifacts — plus the always-true rules (default-deny tools, owner-only activation, approval-gated guard release).
+- **Product questions arrive as forms**: during discovery, product/decision questions go through ask_smart_plan forms (briefing + options + consequences) instead of prose; plain text is reserved for simple factual clarifications.
+
 ## 0.6.0
 
 - **Plan mode is default-deny**: only reading (read/grep/find/ls), bash restricted to read-only commands, web research and the planning-store tools run while planning — everything else, including unknown or future third-party tools, is blocked. Writes happen exclusively in the plans folder via the store tools.

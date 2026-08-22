@@ -96,11 +96,11 @@ const WIDGET_KEY = "smart-plan";
  * hue at low density (░░), reached ones burn at full density (██). */
 const PHASE_HEAT: Record<Phase, number> = {
 	discovery: 243, // neutral gray
-	hld: 137, // muted brown-orange
-	decompose: 179, // tan-orange
-	ablate: 172, // dark orange
-	present: 208, // orange
-	execute: 214, // bright orange
+	hld: 179, // tan-orange
+	decompose: 172, // dark orange
+	ablate: 208, // orange
+	present: 214, // bright orange
+	execute: 202, // deep orange-red
 };
 
 const RESET = "\x1b[0m";
