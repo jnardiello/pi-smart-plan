@@ -15,7 +15,7 @@ export type AskQuestion = {
 
 export type AskFormResult = { declined: true } | { answers: Record<string, string | string[]> };
 
-const CUSTOM = "None of these — I'll specify";
+const CUSTOM = "None of the above";
 const PREVIEW_MIN = 80;
 
 export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]): Promise<AskFormResult> {
@@ -76,6 +76,10 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 			done({ answers: out });
 		}
 
+		function finishIfReady(): void {
+			if (allAnswered()) finish();
+		}
+
 		function allAnswered(): boolean {
 			return questions.every((q) => answers.has(qKey(q)));
 		}
@@ -97,8 +101,15 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 			if (!q) return;
 			const trimmed = value.trim();
 			if (!trimmed) {
+				// Empty note on the built-in "None of the above": the note is OPTIONAL — accept as-is.
 				editMode = false;
 				editor.setText("");
+				if (q.multiSelect) {
+					multiPicks.set(qKey(q), [CUSTOM]);
+					answers.set(qKey(q), [CUSTOM]);
+				} else {
+					saveSingle(q, CUSTOM);
+				}
 				refresh();
 				return;
 			}
@@ -106,13 +117,13 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 			editor.setText("");
 			if (q.multiSelect) {
 				const picks = multiPicks.get(qKey(q)) ?? [];
-				picks.push(trimmed);
+				picks.push(trimmed.includes(CUSTOM) ? trimmed : `${CUSTOM} — ${trimmed}`);
 				multiPicks.set(qKey(q), picks);
 				answers.set(qKey(q), picks);
 				refresh();
 				return;
 			}
-			saveSingle(q, trimmed);
+			saveSingle(q, trimmed.includes(CUSTOM) ? trimmed : `${CUSTOM} — ${trimmed}`);
 		};
 
 		function handleInput(data: string): void {
@@ -182,11 +193,16 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 
 			if (q.multiSelect && matchesKey(data, Key.space)) {
 				const opt = opts[optionIndex];
-				if (!opt || opt.custom) return;
-				const picks = multiPicks.get(qKey(q)) ?? [];
-				const i = picks.indexOf(opt.label);
-				if (i >= 0) picks.splice(i, 1);
-				else picks.push(opt.label);
+				if (!opt) return;
+				let picks = [...(multiPicks.get(qKey(q)) ?? [])];
+				if (opt.custom) {
+					picks = picks.includes(CUSTOM) ? [] : [CUSTOM];
+				} else {
+					picks = picks.filter((pick) => pick !== CUSTOM);
+					const i = picks.indexOf(opt.label);
+					if (i >= 0) picks.splice(i, 1);
+					else picks.push(opt.label);
+				}
 				multiPicks.set(qKey(q), picks);
 				if (picks.length) answers.set(qKey(q), picks);
 				else answers.delete(qKey(q));
@@ -198,7 +214,11 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 				if (q.multiSelect) {
 					const opt = opts[optionIndex];
 					if (opt?.custom) {
-						editMode = true;
+						let picks = (multiPicks.get(qKey(q)) ?? []).filter((pick) => pick !== CUSTOM);
+						picks.push(CUSTOM);
+						multiPicks.set(qKey(q), picks);
+						answers.set(qKey(q), picks);
+						finishIfReady();
 						refresh();
 						return;
 					}
@@ -325,7 +345,7 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 				else addPrefixed(briefing, "", theme.fg("dim", "No extra consequences written for this option."), paneWidth);
 			} else if (selected?.custom) {
 				briefing.push("");
-				addPrefixed(briefing, "", theme.fg("muted", "Write your own answer in the note editor."), paneWidth);
+				addPrefixed(briefing, "", theme.fg("muted", "Optional note — submit an empty note to accept \u201cNone of the above\u201d as-is."), paneWidth);
 			}
 			const viewport = Math.max(body.length, 6);
 			const maxScroll = Math.max(0, briefing.length - viewport);

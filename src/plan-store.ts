@@ -13,6 +13,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, readdir
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
 	applyWavesSection,
 	buildWavesSection,
@@ -412,6 +413,93 @@ export function updateTaskStatus(cwd: string, goal: string, taskId: string, stat
 	}
 	if (status === "done") appendJournal(cwd, goal, `task ${taskId} closed (owns verified)`);
 	return `Task ${taskId} → ${status}${status === "done" ? " (owns + deps verified)" : ""}.`;
+}
+
+/** Raw text of a top-level ## section (without the heading), or "". */
+function extractSection(content: string, name: string): string {
+	const lines = content.split("\n");
+	const start = lines.findIndex((line) => new RegExp(`^##\\s+${name}\\b`).test(line));
+	if (start === -1) return "";
+	const out: string[] = [];
+	for (let i = start + 1; i < lines.length; i++) {
+		if (/^##\s/.test(lines[i])) break;
+		out.push(lines[i]);
+	}
+	return out.join("\n").trim();
+}
+
+export interface PlanViewTask {
+	id: string;
+	title: string;
+	done: boolean;
+	deps: string[];
+	owns: string[];
+	ready: boolean;
+	wave: number;
+}
+
+export interface PlanView {
+	goal: string;
+	scope: string;
+	nonGoals: string;
+	dod: string[];
+	hld: string;
+	tasks: PlanViewTask[];
+	doneCount: number;
+	total: number;
+	frontier: string[];
+}
+
+/** Structured snapshot of a goal's plan for UI rendering (live panel). */
+export function getPlanView(cwd: string, goal: string): PlanView | null {
+	const content = readOptional(join(activeGoalDir(cwd, goal), "plan.md"));
+	if (!content) return null;
+	const tasks = parseTasks(content);
+	const layers = computeLayers(tasks) ?? new Map();
+	const doneIds = new Set(tasks.filter((t) => t.done).map((t) => t.id));
+	const viewTasks: PlanViewTask[] = tasks.map((t) => ({
+		id: t.id,
+		title: t.title,
+		done: t.done,
+		deps: t.deps,
+		owns: t.owns,
+		ready: !t.done && t.deps.every((dep) => doneIds.has(dep)),
+		wave: layers.get(t.id) ?? 0,
+	}));
+	const firstLine = (name: string) => extractSection(content, name).split("\n")[0] ?? "";
+	return {
+		goal,
+		scope: firstLine("Scope"),
+		nonGoals: extractSection(content, "Non-goals").split("\n").join(" · "),
+		dod: parseDoD(content),
+		hld: extractSection(content, "HLD"),
+		tasks: viewTasks,
+		doneCount: tasks.filter((t) => t.done).length,
+		total: tasks.length,
+		frontier: readyFrontier(tasks).map((t) => t.id),
+	};
+}
+
+/** Durable home of APPROVED plans: <agentDir>/smart-plan/approved/<repo>/<goal>/. */
+function approvedRoot(): string {
+	return join(getAgentDir(), "smart-plan", "approved");
+}
+
+/**
+ * Persist the APPROVED plan to the durable store (survives reboots, unlike the
+ * ephemeral working store). Called only after Gate 1 (owner validated the
+ * contract). Returns the destination path — internal use only.
+ */
+export function persistApproved(cwd: string, goal: string): string {
+	validateGoal(goal);
+	const content = readOptional(join(activeGoalDir(cwd, goal), "plan.md"));
+	if (!content) throw new PlanStoreValidationError(`no active plan for goal "${goal}" — save one first via plan_save`);
+	const destDir = join(approvedRoot(), repoSlug(cwd), goal);
+	mkdirSync(destDir, { recursive: true });
+	const dest = join(destDir, "plan.md");
+	writeFileSync(dest, content, "utf8");
+	appendJournal(cwd, goal, "plan APPROVED by owner and persisted durably");
+	return dest;
 }
 
 /** Executable DoD commands of a goal's plan (mechanical delivery gate). */

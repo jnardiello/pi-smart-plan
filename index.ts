@@ -27,7 +27,7 @@ import { runAskForm } from "./src/ask-form.ts";
 import { GLOBAL_CONSTRAINTS, PHASE_PROMPTS, planBootstrapMessage } from "./src/prompts.ts";
 import { PHASES, type Phase } from "./src/plan-validate.ts";
 import { isReadOnlyCommand } from "./src/bash-guard.ts";
-import { savePlan, appendJournal, recall, completeGoal, currentPhase, getDoD, goalSummaries, nextTasks, updateTaskStatus, PlanStoreValidationError } from "./src/plan-store.ts";
+import { savePlan, appendJournal, recall, completeGoal, currentPhase, getDoD, getPlanView, goalSummaries, nextTasks, persistApproved, updateTaskStatus, PlanStoreValidationError, type PlanView } from "./src/plan-store.ts";
 
 const STORE_KEY = "plan-guard";
 const STATUS_KEY = "plan-guard";
@@ -89,6 +89,39 @@ function syncStatus(ctx: ExtensionContext): void {
 }
 
 const WIDGET_KEY = "smart-plan";
+const PRESENT_ENTRY_KEY = "plan-present";
+let lastCwd: string | undefined;
+function noteCwd(ctx: ExtensionContext): void {
+	lastCwd = ctx.cwd;
+}
+
+/** Themed implementation-plan panel: waves, dependencies and a LIVE checklist
+ * (done ✓ / ready ● / pending ○) that re-reads the store on every redraw. */
+function renderPlanPanel(view: PlanView, theme: { fg: (color: any, text: string) => string; bold: (text: string) => string }): string[] {
+	const R = theme.fg("borderAccent", "▌");
+	const line = (content = "") => `${R}${content ? " " + content : ""}`;
+	const lines: string[] = [];
+	lines.push(line(theme.fg("accent", theme.bold("◈ IMPLEMENTATION PLAN")) + theme.fg("muted", ` — ${view.goal}`)));
+	if (view.hld) lines.push(line(theme.fg("muted", `HLD: ${view.hld}`)));
+	if (view.scope) lines.push(line(theme.fg("text", `SCOPE: ${view.scope}`)));
+	if (view.nonGoals) lines.push(line(theme.fg("text", `NON-GOALS: ${view.nonGoals}`)));
+	if (view.dod.length) lines.push(line(theme.fg("text", `DoD: ${view.dod.join(" && ")}`)));
+	lines.push(line());
+	let wave = 0;
+	for (const task of view.tasks) {
+		if (task.wave !== wave) {
+			wave = task.wave;
+			lines.push(line(theme.fg("muted", theme.bold(`WAVE ${wave}`))));
+		}
+		const mark = task.done ? theme.fg("success", "✓") : task.ready ? theme.fg("accent", "●") : theme.fg("dim", "○");
+		const deps = task.deps.length ? theme.fg("dim", `  ← ${task.deps.join(", ")}`) : "";
+		const title = theme.fg(task.done ? "muted" : "text", `${task.id}  ${task.title}`);
+		lines.push(line(` ${mark} ${title}${deps}`));
+	}
+	lines.push(line());
+	lines.push(line(theme.fg("muted", `✓ ${view.doneCount}/${view.total} done · ready: ${view.frontier.join(", ") || "—"}`)));
+	return lines;
+}
 
 /** Heat ramp for the phase bar: starts neutral gray, warms up to vivid
  * orange as the plan approaches completion (fixed xterm-256 hues, deliberately
@@ -237,7 +270,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 		description: "Show a custom form: tabs, a human briefing pane, and an inline note when no option fits.",
 		promptSnippet: "ask_smart_plan: ask the user questions before continuing",
 		promptGuidelines: [
-			"Use ask_smart_plan for structured user decisions. Always fill detail with a plain-language briefing (context, facts, consequences; no jargon, no assumed prior turns). Fill each option preview with what happens if that option is chosen. Offer a custom note path; never invent an answer.",
+			"Use ask_smart_plan for structured user decisions. Always fill detail with a plain-language briefing (context, facts, consequences; no jargon, no assumed prior turns). Fill each option preview with what happens if that option is chosen. Never invent an answer. Every form automatically ends with a built-in \"None of the above\" option plus optional note — never add your own equivalent option.",
 		],
 		parameters: Type.Object({
 			questions: Type.Array(
@@ -382,6 +415,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			try {
 				const text = updateTaskStatus(ctx.cwd, params.goal, params.taskId, params.status);
+				noteCwd(ctx);
 				refreshWidget(ctx);
 				return { content: [{ type: "text", text }], details: { goal: params.goal, taskId: params.taskId, status: params.status } };
 			} catch (error) {
@@ -422,6 +456,71 @@ export default function planGuard(pi: ExtensionAPI): void {
 				return { content: [{ type: "text", text: `${headline}\n${body}` }], details: { passed: failed === 0 }, isError: failed > 0 };
 			} catch (error) {
 				return { content: [{ type: "text", text: safeError("plan_verify", error) }], details: {}, isError: true };
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "plan_present",
+		label: "Present plan panel",
+		description: "Render the structured implementation-plan panel (waves + live checklist) in the transcript for the owner.",
+		promptSnippet: "plan_present: render the structured plan panel for the owner",
+		promptGuidelines: [
+			"Call plan_present AFTER posting the human abstraction in chat and BEFORE opening the approval form.",
+		],
+		parameters: Type.Object({
+			goal: Type.String(),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			noteCwd(ctx);
+			try {
+				const view = getPlanView(ctx.cwd, params.goal);
+				if (!view) throw new PlanStoreValidationError(`no active plan for goal "${params.goal}" — save one first via plan_save`);
+				pi.appendEntry(PRESENT_ENTRY_KEY, { goal: params.goal });
+				return {
+					content: [{ type: "text", text: "Implementation-plan panel rendered above. Now open the approval form (releasePlanGuardOnAnswer: true) — the full plan is visible to the owner." }],
+					details: { goal: params.goal },
+				};
+			} catch (error) {
+				return { content: [{ type: "text", text: safeError("plan_present", error) }], details: {}, isError: true };
+			}
+		},
+	});
+
+	pi.registerEntryRenderer(PRESENT_ENTRY_KEY, (entry, _opts, theme) => {
+		const goal = (entry.data as { goal?: string } | undefined)?.goal ?? "";
+		const view = lastCwd ? getPlanView(lastCwd, goal) : null;
+		const inner = view ? renderPlanPanel(view, theme) : [theme.fg("dim", "(plan not available)")];
+		return {
+			render(width = 80): string[] {
+				void width;
+				return inner;
+			},
+			invalidate() {},
+		};
+	});
+
+	pi.registerTool({
+		name: "plan_approve",
+		label: "Approve & persist plan",
+		description: "Persist the owner-approved plan to the durable store. Call ONLY after Gate 1 (the owner approved the contract via form).",
+		promptSnippet: "plan_approve: persist the approved plan durably",
+		promptGuidelines: [
+			"Call plan_approve immediately AFTER the Gate 1 approval click and BEFORE opening the Gate 2 authorization form.",
+		],
+		parameters: Type.Object({
+			goal: Type.String(),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			noteCwd(ctx);
+			try {
+				const dest = persistApproved(ctx.cwd, params.goal);
+				return {
+					content: [{ type: "text", text: `Plan approved and persisted durably (${params.goal}). Now open the Gate 2 authorization form.` }],
+					details: { goal: params.goal },
+				};
+			} catch (error) {
+				return { content: [{ type: "text", text: safeError("plan_approve", error) }], details: {}, isError: true };
 			}
 		},
 	});
@@ -538,6 +637,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 	// Per-turn phase injection: only the current state-machine phase (+ global
 	// constraints) reaches the model. Appended to the system prompt, not stored.
 	pi.on("before_agent_start", async (event, ctx) => {
+		noteCwd(ctx);
 		const injection = planInjection(ctx.cwd);
 		if (!injection) return undefined;
 		return { systemPrompt: `${event.systemPrompt}\n\n${injection}` };
@@ -561,6 +661,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 		}
 		if (enabled) restrictTools();
 		else restoreTools();
+		noteCwd(ctx);
 		syncStatus(ctx);
 		refreshWidget(ctx);
 	});

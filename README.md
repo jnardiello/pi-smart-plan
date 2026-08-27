@@ -94,10 +94,12 @@ Then run `/reload` to pick up the extension.
 - `plan_next` — mechanically computed ready frontier for a goal: pending tasks whose deps are all done. Use it during execution instead of eyeballing deps.
 - `plan_complete` — move a goal to the `done/` portion of the store after its DoD passes.
 - `plan_task_update` — set a task's status (`pending | in_progress | blocked | done`). Claiming snapshots dirty files; closing verifies the delta stayed inside the task's `owns` (git-backed) and that dependencies are closed. Checkbox flipped server-side.
+- `plan_task_update` — set a task's status (`pending | in_progress | blocked | done`). Claiming snapshots dirty files; closing verifies the delta stayed inside the task's `owns` (git-backed) and that dependencies are closed. Checkbox flipped server-side.
+- `plan_present` — render the structured implementation panel in the transcript: waves, dependencies and a live checklist for the owner. Call it after the human abstraction, before the approval form.
 - `plan_verify` — run every DoD command of a goal's plan and report pass/fail. The mechanical delivery gate: no delivery claim without a green `plan_verify`.
 - `/plan-status` — zero-token dump of active goals, phases and ready frontier.
 - `shift+tab` — toggle read-only plan mode. Activation only notifies you (no LLM turn): describe what you want to design and the discovery-phase instructions take over; the full `/plan <goal>` command remains available.
-- `ask_smart_plan` tool — custom form, one tab per open decision (never structural categories like "Scope" or "DoD": the agent drafts that contract itself and presents it in the approval briefing). Right pane is a human briefing (`detail`) plus consequences of the highlighted option (`preview`). Long text scrolls with J/K or PgUp/PgDn. "None of these — I'll specify" opens an inline editor. Escape declines the form. Goals with no real fork skip the form entirely. No third-party extension required.
+- `ask_smart_plan` tool — custom form, one tab per open decision (never structural categories like "Scope" or "DoD": the agent drafts that contract itself and presents it in the approval briefing). Right pane is a human briefing (`detail`) plus consequences of the highlighted option (`preview`). Long text scrolls with J/K or PgUp/PgDn. Every form ends with a built-in **"None of the above"** option — selecting it opens an OPTIONAL note (submit empty to accept as-is); in multi-select it is exclusive. Escape declines the form. Goals with no real fork skip the form entirely. No third-party extension required.
 
 `/plan` injects the workflow into the session. This package is a pi extension, not a skill. Start with the guard already engaged via `pi --plan`.
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.0
+
+- **Implementation-plan panel**: at presentation time the agent calls plan_present, which appends a dedicated panel to the transcript — waves, dependencies and a LIVE checklist (✓ done / ● ready / ○ pending) that re-reads the plan on every redraw. Distinct visual style (colored rule) so the final plan stands out from the rest of the chat.
+- **present phase reordered**: ablation recap → human abstraction in chat → structured panel → approval form.
+
+## 0.7.1
+
+- **"None of the above" on every form, always last, with OPTIONAL note**: submitting an empty note now accepts the answer as-is (previously it bounced back to the list); a typed note is appended to the answer. In multi-select it is EXCLUSIVE — selecting it clears the other picks, and picking a real option clears it.
+- The model is told every form automatically ends with this built-in option and must never add its own equivalent.
+
 ## 0.7.0
 
 - **Two-level missions**: global — in plan mode the only deliverable is THE PLAN, never code/setup/implementation promises; local — every phase declares the deliverables the NEXT phase consumes, which is also its exit criterion.

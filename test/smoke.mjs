@@ -16,8 +16,9 @@ import {
 import { inferPhase, parsePhaseLine, PHASES } from "../src/plan-validate.ts";
 import { statSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { runAskForm } from "../src/ask-form.ts";
 
 let failures = 0;
 function check(name, cond) {
@@ -32,8 +33,8 @@ const uid = typeof process.getuid === "function" ? process.getuid() : 0;
 const expectedStore = join(tmpdir(), `pi-smart-plan-${uid}`, CWD.replaceAll("/", "-"));
 
 // ---- mock ExtensionAPI -----------------------------------------------------
-const registered = { tools: new Map(), commands: new Map(), shortcuts: new Map(), renderers: new Map(), handlers: new Map(), flags: new Map() };
-const FULL_TOOLS = ["read", "bash", "edit", "write", "grep", "subagent", "subagent_wait", "chrome_click", "chrome_screenshot", "web_search", "plan_exit", "plan_save", "plan_next", "plan_task_update", "plan_verify", "journal_append", "plan_recall", "plan_complete", "ask_smart_plan"];
+const registered = { tools: new Map(), commands: new Map(), shortcuts: new Map(), renderers: new Map(), handlers: new Map(), flags: new Map(), entries: new Map() };
+const FULL_TOOLS = ["read", "bash", "edit", "write", "grep", "subagent", "subagent_wait", "chrome_click", "chrome_screenshot", "web_search", "plan_exit", "plan_save", "plan_next", "plan_task_update", "plan_present", "plan_verify", "journal_append", "plan_recall", "plan_complete", "ask_smart_plan"];
 let activeTools = [...FULL_TOOLS];
 const sent = [];
 const entries = [];
@@ -49,6 +50,7 @@ const pi = {
 	registerCommand(name, def) { registered.commands.set(name, def); },
 	registerShortcut(key, def) { registered.shortcuts.set(key, def); },
 	registerMessageRenderer(type, fn) { registered.renderers.set(type, fn); },
+	registerEntryRenderer(key, fn) { registered.entries.set(key, fn); },
 	registerFlag(name, def) { registered.flags.set(name, def); },
 	getFlag: (name) => (name === "plan" ? flagValue : undefined),
 	on(event, fn) { registered.handlers.set(event, fn); },
@@ -95,7 +97,7 @@ check("shift+tab shortcut registered", registered.shortcuts.has("shift+tab"));
 check("ctrl+p shortcut dropped", !registered.shortcuts.has("ctrl+p"));
 check("--plan flag registered", registered.flags.has("plan"));
 check("no plan_enter tool (owner-only)", !registered.tools.has("plan_enter"));
-for (const t of ["plan_exit", "plan_next", "plan_task_update", "plan_verify", "ask_smart_plan", "plan_save", "journal_append", "plan_recall", "plan_complete"])
+for (const t of ["plan_exit", "plan_next", "plan_task_update", "plan_present", "plan_approve", "plan_verify", "ask_smart_plan", "plan_save", "journal_append", "plan_recall", "plan_complete"])
 	check(`tool ${t} registered`, registered.tools.has(t));
 check("/plan-status command registered", registered.commands.has("plan-status"));
 for (const h of ["tool_call", "before_agent_start", "session_start"])
@@ -103,6 +105,10 @@ for (const h of ["tool_call", "before_agent_start", "session_start"])
 
 console.log("\n[state machine prompt structure]");
 check("global mission: deliverable is THE PLAN", GLOBAL_CONSTRAINTS.includes("MISSION (global)") && GLOBAL_CONSTRAINTS.includes("never code, never setup"));
+check("visibility rule for background phases", GLOBAL_CONSTRAINTS.includes("VISIBILITY RULE") && GLOBAL_CONSTRAINTS.includes("BRIEF update in chat"));
+check("hld phase: silent drafting + visibility card, no gate", PHASE_PROMPTS.hld.includes("silent background drafting") && PHASE_PROMPTS.hld.includes("SHORT visibility card") && !PHASE_PROMPTS.hld.includes("releasePlanGuardOnAnswer"));
+check("ablate: silent while working, cuts recap at end", PHASE_PROMPTS.ablate.includes("Do not narrate the review WHILE working") && PHASE_PROMPTS.ablate.includes("post a SHORT recap in chat"));
+check("present: full contract + two gates", PHASE_PROMPTS.present.includes("SHOW THE FULL CONTRACT") && PHASE_PROMPTS.present.includes("GATE 1") && PHASE_PROMPTS.present.includes("GATE 2") && PHASE_PROMPTS.present.includes("plan_approve"));
 check("every question goes through forms (global rule)", GLOBAL_CONSTRAINTS.includes("EVERY question to the owner goes through an ") );
 check("all phases declare LOCAL MISSION", Object.values(PHASE_PROMPTS).filter((p) => p.includes("LOCAL MISSION:")).length === 6);
 check("discovery offers the idea-challenge loop", PHASE_PROMPTS.discovery.includes("CHALLENGE their implementation ideas") && PHASE_PROMPTS.discovery.includes("ONE challenge per turn") && PHASE_PROMPTS.discovery.includes("Check in every ~5 challenges"));
@@ -110,10 +116,10 @@ check("challenge ALWAYS via form + naming ban", PHASE_PROMPTS.discovery.includes
 check("discovery fences external charters", PHASE_PROMPTS.discovery.includes("FENCE:") && PHASE_PROMPTS.discovery.includes("build documents, not software"));
 check("discovery is goal-gated", PHASE_PROMPTS.discovery.includes("goal-gated") && PHASE_PROMPTS.discovery.includes("No goal stated yet? Your ONLY move is to ask"));
 check("discovery questions go through forms, never prose", PHASE_PROMPTS.discovery.includes("EVERY question to the owner goes through an") && PHASE_PROMPTS.discovery.includes("No prose questions, ever"));
-check("ablate is SILENT", PHASE_PROMPTS.ablate.includes("SILENT internal review") && PHASE_PROMPTS.ablate.includes("do not narrate"));
-check("present: chat BEFORE approval form", PHASE_PROMPTS.present.includes("SHOW THE PLAN FIRST") && PHASE_PROMPTS.present.indexOf("SHOW THE PLAN FIRST") < PHASE_PROMPTS.present.indexOf("releasePlanGuardOnAnswer"));
-check("present: human abstraction first + fusion rule", PHASE_PROMPTS.present.includes("HUMAN ABSTRACTION") && PHASE_PROMPTS.present.includes("fused small-goal gates"));
-check("ablation recap recovered at presentation", PHASE_PROMPTS.present.includes("recover your ablation journal notes via plan_recall"));
+check("ablate is SILENT", PHASE_PROMPTS.ablate.includes("SILENT internal review") && PHASE_PROMPTS.ablate.includes("Do not narrate the review WHILE working"));
+check("present: chat BEFORE approval form", PHASE_PROMPTS.present.includes("SHOW THE FULL CONTRACT") && PHASE_PROMPTS.present.indexOf("SHOW THE PLAN FIRST") < PHASE_PROMPTS.present.indexOf("releasePlanGuardOnAnswer"));
+check("present: human abstraction first + fusion rule", PHASE_PROMPTS.present.includes("the human abstraction (what changes, why, priorities") && PHASE_PROMPTS.present.includes("Fused small-goal gates"));
+check("ablation recap recovered at presentation", PHASE_PROMPTS.present.includes("ablation-cut recap (via plan_recall)"));
 check("hld revisions journaled", PHASE_PROMPTS.hld.includes("journal what changed versus the previous version"));
 check("global constraints forbid self-toggling", GLOBAL_CONSTRAINTS.includes("You cannot toggle plan mode yourself"));
 
@@ -260,6 +266,24 @@ await registered.shortcuts.get("shift+tab").handler(makeCtx());
 const injExecute = await bas({ systemPrompt: "BASE" }, makeCtx());
 check("guard OFF + pending tasks → execute block", injExecute.systemPrompt.includes("PHASE: execute"));
 
+console.log("\n[C2/C3 — durable persistence + plan_approve]");
+const approvedPath = join(homedir(), ".pi", "agent", "smart-plan", "approved", CWD.replaceAll("/", "-"), "demo", "plan.md");
+const pa = await registered.tools.get("plan_approve").execute("id", { goal: "demo" }, undefined, undefined, makeCtx());
+check("plan_approve persists durably", pa.content[0].text.includes("persisted durably") && statSync(approvedPath).isFile());
+
+console.log("\n[P2 — implementation-plan panel]");
+check("plan-present entry renderer registered", registered.entries.has("plan-present"));
+const pp = await registered.tools.get("plan_present").execute("id", { goal: "demo" }, undefined, undefined, makeCtx());
+check("panel entry appended", entries.some((e) => e.key === "plan-present" && e.data.goal === "demo"));
+check("guidance returned to model", pp.content[0].text.includes("approval form"));
+const renderPanel = registered.entries.get("plan-present");
+const comp = renderPanel({ data: { goal: "demo" } }, {}, fakeTheme);
+const panelText = comp.render(100).join("\n");
+check("panel: title + waves + live checklist", panelText.includes("IMPLEMENTATION PLAN") && panelText.includes("WAVE 1") && panelText.includes("✓ T1") && panelText.includes("● T2") && panelText.includes("1/3 done"));
+updateTaskStatus(CWD, "demo", "T2", "done");
+const panelText2 = renderPanel({ data: { goal: "demo" } }, {}, fakeTheme).render(100).join("\n");
+check("live checklist updates after completion", panelText2.includes("✓ T2") && panelText2.includes("2/3 done"));
+
 console.log("\n[T4 — plan_verify mechanical delivery gate]");
 const pv = await registered.tools.get("plan_verify").execute("id", { goal: "demo" }, undefined, undefined, makeCtx());
 check("DoD echo ok → PASS", pv.content[0].text.includes("1/1 PASS") && pv.isError !== true);
@@ -276,6 +300,55 @@ const ask = await registered.tools.get("ask_smart_plan").execute(
 	undefined, undefined, makeCtx(),
 );
 check("guard released on approval click", ask.details.released === true && ["edit", "write", "subagent"].every((t) => activeTools.includes(t)));
+
+console.log("\n[form UX — None of the above, optional note]");
+{
+	const KEY = { down: "\x1b[B", enter: "\r", space: " " };
+	// single-select: navigate to the trailing custom option, submit an EMPTY note
+	let drive = null;
+	const formCtx = makeCtx();
+	formCtx.ui.custom = (builder) => new Promise((resolve) => {
+		drive = builder({ requestRender() {} }, fakeTheme, {}, resolve);
+	});
+	const formPromise = runAskForm(formCtx, [{ question: "Pick one?", options: [{ label: "Option A", description: "dA", preview: "pA" }, { label: "Option B", preview: "pB" }] }]);
+	drive.handleInput(KEY.down);
+	drive.handleInput(KEY.down); // reach "None of the above"
+	drive.handleInput(KEY.enter); // open optional-note editor
+	drive.handleInput(KEY.enter); // submit EMPTY note → accepted
+	const resEmpty = await formPromise;
+	check("empty note accepts 'None of the above'", resEmpty.answers["Pick one?"] === "None of the above");
+
+	// single-select with a typed note
+	let drive2 = null;
+	const formCtx2 = makeCtx();
+	formCtx2.ui.custom = (builder) => new Promise((resolve) => {
+		drive2 = builder({ requestRender() {} }, fakeTheme, {}, resolve);
+	});
+	const formPromise2 = runAskForm(formCtx2, [{ question: "Pick one?", options: [{ label: "Option A" }, { label: "Option B" }] }]);
+	drive2.handleInput(KEY.down);
+	drive2.handleInput(KEY.down);
+	drive2.handleInput(KEY.enter);
+	drive2.handleInput("X"); // type a note
+	drive2.handleInput(KEY.enter);
+	const resNote = await formPromise2;
+	check("typed note appended to 'None of the above'", resNote.answers["Pick one?"] === "None of the above — X");
+
+	// multi-select: 'None of the above' is EXCLUSIVE
+	let drive3 = null;
+	const formCtx3 = makeCtx();
+	formCtx3.ui.custom = (builder) => new Promise((resolve) => {
+		drive3 = builder({ requestRender() {} }, fakeTheme, {}, resolve);
+	});
+	const formPromise3 = runAskForm(formCtx3, [{ question: "Multi?", multiSelect: true, options: [{ label: "Option A" }, { label: "Option B" }] }]);
+	drive3.handleInput(KEY.space); // Option A selected
+	drive3.handleInput(KEY.down);
+	drive3.handleInput(KEY.down); // reach "None of the above"
+	drive3.handleInput(KEY.space); // EXCLUSIVE toggle → clears A, selects it
+	drive3.handleInput(KEY.enter); // confirm answer
+	const resMulti = await formPromise3;
+	check("multiselect: custom is exclusive", JSON.stringify(resMulti.answers["Multi?"]) === JSON.stringify(["None of the above"]));
+	const rendered = drive3.render ? null : null;
+}
 
 console.log("\n[/plan bootstrap message]");
 sent.length = 0;
