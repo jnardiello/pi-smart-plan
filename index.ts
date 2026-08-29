@@ -9,8 +9,11 @@
  * While active the session is truly read-only:
  * - edit/write are REMOVED from the active tool set (the model cannot see them);
  * - bash is restricted to a read-only allowlist (src/bash-guard.ts);
- * - state-mutating tools from other extensions (subagent spawn, chrome
- *   interaction) are removed and additionally blocked as a backstop;
+ * - subagents ARE allowed but inherit the same guard: the parent spawns
+ *   them with PI_SMART_PLAN=1 in their env, and the children self-restrict
+ *   to read-only exploration (no phase machine, no planning UI);
+ * - other state-mutating tools (chrome interaction, unknown/extensions)
+ *   are removed and additionally blocked as a backstop;
  * - the only write path is the extension-owned external store via
  *   plan_save / journal_append / plan_complete — the model never handles
  *   store paths.
@@ -21,13 +24,13 @@
  */
 import { execFileSync } from "node:child_process";
 import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
+import { Box, Text, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { runAskForm } from "./src/ask-form.ts";
-import { GLOBAL_CONSTRAINTS, PHASE_PROMPTS, planBootstrapMessage } from "./src/prompts.ts";
+import { GLOBAL_CONSTRAINTS, PHASE_PROMPTS, SUBAGENT_CONSTRAINTS, planBootstrapMessage } from "./src/prompts.ts";
 import { PHASES, type Phase } from "./src/plan-validate.ts";
 import { isReadOnlyCommand } from "./src/bash-guard.ts";
-import { savePlan, appendJournal, recall, completeGoal, currentPhase, getDoD, getPlanView, goalSummaries, nextTasks, persistApproved, updateTaskStatus, PlanStoreValidationError, type PlanView } from "./src/plan-store.ts";
+import { savePlan, appendJournal, recall, approvedGoals, completeGoal, currentPhase, getDoD, getPlanView, goalSummaries, nextTasks, persistApproved, updateTaskStatus, PlanStoreValidationError, type PlanView } from "./src/plan-store.ts";
 
 const STORE_KEY = "plan-guard";
 const STATUS_KEY = "plan-guard";
@@ -38,16 +41,20 @@ const BASH_BLOCK_REASON =
 
 /** While plan mode is on the session is DEFAULT-DENY: only these tools run —
  * read-only built-ins for codebase investigation, the planning store tools
- * (the only writes allowed, into the external plans folder), and web research
- * for understanding the problem. Everything else — write built-ins,
- * subagents, chrome, unknown or future third-party tools — is blocked.
- * Extend this set deliberately if a specific tool is ever needed. */
+ * (the only writes allowed, into the external plans folder), web research
+ * for understanding the problem, and subagent spawn (children inherit this
+ * same read-only guard via PI_SMART_PLAN, so they stay exploration-only).
+ * Everything else — write built-ins, chrome, unknown or future third-party
+ * tools — is blocked. Extend this set deliberately if a specific tool is
+ * ever needed. */
 const PLAN_MODE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
 	"read",
 	"bash",
 	"grep",
 	"find",
 	"ls",
+	"subagent",
+	"subagent_wait",
 	"ask_smart_plan",
 	"plan_exit",
 	"plan_save",
@@ -62,6 +69,33 @@ const PLAN_MODE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
 	"get_search_content",
 ]);
 
+/** Subagent children (guard inherited via PI_SMART_PLAN) are EXPLORATION-ONLY:
+ * they must never touch the shared parent-owned plan store, the planning UI or
+ * guard-control tools (ask_smart_plan / plan_exit would mutate or gate parent
+ * state). Strict exploration: reading, read-only bash, web research and nested
+ * subagent spawn only. */
+const CHILD_MODE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
+	"read",
+	"bash",
+	"grep",
+	"find",
+	"ls",
+	"web_search",
+	"source_check",
+	"fetch_content",
+	"get_search_content",
+	"subagent",
+	"subagent_wait",
+]);
+
+/** Effective allowlist for THIS process: the full plan-mode set in the parent
+ * session, the exploration-only subset in subagent children. Single source of
+ * truth for BOTH the active-tool restriction and the tool_call default-deny
+ * backstop, so the two can never disagree about what a child may call. */
+function effectiveAllowedTools(): ReadonlySet<string> {
+	return isSubagentChild ? CHILD_MODE_ALLOWED_TOOLS : PLAN_MODE_ALLOWED_TOOLS;
+}
+
 /** Error text for a failed store tool. Validation errors (safe, no paths) are
  * forwarded verbatim; anything else (fs errors with absolute store paths embedded)
  * maps to a generic message so store locations never leak to the model. */
@@ -71,6 +105,12 @@ function safeError(operation: string, error: unknown): string {
 }
 
 let enabled = false;
+
+/** True when this extension instance runs inside a pi-subagents child that
+ * inherited the parent's plan mode via PI_SMART_PLAN. Such children are
+ * read-only explorers only: they get a dedicated constraint prompt instead
+ * of the phase state machine and no planning UI/status. */
+let isSubagentChild = false;
 
 /** Deliver a plan request as a custom message: content goes to the LLM, the
  * TUI shows only the single-line renderer. Idle → trigger a turn immediately;
@@ -97,30 +137,57 @@ function noteCwd(ctx: ExtensionContext): void {
 
 /** Themed implementation-plan panel: waves, dependencies and a LIVE checklist
  * (done ✓ / ready ● / pending ○) that re-reads the store on every redraw. */
-function renderPlanPanel(view: PlanView, theme: { fg: (color: any, text: string) => string; bold: (text: string) => string }): string[] {
+function renderPlanPanel(view: PlanView, theme: { fg: (color: any, text: string) => string; bold: (text: string) => string }, width: number): string[] {
 	const R = theme.fg("borderAccent", "▌");
-	const line = (content = "") => `${R}${content ? " " + content : ""}`;
+	const contentWidth = Math.max(1, width - 2);
+	const line = (content = ""): string[] => {
+		if (!content) return [R];
+		return wrapTextWithAnsi(content, contentWidth).map((part) => `${R} ${part}`);
+	};
 	const lines: string[] = [];
-	lines.push(line(theme.fg("accent", theme.bold("◈ IMPLEMENTATION PLAN")) + theme.fg("muted", ` — ${view.goal}`)));
-	if (view.hld) lines.push(line(theme.fg("muted", `HLD: ${view.hld}`)));
-	if (view.scope) lines.push(line(theme.fg("text", `SCOPE: ${view.scope}`)));
-	if (view.nonGoals) lines.push(line(theme.fg("text", `NON-GOALS: ${view.nonGoals}`)));
-	if (view.dod.length) lines.push(line(theme.fg("text", `DoD: ${view.dod.join(" && ")}`)));
-	lines.push(line());
+	lines.push(...line(theme.fg("accent", theme.bold("◈ IMPLEMENTATION PLAN")) + theme.fg("muted", ` — ${view.goal}`)));
+	if (view.hld) lines.push(...line(theme.fg("muted", `HLD: ${view.hld}`)));
+	if (view.scope) lines.push(...line(theme.fg("text", `SCOPE: ${view.scope}`)));
+	if (view.nonGoals) lines.push(...line(theme.fg("text", `NON-GOALS: ${view.nonGoals}`)));
+	if (view.dod.length) lines.push(...line(theme.fg("text", `DoD: ${view.dod.join(" && ")}`)));
+	lines.push(R);
 	let wave = 0;
 	for (const task of view.tasks) {
 		if (task.wave !== wave) {
 			wave = task.wave;
-			lines.push(line(theme.fg("muted", theme.bold(`WAVE ${wave}`))));
+			lines.push(...line(theme.fg("muted", theme.bold(`WAVE ${wave}`))));
 		}
 		const mark = task.done ? theme.fg("success", "✓") : task.ready ? theme.fg("accent", "●") : theme.fg("dim", "○");
 		const deps = task.deps.length ? theme.fg("dim", `  ← ${task.deps.join(", ")}`) : "";
 		const title = theme.fg(task.done ? "muted" : "text", `${task.id}  ${task.title}`);
-		lines.push(line(` ${mark} ${title}${deps}`));
+		lines.push(...line(` ${mark} ${title}${deps}`));
 	}
-	lines.push(line());
-	lines.push(line(theme.fg("muted", `✓ ${view.doneCount}/${view.total} done · ready: ${view.frontier.join(", ") || "—"}`)));
+	lines.push(R);
+	lines.push(...line(theme.fg("muted", `✓ ${view.doneCount}/${view.total} done · ready: ${view.frontier.join(", ") || "—"}`)));
 	return lines;
+}
+
+/** Compact, store-derived contract summary (goal, scope, non-goals, DoD and
+ * the wave/task list). Injected into the approval form's briefing so the owner
+ * sees the real contract regardless of chat prose. Line-oriented by design:
+ * the form wraps every line through wrapTextWithAnsi when rendering. */
+function buildContractSummary(view: PlanView): string {
+	const lines: string[] = [`CONTRACT — ${view.goal}`];
+	if (view.scope) lines.push(`SCOPE: ${view.scope}`);
+	if (view.nonGoals) lines.push(`NON-GOALS: ${view.nonGoals}`);
+	if (view.dod.length) lines.push(`DoD: ${view.dod.join(" && ")}`);
+	const waves: string[] = [];
+	let wave = -1;
+	for (const task of view.tasks) {
+		if (task.wave !== wave) {
+			wave = task.wave;
+			waves.push(`WAVE ${wave}: ${task.id} ${task.title}`);
+		} else {
+			waves[waves.length - 1] += ` · ${task.id} ${task.title}`;
+		}
+	}
+	lines.push(...waves);
+	return lines.join("\n");
 }
 
 /** Heat ramp for the phase bar: starts neutral gray, warms up to vivid
@@ -172,7 +239,7 @@ function refreshWidget(ctx: ExtensionContext): void {
 		if (current === "discovery" && goals.length === 0) {
 			lines.push(theme.fg("muted", "  → tell me what you want to design together"));
 		}
-		return { render: () => lines, invalidate: () => {} };
+		return { render: (width = 80) => lines.map((l) => truncateToWidth(l, width)), invalidate: () => {} };
 	});
 }
 
@@ -181,6 +248,9 @@ function refreshWidget(ctx: ExtensionContext): void {
  * while an approved goal is still in flight (execution/delivery). */
 function planInjection(cwd: string): string | undefined {
 	if (enabled) {
+		// Subagent children under parent plan mode never run the plan workflow:
+		// drive them with a dedicated read-only exploration contract instead.
+		if (isSubagentChild) return `${GLOBAL_CONSTRAINTS}\n\n${SUBAGENT_CONSTRAINTS}`;
 		const current = currentPhase(cwd, true);
 		const phase = current?.phase ?? "discovery";
 		return `${GLOBAL_CONSTRAINTS}\n\n${PHASE_PROMPTS[phase]}`;
@@ -193,6 +263,10 @@ function planInjection(cwd: string): string | undefined {
 export default function planGuard(pi: ExtensionAPI): void {
 	/** Active-tool snapshot taken on first engagement, restored on exit. */
 	let toolsBeforePlanMode: string[] | undefined;
+	/** Goal the owner last saw presented via plan_present. Navigation gate for
+	 * the release form: plan_save resets it — a fresh save invalidates the
+	 * previous presentation, so the form can never open unannounced. */
+	let presentedGoal: string | undefined;
 
 	pi.registerFlag("plan", {
 		description: "Start with the read-only plan guard engaged",
@@ -202,12 +276,16 @@ export default function planGuard(pi: ExtensionAPI): void {
 
 	function restrictTools(): void {
 		if (toolsBeforePlanMode === undefined) toolsBeforePlanMode = pi.getActiveTools();
-		pi.setActiveTools(toolsBeforePlanMode.filter((name) => PLAN_MODE_ALLOWED_TOOLS.has(name)));
+		pi.setActiveTools(toolsBeforePlanMode.filter((name) => effectiveAllowedTools().has(name)));
+		// Propagate the guard to pi-subagents children: they inherit process.env
+		// from the spawner and self-activate the read-only guard on session_start.
+		process.env.PI_SMART_PLAN = "1";
 	}
 
 	function restoreTools(): void {
 		if (toolsBeforePlanMode !== undefined) pi.setActiveTools(toolsBeforePlanMode);
 		toolsBeforePlanMode = undefined;
+		delete process.env.PI_SMART_PLAN;
 	}
 
 	function set(ctx: ExtensionContext, next: boolean, note: string, type: "info" | "warning"): void {
@@ -248,13 +326,28 @@ export default function planGuard(pi: ExtensionAPI): void {
 					details: { enabled },
 				};
 			}
+			const approved = approvedGoals(ctx.cwd);
 			const summaries = goalSummaries(ctx.cwd, enabled);
 			const context = summaries.length > 0
 				? `\n\nActive plans:\n${summaries.map((line) => `• ${line}`).join("\n")}`
 				: "\n\nWARNING: no plan has been saved yet (nothing written via plan_save).";
-			const confirmed = await ctx.ui.confirm("Plan mode", `Exit plan mode?${context}`);
+			const hasApproved = approved.length > 0;
+			const question = hasApproved
+				? `Exit plan mode and start implementing the approved plan(s) [${approved.join(", ")}]?`
+				: "Exit plan mode?";
+			const confirmed = await ctx.ui.confirm("Plan mode", `${question}${context}`);
 			if (confirmed) {
 				set(ctx, false, "◈ Plan mode OFF — full access restored.", "info");
+				if (hasApproved) {
+					for (const goal of approved) appendJournal(ctx.cwd, goal, "owner confirmed exit — implementation authorized");
+					return {
+						content: [{
+							type: "text",
+							text: `Plan mode exited. The owner's confirmation IS the authorization: start implementing the approved plan(s) [${approved.join(", ")}] NOW — do not ask again.`,
+						}],
+						details: { enabled, approved },
+					};
+				}
 				return { content: [{ type: "text", text: "Plan mode exited." }], details: { enabled } };
 			}
 			return {
@@ -306,14 +399,34 @@ export default function planGuard(pi: ExtensionAPI): void {
 			if (!ctx.hasUI) {
 				return { content: [{ type: "text", text: "No interactive UI; ask in prose." }], details: { ui: false } };
 			}
-			const result = await runAskForm(ctx, params.questions);
+			let questions = params.questions;
+			if (params.releasePlanGuardOnAnswer === true && enabled) {
+				const view = presentedGoal === undefined ? null : getPlanView(ctx.cwd, presentedGoal);
+				if (!view) {
+					return {
+						content: [{
+							type: "text",
+							text: "Release form blocked: no plan has been presented in this session (or it was invalidated by a later plan_save / completed goal). Call plan_present first, then open the release form (releasePlanGuardOnAnswer: true).",
+						}],
+						details: {},
+						isError: true,
+					};
+				}
+				// The owner must see the real contract in the form UI itself — never
+				// rely on what the model wrote in chat. Prepended to the first
+				// question's briefing, which the form wraps through wrapTextWithAnsi.
+				questions = params.questions.map((q, i) =>
+					i === 0 ? { ...q, detail: `${buildContractSummary(view)}\n\n${q.detail ?? ""}`.trim() } : q
+				);
+			}
+			const result = await runAskForm(ctx, questions);
 			if ("declined" in result) {
 				return { content: [{ type: "text", text: "The user declined." }], details: { answers: {}, declined: true } };
 			}
 			const blocks = Object.entries(result.answers).map(([q, a]) => `Q: ${q}\nA: ${Array.isArray(a) ? a.join(", ") : a}`);
 			if (params.releasePlanGuardOnAnswer === true && enabled) {
 				set(ctx, false, "Plan approved — plan mode OFF, full access restored.", "info");
-				blocks.push("(Approved: plan mode released — proceed with execution.)");
+				blocks.push("(APPROVED by owner — plan mode released. The owner's answer IS the authorization: start implementing NOW. Do not ask for confirmation again.)");
 				return { content: [{ type: "text", text: blocks.join("\n") }], details: { answers: result.answers, released: true } };
 			}
 			return { content: [{ type: "text", text: blocks.join("\n") }], details: { answers: result.answers } };
@@ -333,6 +446,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			try {
 				savePlan(ctx.cwd, params.goal, params.content);
+				presentedGoal = undefined; // a new save invalidates the previous presentation
 				refreshWidget(ctx);
 				return { content: [{ type: "text", text: `Plan saved for ${params.goal}.` }], details: { goal: params.goal } };
 			} catch (error) {
@@ -477,6 +591,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 				const view = getPlanView(ctx.cwd, params.goal);
 				if (!view) throw new PlanStoreValidationError(`no active plan for goal "${params.goal}" — save one first via plan_save`);
 				pi.appendEntry(PRESENT_ENTRY_KEY, { goal: params.goal });
+				presentedGoal = params.goal;
 				return {
 					content: [{ type: "text", text: "Implementation-plan panel rendered above. Now open the approval form (releasePlanGuardOnAnswer: true) — the full plan is visible to the owner." }],
 					details: { goal: params.goal },
@@ -490,11 +605,9 @@ export default function planGuard(pi: ExtensionAPI): void {
 	pi.registerEntryRenderer(PRESENT_ENTRY_KEY, (entry, _opts, theme) => {
 		const goal = (entry.data as { goal?: string } | undefined)?.goal ?? "";
 		const view = lastCwd ? getPlanView(lastCwd, goal) : null;
-		const inner = view ? renderPlanPanel(view, theme) : [theme.fg("dim", "(plan not available)")];
 		return {
 			render(width = 80): string[] {
-				void width;
-				return inner;
+				return view ? renderPlanPanel(view, theme, width) : [theme.fg("dim", "(plan not available)")];
 			},
 			invalidate() {},
 		};
@@ -625,13 +738,22 @@ export default function planGuard(pi: ExtensionAPI): void {
 			}
 			return undefined;
 		}
-		if (!PLAN_MODE_ALLOWED_TOOLS.has(event.toolName)) {
+		if (!effectiveAllowedTools().has(event.toolName)) {
 			return {
 				block: true,
-				reason: `Plan mode is active — "${event.toolName}" is not available while planning (only reading, planning-store tools and web research are allowed). Repo changes wait until the user exits plan mode.`,
+				reason: isSubagentChild
+					? `Your parent session is in plan mode — "${event.toolName}" is not available to read-only subagents (exploration only: read, read-only bash, web research, nested subagent spawn). Report findings to the parent; never touch the plan store or planning tools.`
+					: `Plan mode is active — "${event.toolName}" is not available while planning (only reading, planning-store tools and web research are allowed). Repo changes wait until the user exits plan mode.`,
 			};
 		}
 		return undefined;
+	});
+
+	// FIX 3 (T5): while the guard is active, remind the model it is read-only
+	// on every bash result — it keeps designing instead of trying to write.
+	pi.on("tool_result", (event, _ctx) => {
+		if (!enabled || event.toolName !== "bash") return undefined;
+		return { content: [...event.content, { type: "text", text: "[plan mode: read-only guard active — do NOT write/edit; design only]" }] };
 	});
 
 	// Per-turn phase injection: only the current state-machine phase (+ global
@@ -646,6 +768,16 @@ export default function planGuard(pi: ExtensionAPI): void {
 	// Restore guard state on startup/reload/new/resume/fork, re-applying the
 	// restricted tool set when the guard was active.
 	pi.on("session_start", async (_event, ctx) => {
+		// Subagent child that inherited the parent's plan mode: self-activate the
+		// read-only guard, keeping the state ephemeral (no store entry, no UI).
+		const childDepth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
+		isSubagentChild = Number.isFinite(childDepth) && childDepth > 0;
+		if (isSubagentChild && process.env.PI_SMART_PLAN === "1") {
+			enabled = true;
+			restrictTools();
+			noteCwd(ctx);
+			return;
+		}
 		let restored: { enabled: boolean; tools?: string[] } | undefined;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom" && entry.customType === STORE_KEY) {

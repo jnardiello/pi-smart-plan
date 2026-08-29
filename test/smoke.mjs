@@ -128,8 +128,10 @@ widgetCalls.length = 0;
 sent.length = 0;
 await registered.shortcuts.get("shift+tab").handler(makeCtx());
 check("mutating tools removed",
-	["edit", "write", "subagent", "chrome_click"].every((t) => !activeTools.includes(t)));
+	["edit", "write", "chrome_click"].every((t) => !activeTools.includes(t)));
+check("subagent stays available (children inherit guard)", activeTools.includes("subagent"));
 check("toggle sends NO message (no auto-turn)", sent.length === 0);
+check("env PI_SMART_PLAN set while guard ON", process.env.PI_SMART_PLAN === "1");
 const wl = widgetLines();
 check("widget: header + heat bar (gray start, orange end)",
 	wl?.[0]?.includes("PLAN MODE") === true &&
@@ -154,9 +156,9 @@ check("curl POST blocked", (await tc(bashEvent("curl -X POST https://x.dev"), ma
 console.log("\n[default-deny backstop]");
 check("edit blocked", (await tc(toolEvent("edit"), makeCtx()))?.block === true);
 check("write blocked", (await tc(toolEvent("write"), makeCtx()))?.block === true);
-check("subagent spawn blocked", (await tc(toolEvent("subagent"), makeCtx()))?.block === true);
+check("subagent allowed (read-only descendants)", (await tc(toolEvent("subagent"), makeCtx())) === undefined);
 check("chrome_screenshot blocked (default-deny)", (await tc(toolEvent("chrome_screenshot"), makeCtx()))?.block === true);
-check("subagent_wait blocked", (await tc(toolEvent("subagent_wait"), makeCtx()))?.block === true);
+check("subagent_wait allowed", (await tc(toolEvent("subagent_wait"), makeCtx())) === undefined);
 check("unknown future tool blocked", (await tc(toolEvent("some_future_tool"), makeCtx()))?.block === true);
 check("read allowed", (await tc(toolEvent("read"), makeCtx())) === undefined);
 check("web_search allowed", (await tc(toolEvent("web_search"), makeCtx())) === undefined);
@@ -171,6 +173,7 @@ confirmResponse = true;
 await registered.tools.get("plan_exit").execute("id", {}, undefined, undefined, makeCtx());
 check("confirmed → full toolset restored", ["edit", "write", "subagent"].every((t) => activeTools.includes(t)));
 check("widget cleared on exit", widgetCalls.at(-1)?.[1] === undefined);
+check("env PI_SMART_PLAN removed when guard OFF", process.env.PI_SMART_PLAN === undefined);
 
 console.log("\n[V1 — DAG validation on plan_save]");
 const baseTasks = (t1state = "[ ]") => `# Plan: demo
@@ -361,6 +364,7 @@ activeTools = [...FULL_TOOLS];
 flagValue = true;
 await registered.handlers.get("session_start")(undefined, makeCtx());
 check("flag engages guard at startup", !activeTools.includes("edit") && !activeTools.includes("write"));
+check("env mirrored after session_start restore", process.env.PI_SMART_PLAN === "1");
 flagValue = false;
 
 console.log("\n[/plan-status zero-token dump]");
@@ -373,6 +377,33 @@ for (const [cmd, expected] of [["cat package.json", true], ["rg 'p' src", true],
 	check(`isReadOnly("${cmd}") === ${expected}`, isReadOnlyCommand(cmd) === expected);
 for (const cmd of ["rm -rf /", "git push", "npm install x", "curl -o f https://x", "find . -delete", "sudo x"])
 	check(`blocked: "${cmd}"`, isReadOnlyCommand(cmd) === false);
+
+console.log("\n[child mode — subagent under parent plan mode]");
+const savedSmart = process.env.PI_SMART_PLAN;
+const savedDepth = process.env.PI_SUBAGENT_DEPTH;
+activeTools = [...FULL_TOOLS];
+process.env.PI_SMART_PLAN = "1";
+process.env.PI_SUBAGENT_DEPTH = "2";
+const childCtx = makeCtx({ sessionManager: { getBranch: () => [] } });
+await registered.handlers.get("session_start")(undefined, childCtx);
+check("child guard self-activates from inherited env",
+	!activeTools.includes("edit") && !activeTools.includes("write") && activeTools.includes("subagent") && activeTools.includes("grep"));
+check("child active set is exploration-only (no plan-store tools)",
+	!activeTools.includes("plan_save") && !activeTools.includes("journal_append") &&
+	!activeTools.includes("ask_smart_plan") && !activeTools.includes("plan_exit") &&
+	!activeTools.includes("plan_next") && !activeTools.includes("plan_complete"));
+const injChild = await bas({ systemPrompt: "BASE" }, childCtx);
+check("child injection: subagent contract, NO phase machine",
+	injChild.systemPrompt.includes("SUBAGENT — READ-ONLY") && injChild.systemPrompt.includes("read-only") && !injChild.systemPrompt.includes("PHASE:"));
+check("child default-deny applies (write still blocked)", (await tc(toolEvent("write"), childCtx))?.block === true);
+check("child blocks plan_save (shared store write)", (await tc(toolEvent("plan_save"), childCtx))?.block === true);
+check("child blocks journal_append (shared store write)", (await tc(toolEvent("journal_append"), childCtx))?.block === true);
+check("child blocks other planning tools (plan_next)", (await tc(toolEvent("plan_next"), childCtx))?.block === true);
+check("child keeps read allowed", (await tc(toolEvent("read"), childCtx)) === undefined);
+check("child keeps subagent/subagent_wait (nested exploration)",
+	(await tc(toolEvent("subagent"), childCtx)) === undefined && (await tc(toolEvent("subagent_wait"), childCtx)) === undefined);
+if (savedSmart === undefined) delete process.env.PI_SMART_PLAN; else process.env.PI_SMART_PLAN = savedSmart;
+if (savedDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH; else process.env.PI_SUBAGENT_DEPTH = savedDepth;
 
 rmSync(expectedStore, { recursive: true, force: true });
 rmSync(CWD, { recursive: true, force: true });

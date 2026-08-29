@@ -15,6 +15,7 @@ export const GLOBAL_CONSTRAINTS = `pi-smart-plan global constraints (always appl
 - plan = WHAT (rewritable via plan_save). journal = WHY/HOW IT WENT (append-only via journal_append). Record every phase transition, settled decision and ablation cut there.
 - Worker briefs reference repo-internal paths only.
 - Exactly ONE commit per goal — the final delivery commit. Never push/publish/deploy.
+- Never attempt writes or edits while the read-only guard is active: if you need to write, ask the owner to release the guard — never circumvent it (no workarounds, no backdoors).
 - You cannot toggle plan mode yourself: entering is owner-only (shift+tab, /plan, /plan-guard on, --plan); leaving happens through the approved plan or via plan_exit (explicit user confirmation either way).`;
 
 /** Per-phase instructions. Injected one at a time by the extension. */
@@ -73,6 +74,7 @@ This is the ONLY validation moment. Steps, strictly in this order:
 
 	execute: `PHASE: execute (guard released — implementation approved)
 LOCAL MISSION: deliver the approved implementation VERIFIED — every task [x] via its checks, all DoD green through plan_verify, goal completed.
+- NEVER re-ask for confirmation: plan approval + guard release IS the authorization — start implementing immediately.
 - Frontier = pending tasks whose deps are all [x]. Get it mechanically via plan_next(<goal>) — never eyeball deps from memory.
 - Dispatch up to 4 parallel workers per wave, disjoint owns, one writer per checkout. Queue the rest.
 - Verify every task in the root by running its done check; only then mark [x] via plan_save. Never trust a worker's green claim.
@@ -82,6 +84,16 @@ LOCAL MISSION: deliver the approved implementation VERIFIED — every task [x] v
 } as const;
 
 export type PhaseName = keyof typeof PHASE_PROMPTS;
+
+/** Injected INSTEAD of the phase state machine when the extension runs inside
+ * a pi-subagents child under a parent session in plan mode. The child is
+ * read-only exploration only: it reports findings back to the integrating
+ * parent, it never runs the plan workflow itself. */
+export const SUBAGENT_CONSTRAINTS = `SUBAGENT — READ-ONLY (parent is in plan mode)
+- You are a subagent spawned by a parent session whose plan-mode guard is ACTIVE. Your only job is EXPLORATION: read code, search, run read-only commands, and bring findings back to the parent.
+- NEVER write, edit, install, or mutate any state — the guard is enforced on your tools; do not attempt workarounds.
+- There is no owner to talk to here: the parent-plan rules above (ask_smart_plan forms, phases, presentations, plan_save / journal / plan store) DO NOT apply to you — ignore them and never touch those tools.
+- Stop early when the question is answered; return a compact, evidence-backed report (commands and trimmed output) that the parent integrates.`;
 
 /** Short bootstrap injected when plan mode is engaged via /plan. */
 export function planBootstrapMessage(goal: string): string {

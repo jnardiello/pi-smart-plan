@@ -502,6 +502,16 @@ export function persistApproved(cwd: string, goal: string): string {
 	return dest;
 }
 
+/** Names of ACTIVE goals already approved in the durable store (no re-confirm). */
+export function approvedGoals(cwd: string): string[] {
+	const approved = join(approvedRoot(), repoSlug(cwd));
+	const goals: string[] = [];
+	for (const name of listGoalDirs(storeRoot(cwd))) {
+		if (name !== "done" && existsSync(join(approved, name))) goals.push(name);
+	}
+	return goals;
+}
+
 /** Executable DoD commands of a goal's plan (mechanical delivery gate). */
 export function getDoD(cwd: string, goal: string): string[] {
 	const content = readOptional(join(activeGoalDir(cwd, goal), "plan.md"));

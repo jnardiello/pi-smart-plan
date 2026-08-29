@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.0
+
+- **Subagents available in plan mode, exploration-only**: `subagent` and `subagent_wait` are now in the plan-mode allowlist, so the root can delegate reconnaissance while planning.
+- **Guard inheritance via env**: while the guard is active the extension exports `PI_SMART_PLAN=1`; pi-subagents children inherit the parent env, and the extension (loaded in the child) self-activates the same default-deny guard at `session_start` when `PI_SUBAGENT_DEPTH >= 1`. Nested delegation stays guarded automatically.
+- **Children are exploration-only**: a dedicated child allowlist (read/bash/grep/find/ls + web research + subagent tools) excludes every plan-store tool (`plan_*`, `journal_append`, `ask_smart_plan`, `plan_exit`), so a child can never mutate the parent's shared plan store; children receive a compact read-only subagent contract instead of the phase state machine.
+- **Guard-circumvention rule in global constraints**; execute phase no longer re-asks for confirmation after approval; `approvedGoals` store helper.
+- Known gap (accepted): a child agent profile that declares explicit `extensions:` makes pi pass `--no-extensions`, dropping the guard from that child.
+
 ## 0.8.0
 
 - **Implementation-plan panel**: at presentation time the agent calls plan_present, which appends a dedicated panel to the transcript — waves, dependencies and a LIVE checklist (✓ done / ● ready / ○ pending) that re-reads the plan on every redraw. Distinct visual style (colored rule) so the final plan stands out from the rest of the chat.
