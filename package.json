@@ -1,6 +1,6 @@
 {
   "name": "@jnardiello/pi-smart-plan",
-  "version": "0.9.0",
+  "version": "0.10.1",
   "description": "Plan mode for pi: file edits are blocked while planning; plans and journals live in an extension-owned store outside the repo",
   "type": "module",
   "keywords": [
@@ -31,7 +31,7 @@
   ],
   "scripts": {
     "check": "npm pack --dry-run",
-    "test": "node test/smoke.mjs"
+    "test": "node test/smoke.mjs && node test/phase-machine.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

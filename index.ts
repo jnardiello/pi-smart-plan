@@ -23,14 +23,28 @@
  * injected only by /plan.
  */
 import { execFileSync } from "node:child_process";
-import { isToolCallEventType, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Box, Text, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { isToolCallEventType, keyHint, type ExtensionAPI, type ExtensionContext, type TurnEndEvent } from "@earendil-works/pi-coding-agent";
+import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { runAskForm } from "./src/ask-form.ts";
+import { runAskForm, runAskFormPages, type AskQuestionInput } from "./src/ask-form.ts";
 import { GLOBAL_CONSTRAINTS, PHASE_PROMPTS, SUBAGENT_CONSTRAINTS, planBootstrapMessage } from "./src/prompts.ts";
+import { firstLine, renderIntentPanel, renderPlanPanel, resultText, toolCallLabel } from "./src/render.ts";
 import { PHASES, type Phase } from "./src/plan-validate.ts";
 import { isReadOnlyCommand } from "./src/bash-guard.ts";
-import { savePlan, appendJournal, recall, approvedGoals, completeGoal, currentPhase, getDoD, getPlanView, goalSummaries, nextTasks, persistApproved, updateTaskStatus, PlanStoreValidationError, type PlanView } from "./src/plan-store.ts";
+import {
+	PHASE_ALLOWED_TOOLS,
+	FINALIZE_RULES,
+	finalizeVerdict,
+	nextActionHint,
+	phaseDeliverableReady,
+	DISCOVERY_PRE_INTENT_KEY,
+	discoveryPreIntentSteer,
+	DISCOVERY_POST_INTENT_KEY,
+	discoveryPostIntentSteer,
+	type PhaseSnapshot,
+} from "./src/phase-machine.ts";
+import { savePlan, appendJournal, recall, approvedGoals, completeGoal, confirmIntent, currentPhase, getDoD, getPlanView, gitStagedFiles, goalIsDone, goalSummaries, isPartiallyStaged, isPlanningPhase, journalEntriesSincePhaseStart, nextTasks, persistApproved, purgeTombstone, readIntent, readMachinePhase, readPlan, restoreTombstonedGoal, setMachinePhase, tombstoneActiveGoal, updateTaskStatus, validateGoalSlug, OBJECTIVE_MAX_LEN, PlanStoreValidationError, type PlanView } from "./src/plan-store.ts";
+import { cancelAbandon, getAbandonGraceMs, scheduleAbandon } from "./src/abandon.ts";
 
 const STORE_KEY = "plan-guard";
 const STATUS_KEY = "plan-guard";
@@ -38,36 +52,55 @@ const MESSAGE_TYPE = "smart-plan";
 const BASH_BLOCK_REASON =
 	"Plan mode is active — bash is limited to read-only commands (ls, rg, cat, git status/diff/log, …). " +
 	"Persist plans via plan_save / journal_append; repo changes wait until the user exits plan mode (plan_exit).";
+/** plan_intent's explicit rejection — identical text whether the owner picks
+ * "Keep chatting" or dismisses the form with Esc: nothing is created, the
+ * objective is rejected, and the model returns to the conversation to
+ * re-elicit before re-opening plan_intent. */
+const INTENT_KEEP_CHATTING_TEXT = "the owner rejected this objective — keep chatting, re-elicit, and re-open plan_intent when it's right";
 
-/** While plan mode is on the session is DEFAULT-DENY: only these tools run —
- * read-only built-ins for codebase investigation, the planning store tools
- * (the only writes allowed, into the external plans folder), web research
- * for understanding the problem, and subagent spawn (children inherit this
- * same read-only guard via PI_SMART_PLAN, so they stay exploration-only).
- * Everything else — write built-ins, chrome, unknown or future third-party
- * tools — is blocked. Extend this set deliberately if a specific tool is
- * ever needed. */
-const PLAN_MODE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
-	"read",
-	"bash",
-	"grep",
-	"find",
-	"ls",
-	"subagent",
-	"subagent_wait",
-	"ask_smart_plan",
-	"plan_exit",
-	"plan_save",
-	"journal_append",
-	"plan_recall",
-	"plan_complete",
-	"plan_next",
-	"plan_task_update",
-	"web_search",
-	"source_check",
-	"fetch_content",
-	"get_search_content",
-]);
+/** plan_intent's openQuestions — a trimmed ask_smart_plan question shape
+ * (question, header?, options[] as a bare string or {label, description})
+ * used as the confirmation-step safety net: if the model reaches plan_intent
+ * with open decisions still in hand, declaring them here elicits the same
+ * paged form ask_smart_plan renders (models fill fields they can see),
+ * resolved BEFORE any OBJECTIVE card or Confirm/Keep-chatting form. */
+const OPEN_QUESTION_SCHEMA = Type.Object({
+	question: Type.String(),
+	header: Type.Optional(Type.String()),
+	options: Type.Array(
+		Type.Union([Type.String(), Type.Object({ label: Type.String(), description: Type.Optional(Type.String()) })]),
+		{ minItems: 2, maxItems: 4 },
+	),
+});
+
+/** Self-advance table for the formless plan_advance tool — discovery/simplify/
+ * decompose only. review_hld/review_final/execute have no entry: plan_advance
+ * intercepts those two phases itself (re-opening the owner gate rather than
+ * looking up a target here), and their own targets (decompose / execute) are
+ * decided by runReviewGate's routing, shared with ask_smart_plan's phaseGate
+ * branch; execute exits via plan_complete, not a phase advance. The machine
+ * never jumps phases. */
+const PHASE_NEXT: Record<Phase, Phase | undefined> = {
+	discovery: "simplify",
+	simplify: "review_hld",
+	review_hld: undefined,
+	decompose: "review_final",
+	review_final: undefined,
+	execute: undefined,
+};
+
+/** plan_task_update's renderCall verb per status — "claimed"/"done" read more
+ * naturally in a one-liner than the raw enum values (pending/blocked pass
+ * through unchanged). */
+const TASK_STATUS_VERB: Record<string, string> = { in_progress: "claimed", done: "done", blocked: "blocked", pending: "pending" };
+
+/** Session flags the phase-deliverable snapshot can't derive from plan content
+ * alone. Session-global (not per-goal) — reset in restoreTools (guard off);
+ * never duplicated into the store. */
+const sessionState = {
+	dodPassed: false,
+	completed: false,
+};
 
 /** Subagent children (guard inherited via PI_SMART_PLAN) are EXPLORATION-ONLY:
  * they must never touch the shared parent-owned plan store, the planning UI or
@@ -88,12 +121,15 @@ const CHILD_MODE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
 	"subagent_wait",
 ]);
 
-/** Effective allowlist for THIS process: the full plan-mode set in the parent
- * session, the exploration-only subset in subagent children. Single source of
- * truth for BOTH the active-tool restriction and the tool_call default-deny
- * backstop, so the two can never disagree about what a child may call. */
-function effectiveAllowedTools(): ReadonlySet<string> {
-	return isSubagentChild ? CHILD_MODE_ALLOWED_TOOLS : PLAN_MODE_ALLOWED_TOOLS;
+/** Phase-aware tool surface for the CURRENT phase (parent only). When no goal
+ * is set yet the phase is discovery. A pure lookup into PHASE_ALLOWED_TOOLS —
+ * plan_save is already present in every phase there, so no re-add hack is
+ * needed here (the phase-machine module stays the single source of truth). */
+function phaseAllowedTools(ctx: { cwd: string }): ReadonlySet<string> {
+	if (isSubagentChild) return CHILD_MODE_ALLOWED_TOOLS;
+	const current = currentPhase(ctx.cwd, true);
+	const phase = current?.phase ?? "discovery";
+	return PHASE_ALLOWED_TOOLS[phase];
 }
 
 /** Error text for a failed store tool. Validation errors (safe, no paths) are
@@ -104,6 +140,25 @@ function safeError(operation: string, error: unknown): string {
 	return `${operation} failed: ${message}`;
 }
 
+/** F2/F6: guard plan_intent's TARGET goal directly — reading readMachinePhase/
+ * goalIsDone for `goal` itself, never the session pointer — so an unpointed
+ * goal (past discovery, or already archived in done/) refuses just as
+ * reliably as a pointed one. Returns the refusal text, or undefined when the
+ * goal is confirmable. Called both before the form opens and (F6) again
+ * right before confirmIntent writes, so a parallel tool call cannot slip a
+ * goal switch/lock/completion past the pre-form checks while the owner was
+ * answering. */
+function intentGuardViolation(cwd: string, goal: string): string | undefined {
+	const machinePhase = readMachinePhase(cwd, goal);
+	if (machinePhase !== undefined && machinePhase !== "discovery") {
+		return "the objective is locked after discovery — it can only be restated if Gate 1 sends the plan back";
+	}
+	if (goalIsDone(cwd, goal)) {
+		return `"${goal}" is already completed — plan_intent cannot reopen it; re-opening a completed goal happens automatically on the next plan_save`;
+	}
+	return undefined;
+}
+
 let enabled = false;
 
 /** True when this extension instance runs inside a pi-subagents child that
@@ -111,6 +166,52 @@ let enabled = false;
  * read-only explorers only: they get a dedicated constraint prompt instead
  * of the phase state machine and no planning UI/status. */
 let isSubagentChild = false;
+
+/** A steer message is pending regeneration: skip the next prose-close verdict
+ * if the run is our own regeneration (prevents steering our own steers). */
+let regenInFlight = false;
+
+/** Prose-close retries against the CURRENT phase (finalize-retry battery).
+ * Reset on a real owner turn, on guard off/on, and on every successful phase
+ * advance — a stale counter would otherwise eat a fresh phase's retry budget
+ * or, worse, skip its first steer (B2). */
+let retryCount = 0;
+
+/** True while a blocking extension UI form (ask_smart_plan) is open. The
+ * finalize-retry steer must never fire while the owner is actually answering
+ * a form — the model is legitimately waiting on the form result, not drifting
+ * in prose (B3). */
+let uiPromptOpen = false;
+
+/** F2: reentrancy latch for runReviewGate. pi runs tools in parallel by
+ * default — two gate calls landing in the same assistant message (e.g.
+ * plan_advance called twice, or plan_advance + ask_smart_plan{phaseGate})
+ * must never open two independent forms or route two answers. Set at entry,
+ * cleared in a `finally` so it can never get stuck open. */
+let gateFormOpen = false;
+
+/** F3: true when the CURRENT review-phase gate was last resolved as postponed
+ * rather than approved/rejected/authorized. Fed into buildPhaseSnapshot so
+ * finalizeVerdict can treat a prose owner-facing close as legal instead of
+ * steering it away while the owner is expected to signal separately. Cleared
+ * on any real transitionPhase and whenever a gate form actually (re-)opens;
+ * set only by an actual postpone outcome inside runReviewGate. Session-local
+ * by design — see PhaseSnapshot.gatePostponed's doc for the accepted
+ * restart/guard-cycle tradeoff. */
+let gatePostponed = false;
+
+/** True once ANY tool has run (a permitted tool_call) during the current
+ * pre-intent investigation, parent runs only. Latched unconditionally by the
+ * tool_call handler on every allowed call (bash-allowed and allowlist-pass
+ * paths alike) — cross-run persistence is required: the field failure this
+ * floors is scout-in-run-1, prose-close-in-run-2. Fed into buildPhaseSnapshot
+ * so finalizeVerdict's discovery branch can regenerate a tool-less prose
+ * close instead of letting a model that never enters the machine go
+ * unpoliced. Session-local by design: reset on guard off/on (restoreTools)
+ * and on plan_intent's Confirm (anti-leak across a later goal in the same
+ * session) — see PhaseSnapshot.investigationDone's doc for the accepted
+ * restart/guard-cycle tradeoff. */
+let investigationDone = false;
 
 /** Deliver a plan request as a custom message: content goes to the LLM, the
  * TUI shows only the single-line renderer. Idle → trigger a turn immediately;
@@ -130,42 +231,15 @@ function syncStatus(ctx: ExtensionContext): void {
 
 const WIDGET_KEY = "smart-plan";
 const PRESENT_ENTRY_KEY = "plan-present";
+const INTENT_ENTRY_KEY = "plan-intent-proposal";
 let lastCwd: string | undefined;
 function noteCwd(ctx: ExtensionContext): void {
 	lastCwd = ctx.cwd;
 }
 
-/** Themed implementation-plan panel: waves, dependencies and a LIVE checklist
- * (done ✓ / ready ● / pending ○) that re-reads the store on every redraw. */
-function renderPlanPanel(view: PlanView, theme: { fg: (color: any, text: string) => string; bold: (text: string) => string }, width: number): string[] {
-	const R = theme.fg("borderAccent", "▌");
-	const contentWidth = Math.max(1, width - 2);
-	const line = (content = ""): string[] => {
-		if (!content) return [R];
-		return wrapTextWithAnsi(content, contentWidth).map((part) => `${R} ${part}`);
-	};
-	const lines: string[] = [];
-	lines.push(...line(theme.fg("accent", theme.bold("◈ IMPLEMENTATION PLAN")) + theme.fg("muted", ` — ${view.goal}`)));
-	if (view.hld) lines.push(...line(theme.fg("muted", `HLD: ${view.hld}`)));
-	if (view.scope) lines.push(...line(theme.fg("text", `SCOPE: ${view.scope}`)));
-	if (view.nonGoals) lines.push(...line(theme.fg("text", `NON-GOALS: ${view.nonGoals}`)));
-	if (view.dod.length) lines.push(...line(theme.fg("text", `DoD: ${view.dod.join(" && ")}`)));
-	lines.push(R);
-	let wave = 0;
-	for (const task of view.tasks) {
-		if (task.wave !== wave) {
-			wave = task.wave;
-			lines.push(...line(theme.fg("muted", theme.bold(`WAVE ${wave}`))));
-		}
-		const mark = task.done ? theme.fg("success", "✓") : task.ready ? theme.fg("accent", "●") : theme.fg("dim", "○");
-		const deps = task.deps.length ? theme.fg("dim", `  ← ${task.deps.join(", ")}`) : "";
-		const title = theme.fg(task.done ? "muted" : "text", `${task.id}  ${task.title}`);
-		lines.push(...line(` ${mark} ${title}${deps}`));
-	}
-	lines.push(R);
-	lines.push(...line(theme.fg("muted", `✓ ${view.doneCount}/${view.total} done · ready: ${view.frontier.join(", ") || "—"}`)));
-	return lines;
-}
+/** renderPlanPanel / renderIntentPanel now live in ./src/render.ts (pure,
+ * testable — see that file's doc comment) and are imported above; the
+ * entry-renderer wiring below is unchanged. */
 
 /** Compact, store-derived contract summary (goal, scope, non-goals, DoD and
  * the wave/task list). Injected into the approval form's briefing so the owner
@@ -173,6 +247,7 @@ function renderPlanPanel(view: PlanView, theme: { fg: (color: any, text: string)
  * the form wraps every line through wrapTextWithAnsi when rendering. */
 function buildContractSummary(view: PlanView): string {
 	const lines: string[] = [`CONTRACT — ${view.goal}`];
+	if (view.intent) lines.push(`OBJECTIVE: ${view.intent}`);
 	if (view.scope) lines.push(`SCOPE: ${view.scope}`);
 	if (view.nonGoals) lines.push(`NON-GOALS: ${view.nonGoals}`);
 	if (view.dod.length) lines.push(`DoD: ${view.dod.join(" && ")}`);
@@ -190,16 +265,68 @@ function buildContractSummary(view: PlanView): string {
 	return lines.join("\n");
 }
 
+/** "⚠ STAGED FILES PREFLIGHT" block appended to Gate 2's form detail when
+ * pre-existing staged files are present — pi-subagents' worker acceptance
+ * rejects every write-worker while ANY file is staged, so the owner needs to
+ * see this before deciding how to proceed. */
+function buildStagedPreflight(staged: { code: string; path: string }[]): string {
+	const lines = ["⚠ STAGED FILES PREFLIGHT", "pi-subagents will reject every worker while these files are staged:"];
+	for (const entry of staged) {
+		lines.push(`${entry.code} ${entry.path}`);
+		if (isPartiallyStaged(entry.code)) {
+			lines.push("  index differs from worktree — unstaging keeps the worktree content but drops the staged split; consider committing instead");
+		}
+	}
+	return lines.join("\n");
+}
+
+/** One-line mission for a phase, pulled straight from its PHASE_PROMPTS entry
+ * (single source of truth — never duplicated) — used to tell the model what
+ * the phase it just entered is for, right after a transition. Falls back to
+ * a bare phase name if the LOCAL MISSION line is ever missing. */
+function phaseMissionLine(phase: Phase): string {
+	const match = PHASE_PROMPTS[phase].match(/^LOCAL MISSION:.*$/m);
+	return match ? match[0] : `phase ${phase}`;
+}
+
+/** Strip the "LOCAL MISSION:" label so a mission line reads naturally inline
+ * (the live working message, tool result one-liners) instead of restating
+ * the prompt tag. */
+function stripLocalMission(line: string): string {
+	return line.replace(/^LOCAL MISSION:\s*/, "");
+}
+
+/** Live working-message text for a phase — the same LOCAL MISSION line the
+ * model itself is briefed with, minus its label, so the owner sees what's
+ * happening without reading the raw prompt tag. Set at every transitionPhase
+ * and on plan-mode activation; pi never resets setWorkingMessage on its own,
+ * so every enable/disable path pairs a set with an explicit reset. */
+function phaseWorkingMessage(phase: Phase): string {
+	return `◈ plan · ${phase} — ${stripLocalMission(phaseMissionLine(phase))}`;
+}
+
+/** Deliver the Gate-2 authorization + execute kickoff on a FRESH turn (same
+ * idle/busy pattern as sendPlan): pi's setActiveTools only takes effect on
+ * the model's NEXT turn, so the tool surface set(ctx, false, …) just
+ * restored is invisible mid-run — queuing the briefing instead of returning
+ * it inline lets the model actually see the full surface it needs. */
+function queueImplementationBriefing(pi: ExtensionAPI, ctx: ExtensionContext, goal: string): void {
+	const content =
+		"(APPROVED by owner — plan mode released. The owner's answer IS the authorization: start implementing NOW. Do not ask for confirmation again.)\n\n" +
+		phaseMissionLine("execute");
+	sendPlan(pi, ctx, content, goal, "command");
+}
+
 /** Heat ramp for the phase bar: starts neutral gray, warms up to vivid
  * orange as the plan approaches completion (fixed xterm-256 hues, deliberately
  * theme-independent). Transparency effect: upcoming cells show their future
  * hue at low density (░░), reached ones burn at full density (██). */
 const PHASE_HEAT: Record<Phase, number> = {
 	discovery: 243, // neutral gray
-	hld: 179, // tan-orange
-	decompose: 172, // dark orange
-	ablate: 208, // orange
-	present: 214, // bright orange
+	simplify: 179, // tan-orange
+	review_hld: 172, // dark orange
+	decompose: 208, // orange
+	review_final: 214, // bright orange
 	execute: 202, // deep orange-red
 };
 
@@ -233,7 +360,9 @@ function refreshWidget(ctx: ExtensionContext): void {
 		const lines: string[] = [];
 		const current = currentPhase(ctx.cwd, true)?.phase ?? "discovery";
 		lines.push(theme.fg("accent", theme.bold("◈ PLAN MODE")) + theme.fg("muted", " · read-only"));
-		lines.push(`${buildHeatBar(current)}  ${theme.fg("accent", theme.bold(current))}`);
+		const usage = ctx.getContextUsage();
+		const usageText = usage?.percent != null ? theme.fg("muted", ` · ctx ${Math.round(usage.percent)}%`) : "";
+		lines.push(`${buildHeatBar(current)}  ${theme.fg("accent", theme.bold(current))}${usageText}`);
 		const goals = goalSummaries(ctx.cwd, enabled);
 		for (const goal of goals) lines.push(theme.fg("muted", `  ${goal}`));
 		if (current === "discovery" && goals.length === 0) {
@@ -260,13 +389,59 @@ function planInjection(cwd: string): string | undefined {
 	return undefined;
 }
 
+/** Fresh-activation cleanup, shared by set()'s ON branch (no pending grace
+ * timer) and session_start's `--plan` flag branch — never by a plain session
+ * resume. Purges any tombstone left behind by a killed process (age-agnostic:
+ * a tombstone surviving to a fresh activation always means a dead process or
+ * a lapsed grace, never a live in-process timer). Then the H1 sweep: if
+ * active.txt itself still points at a goal stuck mid-planning with no
+ * tombstone (kill-while-planning, no grace ever armed), tombstone-and-purge
+ * it immediately so a fresh activation always starts clean. Returns every
+ * goal actually discarded by this sweep (leftover-tombstone purge and/or the
+ * H1 tombstone-and-purge — usually at most one, but both CAN fire in the same
+ * call) so the caller can notify the owner, same as every other discard
+ * path. */
+function sweepStaleGoal(cwd: string): string[] {
+	const purged: string[] = [];
+	const leftover = purgeTombstone(cwd);
+	if (leftover) purged.push(leftover);
+	const pointed = currentPhase(cwd, false);
+	if (!pointed) return purged;
+	const machinePhase = readMachinePhase(cwd, pointed.goal) ?? "discovery";
+	if (isPlanningPhase(machinePhase)) {
+		tombstoneActiveGoal(cwd);
+		const swept = purgeTombstone(cwd);
+		if (swept) purged.push(swept);
+	}
+	return purged;
+}
+
 export default function planGuard(pi: ExtensionAPI): void {
 	/** Active-tool snapshot taken on first engagement, restored on exit. */
 	let toolsBeforePlanMode: string[] | undefined;
-	/** Goal the owner last saw presented via plan_present. Navigation gate for
-	 * the release form: plan_save resets it — a fresh save invalidates the
-	 * previous presentation, so the form can never open unannounced. */
-	let presentedGoal: string | undefined;
+
+	/** Assemble the PhaseSnapshot the phase machine's deliverable checks need,
+	 * from the store (plan content + journal-since-phase-start) and session
+	 * flags. Slim by design (see PhaseSnapshot's doc): no text heuristics, no
+	 * legacy gate flags — readiness comes entirely from validatePhaseShape plus
+	 * the facts content can't self-report (execute's DoD/completion state). */
+	function buildPhaseSnapshot(ctx: { cwd: string }, current: { goal: string; phase: Phase } | null): PhaseSnapshot {
+		if (!current) return { planContent: "", investigationDone };
+		const planContent = readPlan(ctx.cwd, current.goal);
+		return {
+			goal: current.goal,
+			planContent,
+			// F1: derived from the goal's own journal.md (journalEntriesSincePhaseStart
+			// scans for the LAST `[→ <to>] ` marker transitionPhase journals) —
+			// restart-proof and per-goal, no session-local baseline to lose or leak.
+			journalEntriesForPhase: journalEntriesSincePhaseStart(ctx.cwd, current.goal),
+			dodPassed: sessionState.dodPassed,
+			completed: sessionState.completed,
+			gatePostponed,
+			intentConfirmed: readIntent(ctx.cwd, current.goal) !== null,
+			investigationDone,
+		};
+	}
 
 	pi.registerFlag("plan", {
 		description: "Start with the read-only plan guard engaged",
@@ -274,9 +449,10 @@ export default function planGuard(pi: ExtensionAPI): void {
 		default: false,
 	});
 
-	function restrictTools(): void {
+	function restrictTools(ctx: { cwd: string }): void {
 		if (toolsBeforePlanMode === undefined) toolsBeforePlanMode = pi.getActiveTools();
-		pi.setActiveTools(toolsBeforePlanMode.filter((name) => effectiveAllowedTools().has(name)));
+		const allowed = phaseAllowedTools(ctx);
+		pi.setActiveTools(toolsBeforePlanMode.filter((name) => allowed.has(name)));
 		// Propagate the guard to pi-subagents children: they inherit process.env
 		// from the spawner and self-activate the read-only guard on session_start.
 		process.env.PI_SMART_PLAN = "1";
@@ -286,22 +462,237 @@ export default function planGuard(pi: ExtensionAPI): void {
 		if (toolsBeforePlanMode !== undefined) pi.setActiveTools(toolsBeforePlanMode);
 		toolsBeforePlanMode = undefined;
 		delete process.env.PI_SMART_PLAN;
+		// B2: a guard off/on cycle must not leak the prose-close retry budget or
+		// a pending regeneration latch into the next planning session.
+		retryCount = 0;
+		regenInFlight = false;
+		sessionState.dodPassed = false;
+		sessionState.completed = false;
+		investigationDone = false;
+	}
+
+	/** Shared phase-transition sequence — the ONLY way the machine advances:
+	 * used by plan_advance's self-advance and by both review_* gates. Journals
+	 * a UNIFORM `[→ <to>] ` marker line — journalEntriesSincePhaseStart
+	 * (plan-store.ts) derives the simplify cut-log count straight from it, so
+	 * there is no session-local baseline here to reset, lose on a guard
+	 * off/on cycle, or leak across goals (F1). Also resets the prose-close
+	 * retry budget, the pending regeneration latch and the postponed-gate flag
+	 * before re-cutting the tool surface for the new phase. */
+	function transitionPhase(ctx: ExtensionContext, goal: string, to: Phase, journalLine: string): void {
+		setMachinePhase(ctx.cwd, goal, to);
+		appendJournal(ctx.cwd, goal, `[→ ${to}] ${journalLine}`);
+		retryCount = 0;
+		regenInFlight = false;
+		gatePostponed = false;
+		refreshWidget(ctx);
+		restrictTools(ctx);
+		ctx.ui.setWorkingMessage(phaseWorkingMessage(to));
 	}
 
 	function set(ctx: ExtensionContext, next: boolean, note: string, type: "info" | "warning"): void {
+		if (!next) {
+			// Abandon-on-exit: toggling off mid-planning tombstones the active
+			// goal and arms a grace-window purge — re-enabling within the window
+			// restores it. Gate 2's release is excluded automatically: it calls
+			// transitionPhase(…, "execute") immediately before set(false), so
+			// isPlanningPhase is already false by the time this check runs.
+			const pointed = currentPhase(ctx.cwd, enabled);
+			if (pointed) {
+				const machinePhase = readMachinePhase(ctx.cwd, pointed.goal) ?? "discovery";
+				if (isPlanningPhase(machinePhase)) {
+					const goal = tombstoneActiveGoal(ctx.cwd);
+					if (goal) {
+						scheduleAbandon(ctx.cwd, () => {
+							purgeTombstone(ctx.cwd);
+						});
+						const graceS = Math.round(getAbandonGraceMs() / 1000);
+						ctx.ui.notify(`plan '${goal}' will be discarded in ${graceS}s — re-enable plan mode to keep it`, "warning");
+					}
+				}
+			}
+		} else if (cancelAbandon(ctx.cwd)) {
+			const goal = restoreTombstonedGoal(ctx.cwd);
+			if (goal) ctx.ui.notify(`plan '${goal}' kept`, "info");
+		} else {
+			// No pending grace timer for THIS cwd: purge any leftover tombstone
+			// from a killed process, then the H1 sweep for a stale planning goal
+			// (see sweepStaleGoal) — a fresh activation always starts clean.
+			// cancelAbandon(ctx.cwd) above only reports a timer for this exact
+			// cwd, so another repo's still-pending abandon is never touched and
+			// never short-circuits this sweep.
+			for (const goal of sweepStaleGoal(ctx.cwd)) {
+				ctx.ui.notify(`stale plan '${goal}' from a previous session was discarded`, "info");
+			}
+		}
 		enabled = next;
-		if (next) restrictTools();
-		else restoreTools();
+		if (next) {
+			restrictTools(ctx);
+			// Fresh activation: the owner just engaged plan mode — the working
+			// message starts on discovery's mission regardless of what a
+			// resumed goal's own phase might be (kept deliberately simple; the
+			// next transitionPhase call corrects it the moment the machine
+			// actually moves).
+			ctx.ui.setWorkingMessage(phaseWorkingMessage("discovery"));
+		} else {
+			restoreTools();
+			// Mandatory reset: pi never clears a custom working message on its
+			// own between turns — restore its own default explicitly.
+			ctx.ui.setWorkingMessage();
+		}
 		pi.appendEntry(STORE_KEY, { enabled, tools: toolsBeforePlanMode }); // persist for reload/resume
 		syncStatus(ctx);
 		refreshWidget(ctx);
 		ctx.ui.notify(note, type);
 	}
 
+	/** THE only implementation of both owner gates (Gate 1 in review_hld, Gate
+	 * 2 in review_final): appends the plan panel, opens the harness-composed
+	 * form and routes the answer. Called by plan_advance (entering OR
+	 * re-opening a review phase) and by ask_smart_plan's phaseGate branch —
+	 * there is no other way to open a gate. Readiness is the CALLER's job
+	 * (message wording differs slightly per caller, as it always has); this
+	 * helper assumes the deliverable is already ready.
+	 *
+	 * F2: pi runs tools in parallel by default — two gate calls landing in the
+	 * same assistant message must never open two independent forms or route
+	 * two answers, so a module-level latch (gateFormOpen) refuses reentrant
+	 * calls instead of racing them. */
+	async function runReviewGate(ctx: ExtensionContext, goal: string, phase: "review_hld" | "review_final", extraDetail?: string) {
+		if (gateFormOpen) {
+			return {
+				content: [{ type: "text" as const, text: "a gate form is already open — wait for the owner's answer" }],
+				details: {},
+				isError: true,
+			};
+		}
+		gateFormOpen = true;
+		try {
+			noteCwd(ctx);
+			const view = getPlanView(ctx.cwd, goal);
+			if (!view) {
+				return {
+					content: [{ type: "text" as const, text: `Gate blocked: no plan view for "${goal}" — save one first via plan_save.` }],
+					details: {},
+					isError: true,
+				};
+			}
+			// The panel in the transcript — same data shape the renderer expects.
+			pi.appendEntry(PRESENT_ENTRY_KEY, { goal });
+			// The owner must see the real contract in the form UI itself — never
+			// rely on what the model wrote in chat. The model's own detail (if any,
+			// from ask_smart_plan's questions[0].detail) is demoted to extra
+			// briefing appended after the contract summary, behind a labeled
+			// separator (F6) so it can never read as harness contract text.
+			const summary = buildContractSummary(view);
+			const baseDetail = extraDetail ? `${summary}\n\n— model briefing (unverified) —\n${extraDetail}` : summary;
+			// F8: pre-existing staged files make pi-subagents reject every
+			// write-worker outright — surface them in Gate 2's own detail (never
+			// computed for Gate 1) before the owner decides how to proceed.
+			const staged = phase === "review_final" ? gitStagedFiles(ctx.cwd) : [];
+			const detail = staged.length > 0 ? `${baseDetail}\n\n${buildStagedPreflight(staged)}` : baseDetail;
+			const gateQuestion: AskQuestionInput =
+				phase === "review_hld"
+					? { question: "Approve this high-level plan?", detail, options: [{ label: "Approve" }, { label: "Reject" }] }
+					: {
+							question: "Start implementation?",
+							detail,
+							options:
+								staged.length > 0
+									? [{ label: "Unstage & start implementation" }, { label: "Start anyway" }, { label: "Stay in planning" }]
+									: [{ label: "Start implementation" }, { label: "Stay in planning" }],
+						};
+			// F3: the gate form is genuinely opening now — clear any earlier
+			// postpone so a stale flag never outlives this reopened gate's own
+			// outcome (only an actual postpone below re-sets it).
+			gatePostponed = false;
+			// GATE FORMS ARE FIXED-STRUCTURE and never paged: one binary owner
+			// decision from a single un-paged, harness-composed form — routing
+			// below is mechanical, never a parse of model-supplied labels. No
+			// built-in "None of the above" here (includeNoneOption: false) — the
+			// two fixed labels are the only picks; Esc/decline is the sole
+			// postpone path below.
+			const result = await runAskForm(ctx, [gateQuestion], { includeNoneOption: false });
+			if ("declined" in result) {
+				// F3: the owner cancelled the form outright (declined) — POSTPONE.
+				gatePostponed = true;
+				return {
+					content: [{ type: "text" as const, text: `The owner postponed the gate — staying in ${phase}. A later plan_advance re-opens it.` }],
+					details: { answers: {}, declined: true, phase },
+					isError: false,
+				};
+			}
+			const answer = result.answers[gateQuestion.question];
+			const label = typeof answer === "string" ? answer : Array.isArray(answer) ? answer[0] : undefined;
+			const blocks = [`Q: ${gateQuestion.question}\nA: ${label ?? "(no answer)"}`];
+
+			if (phase === "review_hld") {
+				if (label === "Approve") {
+					transitionPhase(ctx, goal, "decompose", "Gate 1 APPROVED — HLD locked");
+					blocks.push(`(GATE 1 APPROVED — now in decompose. ${phaseMissionLine("decompose")})`);
+					return { content: [{ type: "text" as const, text: blocks.join("\n") }], details: { answers: result.answers, advanced: true, phase: "decompose" } };
+				}
+				// Only "Reject" remains — the form has no other option (Esc/decline
+				// above is the sole postpone path).
+				const note = ((await ctx.ui.input("What should change?", "Optional — describe what needs to change")) ?? "").trim();
+				transitionPhase(ctx, goal, "discovery", `Gate 1 REJECTED${note ? `: ${note}` : ""}`);
+				blocks.push(
+					`(GATE 1 REJECTED — back in discovery. ${note ? `Owner's note: ${note}. ` : ""}Re-converge on the HLD with the owner, update it, and journal what changed before the next plan_save.)`,
+				);
+				return { content: [{ type: "text" as const, text: blocks.join("\n") }], details: { answers: result.answers, phase: "discovery" } };
+			}
+
+			// review_final
+			if (label === "Start implementation" || label === "Unstage & start implementation" || label === "Start anyway") {
+				if (label === "Unstage & start implementation") {
+					// F8: the ONLY git mutation this feature ever performs, scoped to
+					// EXACTLY the paths gitStagedFiles just detected — never a bare
+					// reset, never other paths.
+					try {
+						execFileSync("git", ["restore", "--staged", "--", ...staged.map((e) => e.path)], { cwd: ctx.cwd, stdio: ["ignore", "pipe", "pipe"] });
+					} catch (err) {
+						return {
+							content: [{ type: "text" as const, text: `git restore --staged failed: ${err instanceof Error ? err.message : String(err)} — nothing else changed; staying in review_final.` }],
+							details: { answers: result.answers, phase: "review_final" },
+							isError: true,
+						};
+					}
+					const remaining = gitStagedFiles(ctx.cwd);
+					if (remaining.length > 0) {
+						return {
+							content: [{
+								type: "text" as const,
+								text: `${remaining.length} staged entr${remaining.length === 1 ? "y" : "ies"} still remain after unstage (${remaining.map((e) => e.path).join(", ")}) — staying in review_final, guard NOT released.`,
+							}],
+							details: { answers: result.answers, phase: "review_final" },
+							isError: true,
+						};
+					}
+					appendJournal(ctx.cwd, goal, `Gate 2: unstaged ${staged.length} pre-existing staged entries at owner's request: ${staged.map((e) => e.path).join(", ")}`);
+				} else if (label === "Start anyway") {
+					appendJournal(ctx.cwd, goal, `Gate 2: owner started with ${staged.length} staged entries present (workers will be rejected by pi-subagents)`);
+				}
+				persistApproved(ctx.cwd, goal);
+				transitionPhase(ctx, goal, "execute", "Gate 2 AUTHORIZED — guard released");
+				set(ctx, false, "Plan approved — plan mode OFF, full access restored.", "info");
+				queueImplementationBriefing(pi, ctx, goal);
+				blocks.push("(GATE 2 AUTHORIZED — plan mode released. Wind down this turn; the implementation briefing arrives on the next turn.)");
+				return { content: [{ type: "text" as const, text: blocks.join("\n") }], details: { answers: result.answers, released: true, phase: "execute" } };
+			}
+			// Only "Stay in planning" remains — the form has no other option
+			// (Esc/decline above is the sole postpone path).
+			appendJournal(ctx.cwd, goal, "Gate 2: owner stays in planning");
+			blocks.push("(Gate 2 not authorized — staying in review_final.)");
+			return { content: [{ type: "text" as const, text: blocks.join("\n") }], details: { answers: result.answers, phase: "review_final" } };
+		} finally {
+			gateFormOpen = false;
+		}
+	}
+
 	pi.registerMessageRenderer(MESSAGE_TYPE, (message, { outputPad }, theme) => {
 		const details = message.details as { goal?: string; source?: string } | undefined;
 		const goal = details?.goal?.trim();
-		const title = theme.fg("customMessageLabel", "◈ PLAN") + theme.fg("customMessageText", goal ? ` — ${goal}` : " — goal da definire");
+		const title = theme.fg("customMessageLabel", "◈ PLAN") + theme.fg("customMessageText", goal ? ` — ${goal}` : " — goal not yet set");
 		const sub = theme.fg("muted", "read-only ") + buildHeatBar(null);
 		const box = new Box(outputPad, 1, (t) => theme.bg("customMessageBg", t));
 		box.addChild(new Text(title, 0, 0));
@@ -324,6 +715,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 				return {
 					content: [{ type: "text", text: "Cannot exit plan mode: no interactive UI is available for user confirmation, so plan mode stays active." }],
 					details: { enabled },
+					isError: true,
 				};
 			}
 			const approved = approvedGoals(ctx.cwd);
@@ -340,11 +732,18 @@ export default function planGuard(pi: ExtensionAPI): void {
 				set(ctx, false, "◈ Plan mode OFF — full access restored.", "info");
 				if (hasApproved) {
 					for (const goal of approved) appendJournal(ctx.cwd, goal, "owner confirmed exit — implementation authorized");
+					// Same fresh-turn pattern as queueImplementationBriefing (mid-run
+					// tool GRANTS never reach the model this same turn): a short result
+					// here, the real kickoff queued for the NEXT turn where the
+					// restored full tool surface is actually visible.
+					const staged = gitStagedFiles(ctx.cwd);
+					const briefing =
+						`(APPROVED by owner — plan mode released via plan_exit. The owner's confirmation IS the authorization: start implementing the approved plan(s) [${approved.join(", ")}] NOW. Do not ask again.)\n\n` +
+						phaseMissionLine("execute") +
+						(staged.length > 0 ? `\n\n⚠ ${staged.length} pre-existing staged file(s) present — pi-subagents will reject every worker until they are committed or unstaged.` : "");
+					sendPlan(pi, ctx, briefing, approved.join(", "), "command");
 					return {
-						content: [{
-							type: "text",
-							text: `Plan mode exited. The owner's confirmation IS the authorization: start implementing the approved plan(s) [${approved.join(", ")}] NOW — do not ask again.`,
-						}],
+						content: [{ type: "text", text: "Plan mode exited — wind down this turn; the implementation briefing for the approved plan(s) arrives next turn." }],
 						details: { enabled, approved },
 					};
 				}
@@ -355,15 +754,33 @@ export default function planGuard(pi: ExtensionAPI): void {
 				details: { enabled },
 			};
 		},
+
+		renderCall(_args, theme, _context) {
+			return new Text(toolCallLabel(theme, "exiting plan mode"), 0, 0);
+		},
+
+		renderResult(result, { isPartial }, theme, context) {
+			if (isPartial) return new Text(theme.fg("warning", "confirming…"), 0, 0);
+			const text = firstLine(resultText(result));
+			if (context.isError) return new Text(theme.fg("error", text), 0, 0);
+			const details = result.details as { enabled?: boolean; approved?: string[] } | undefined;
+			if (details?.enabled === false) {
+				const approved = details.approved?.length ? theme.fg("muted", ` — implementing ${details.approved.join(", ")}`) : "";
+				return new Text(theme.fg("success", "plan mode exited ✓") + approved, 0, 0);
+			}
+			return new Text(theme.fg("muted", text), 0, 0);
+		},
 	});
 
 	pi.registerTool({
 		name: "ask_smart_plan",
 		label: "Ask (smart-plan)",
-		description: "Show a custom form: tabs, a human briefing pane, and an inline note when no option fits.",
+		description:
+			"Show a custom form: tabs, a human briefing pane, and an inline note when no option fits. Question sets larger than 4 are auto-paged into sequential forms (4 per page, answers aggregated in order); if the owner cancels a later page the remaining questions are reported as unanswered and MUST be re-asked — never assumed.",
 		promptSnippet: "ask_smart_plan: ask the user questions before continuing",
 		promptGuidelines: [
 			"Use ask_smart_plan for structured user decisions. Always fill detail with a plain-language briefing (context, facts, consequences; no jargon, no assumed prior turns). Fill each option preview with what happens if that option is chosen. Never invent an answer. Every form automatically ends with a built-in \"None of the above\" option plus optional note — never add your own equivalent option.",
+			"Questions beyond 4 are presented as sequential pages on your side — unanswered questions must be re-asked, never assumed.",
 		],
 		parameters: Type.Object({
 			questions: Type.Array(
@@ -378,58 +795,264 @@ export default function planGuard(pi: ExtensionAPI): void {
 					),
 					multiSelect: Type.Optional(Type.Boolean()),
 					options: Type.Array(
-						Type.Object({
-							label: Type.String(),
-							description: Type.Optional(Type.String()),
-							preview: Type.Optional(Type.String()),
-						}),
+						Type.Union([
+							Type.String(),
+							Type.Object({
+								label: Type.String(),
+								description: Type.Optional(Type.String()),
+								preview: Type.Optional(Type.String()),
+							}),
+						]),
 						{ minItems: 2, maxItems: 4 }
 					),
 				}),
-				{ minItems: 1, maxItems: 4 }
+				// Generous schema cap for the WHOLE question set: the execution flow
+				// auto-pages questions at ASK_FORM_PAGE_MAX (4) per sequential form,
+				// so nothing beyond the first page is ever rejected — this cap only
+				// bounds what a single tool CALL may carry and removes the old
+				// maxItems:4 validation that made the model silently decide the
+				// dropped question.
+				{ minItems: 1, maxItems: 12 }
 			),
 			releasePlanGuardOnAnswer: Type.Optional(
 				Type.Boolean({
 					description:
-						"Set true ONLY on the final plan-approval form: when the user answers without declining, the read-only plan guard is released in the same interaction (single approval gate).",
+						"Alias for phaseGate: true, valid ONLY in review_final (the guard-release gate). Invalid everywhere else — use phaseGate: true instead.",
+				}),
+			),
+			phaseGate: Type.Optional(
+				Type.Boolean({
+					description:
+						"Set true ONLY in review_hld or review_final: opens the harness-composed owner gate form (fixed Approve / Reject in review_hld; Start implementation / Stay in planning in review_final). The harness owns the question and options — your questions[0].detail (if set) is folded into extra briefing text after the contract summary; questions[0].options are ignored. Invalid in every other phase — call plan_advance there instead.",
 				}),
 			),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			// PHASE GATE — the ONLY way the model advances out of review_hld/
+			// review_final. The harness composes the question itself (fixed
+			// labels, see runReviewGate) so routing is mechanical and never
+			// depends on parsing the model's own wording. releasePlanGuardOnAnswer
+			// is a plain alias for the review_final gate; invalid everywhere else.
+			const gateRequested = params.phaseGate === true || params.releasePlanGuardOnAnswer === true;
 			if (!ctx.hasUI) {
+				if (gateRequested) {
+					return {
+						content: [{ type: "text", text: "Gate blocked: no interactive UI is available — the owner gate needs the interactive TUI." }],
+						details: { ui: false },
+						isError: true,
+					};
+				}
 				return { content: [{ type: "text", text: "No interactive UI; ask in prose." }], details: { ui: false } };
 			}
-			let questions = params.questions;
-			if (params.releasePlanGuardOnAnswer === true && enabled) {
-				const view = presentedGoal === undefined ? null : getPlanView(ctx.cwd, presentedGoal);
-				if (!view) {
+
+			if (gateRequested && !isSubagentChild) {
+				const current = currentPhase(ctx.cwd, true);
+				if (params.releasePlanGuardOnAnswer === true && params.phaseGate !== true) {
+					if (!current || current.phase !== "review_final") {
+						return {
+							content: [{ type: "text", text: "the guard is released only by the review_final gate (use phaseGate: true)." }],
+							details: {},
+							isError: true,
+						};
+					}
+				}
+				if (!current) {
 					return {
-						content: [{
-							type: "text",
-							text: "Release form blocked: no plan has been presented in this session (or it was invalidated by a later plan_save / completed goal). Call plan_present first, then open the release form (releasePlanGuardOnAnswer: true).",
-						}],
+						content: [{ type: "text", text: "Gate blocked: no active goal yet — establish the goal before requesting a phase gate." }],
 						details: {},
 						isError: true,
 					};
 				}
-				// The owner must see the real contract in the form UI itself — never
-				// rely on what the model wrote in chat. Prepended to the first
-				// question's briefing, which the form wraps through wrapTextWithAnsi.
-				questions = params.questions.map((q, i) =>
-					i === 0 ? { ...q, detail: `${buildContractSummary(view)}\n\n${q.detail ?? ""}`.trim() } : q
-				);
+				if (current.phase !== "review_hld" && current.phase !== "review_final") {
+					return {
+						content: [{
+							type: "text",
+							text: `Gate blocked: "${current.phase}" has no owner gate — call plan_advance to self-advance instead.`,
+						}],
+						details: { phase: current.phase },
+						isError: true,
+					};
+				}
+				// Deliverable must be complete before the gate form opens; the form
+				// must never open unannounced.
+				const snapshot = buildPhaseSnapshot(ctx, current);
+				const verdict = phaseDeliverableReady(current.phase, snapshot);
+				if (!verdict.ready) {
+					const hint = nextActionHint(current.phase, snapshot);
+					return {
+						content: [{
+							type: "text",
+							text: `Gate "${current.phase}" blocked — the deliverable is not complete. Missing: ${verdict.missing.join("; ")}. ${hint}`,
+						}],
+						details: { gateBlocked: true, phase: current.phase, missing: verdict.missing },
+						isError: true,
+					};
+				}
+				// The model's own detail (if any) is demoted to extra briefing
+				// appended after the contract summary inside runReviewGate; its
+				// options are never consulted — the labels are fixed.
+				const modelDetail = params.questions[0]?.detail?.trim();
+				return await runReviewGate(ctx, current.goal, current.phase, modelDetail);
 			}
-			const result = await runAskForm(ctx, questions);
-			if ("declined" in result) {
-				return { content: [{ type: "text", text: "The user declined." }], details: { answers: {}, declined: true } };
+
+			// ORDINARY FORM — auto-paging: question sets larger than one page are
+			// split into sequential forms (ASK_FORM_PAGE_MAX per page), aggregated
+			// into this single tool result in original order, so an overflow can
+			// NEVER be rejected. If a later page is cancelled, the collected
+			// answers plus the unanswered questions are reported — nothing is ever
+			// invented.
+			const collected = await runAskFormPages(ctx, params.questions);
+			const blocks = Object.entries(collected.answers).map(([q, a]) => `Q: ${q}\nA: ${Array.isArray(a) ? a.join(", ") : a}`);
+			if (collected.declined) {
+				if (collected.unanswered.length > 0) {
+					blocks.push(`UNANSWERED — the owner cancelled before answering these questions (do NOT assume them): ${collected.unanswered.map((q) => q.question).join(" | ")}`);
+				}
+				blocks.push("ANSWER RULE: unanswered questions must be re-asked, never assumed.");
+				return { content: [{ type: "text", text: blocks.join("\n") }], details: { answers: collected.answers, declined: true, unanswered: collected.unanswered.map((q) => q.question) } };
 			}
-			const blocks = Object.entries(result.answers).map(([q, a]) => `Q: ${q}\nA: ${Array.isArray(a) ? a.join(", ") : a}`);
-			if (params.releasePlanGuardOnAnswer === true && enabled) {
-				set(ctx, false, "Plan approved — plan mode OFF, full access restored.", "info");
-				blocks.push("(APPROVED by owner — plan mode released. The owner's answer IS the authorization: start implementing NOW. Do not ask for confirmation again.)");
-				return { content: [{ type: "text", text: blocks.join("\n") }], details: { answers: result.answers, released: true } };
+			return { content: [{ type: "text", text: blocks.join("\n") }], details: { answers: collected.answers, declined: false, unanswered: [] } };
+		},
+
+		renderCall(args, theme, _context) {
+			const gate = args.phaseGate === true || args.releasePlanGuardOnAnswer === true;
+			const n = args.questions.length;
+			const label = gate ? "opening the owner gate" : `asking the owner (${n} question${n === 1 ? "" : "s"})`;
+			return new Text(toolCallLabel(theme, label), 0, 0);
+		},
+
+		renderResult(result, { isPartial }, theme, context) {
+			if (isPartial) return new Text(theme.fg("warning", "asking…"), 0, 0);
+			const text = firstLine(resultText(result));
+			if (context.isError) return new Text(theme.fg("error", text), 0, 0);
+			const details = result.details as
+				| { answers?: Record<string, unknown>; declined?: boolean; unanswered?: string[]; advanced?: boolean; released?: boolean; phase?: string }
+				| undefined;
+			if (details?.released) return new Text(theme.fg("success", `authorized ✓ → ${details.phase}`), 0, 0);
+			if (details?.advanced) return new Text(theme.fg("success", `approved ✓ → ${details.phase}`), 0, 0);
+			if (details?.declined) {
+				const unanswered = details.unanswered?.length ? ` (${details.unanswered.length} unanswered)` : "";
+				return new Text(theme.fg("warning", `postponed${unanswered}`), 0, 0);
 			}
-			return { content: [{ type: "text", text: blocks.join("\n") }], details: { answers: result.answers } };
+			const count = details?.answers ? Object.keys(details.answers).length : 0;
+			return new Text(theme.fg("success", `answered ✓ (${count})`), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "plan_advance",
+		label: "Advance phase",
+		description:
+			"Formless self-advance: move to the next phase once the CURRENT phase's deliverable is complete. Legal in every planning phase, including review_hld/review_final: called there (or when the target of an advance is a review phase) it opens the owner's gate form itself — panel + form, in the same call — instead of silently advancing.",
+		promptSnippet: "plan_advance: self-advance to the next phase once the deliverable is ready; opens the owner's gate form automatically in review_hld/review_final",
+		promptGuidelines: [
+			"Call plan_advance only once the current phase's LOCAL MISSION deliverable is complete — it refuses (isError, phase untouched) when the deliverable is incomplete. In review_hld/review_final, and when advancing INTO one of them, it opens the owner's gate form itself in the same call — never open it any other way.",
+		],
+		parameters: Type.Object({}),
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			const current = currentPhase(ctx.cwd, true);
+			if (!current) {
+				return {
+					content: [{ type: "text", text: "plan_advance blocked — no active goal yet; establish the goal before requesting a phase advance." }],
+					details: {},
+					isError: true,
+				};
+			}
+			// Already IN a review phase: plan_advance RE-OPENS the owner gate — the
+			// harness composes the panel + form itself in this same call; there is
+			// no separate presentation step or tool.
+			if (current.phase === "review_hld" || current.phase === "review_final") {
+				const snapshot = buildPhaseSnapshot(ctx, current);
+				const verdict = phaseDeliverableReady(current.phase, snapshot);
+				if (!verdict.ready) {
+					const hint = nextActionHint(current.phase, snapshot);
+					return {
+						content: [{
+							type: "text",
+							text: `plan_advance blocked — "${current.phase}" deliverable incomplete. Missing: ${verdict.missing.join("; ")}. ${hint}`,
+						}],
+						details: { missing: verdict.missing, phase: current.phase },
+						isError: true,
+					};
+				}
+				// F4: the owner gate needs the interactive TUI — refuse before opening
+				// it rather than letting runReviewGate fabricate an owner "postpone"
+				// for a headless caller.
+				if (!ctx.hasUI) {
+					return {
+						content: [{ type: "text", text: `plan_advance blocked — the owner gate for "${current.phase}" needs the interactive TUI; no interactive UI is available.` }],
+						details: { phase: current.phase },
+						isError: true,
+					};
+				}
+				return await runReviewGate(ctx, current.goal, current.phase);
+			}
+			const target = PHASE_NEXT[current.phase];
+			if (!target) {
+				return {
+					content: [{ type: "text", text: `plan_advance blocked — "${current.phase}" has no further advance.` }],
+					details: { phase: current.phase },
+					isError: true,
+				};
+			}
+			const snapshot = buildPhaseSnapshot(ctx, current);
+			const verdict = phaseDeliverableReady(current.phase, snapshot);
+			if (!verdict.ready) {
+				const hint = nextActionHint(current.phase, snapshot);
+				return {
+					content: [{
+						type: "text",
+						text: `plan_advance blocked — "${current.phase}" deliverable incomplete. Missing: ${verdict.missing.join("; ")}. ${hint}`,
+					}],
+					details: { missing: verdict.missing, phase: current.phase, target },
+					isError: true,
+				};
+			}
+			// Target is a review phase: the owner gate needs the interactive TUI —
+			// refuse BEFORE transitioning so a goal is never stranded in an
+			// ungateable phase.
+			if (target === "review_hld" || target === "review_final") {
+				if (!ctx.hasUI) {
+					return {
+						content: [{ type: "text", text: `plan_advance blocked — the owner gate for "${target}" needs the interactive TUI; no interactive UI is available.` }],
+						details: { phase: current.phase, target },
+						isError: true,
+					};
+				}
+				transitionPhase(ctx, current.goal, target, `phase advanced: ${current.phase} → ${target}`);
+				const gateResult = await runReviewGate(ctx, current.goal, target);
+				return {
+					content: [{ type: "text", text: `(PHASE ADVANCED — now in ${target}. ${phaseMissionLine(target)})\n\n${gateResult.content[0]?.text ?? ""}` }],
+					details: { advanced: true, ...gateResult.details },
+					isError: gateResult.isError,
+				};
+			}
+			transitionPhase(ctx, current.goal, target, `phase advanced: ${current.phase} → ${target}`);
+			return {
+				content: [{ type: "text", text: `(PHASE ADVANCED — now in ${target}. ${phaseMissionLine(target)})` }],
+				details: { advanced: true, phase: target },
+			};
+		},
+
+		renderCall(_args, theme, _context) {
+			return new Text(toolCallLabel(theme, "advancing…"), 0, 0);
+		},
+
+		renderResult(result, { isPartial }, theme, context) {
+			if (isPartial) return new Text(theme.fg("warning", "advancing…"), 0, 0);
+			const text = firstLine(resultText(result));
+			if (context.isError) return new Text(theme.fg("error", text), 0, 0);
+			const details = result.details as { phase?: Phase; declined?: boolean; released?: boolean } | undefined;
+			if (details?.phase) {
+				// Budget leaves room for the "→ <phase> — " prefix and an optional
+				// " (postponed)"/" (guard released)" suffix so the collapsed line
+				// stays on one row at a typical 72-column width.
+				const mission = truncateToWidth(stripLocalMission(phaseMissionLine(details.phase)), 46);
+				let line = theme.fg("success", "→ ") + theme.fg("accent", theme.bold(details.phase)) + theme.fg("muted", ` — ${mission}`);
+				if (details.declined) line += theme.fg("warning", " (postponed)");
+				else if (details.released) line += theme.fg("muted", " (guard released)");
+				return new Text(line, 0, 0);
+			}
+			return new Text(theme.fg("success", text), 0, 0);
 		},
 	});
 
@@ -446,12 +1069,245 @@ export default function planGuard(pi: ExtensionAPI): void {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			try {
 				savePlan(ctx.cwd, params.goal, params.content);
-				presentedGoal = undefined; // a new save invalidates the previous presentation
 				refreshWidget(ctx);
 				return { content: [{ type: "text", text: `Plan saved for ${params.goal}.` }], details: { goal: params.goal } };
 			} catch (error) {
 				return { content: [{ type: "text", text: safeError("plan_save", error) }], details: {}, isError: true };
 			}
+		},
+
+		renderCall(args, theme, _context) {
+			return new Text(`${toolCallLabel(theme, "saving plan")} ${theme.fg("accent", args.goal)}`, 0, 0);
+		},
+
+		renderResult(result, { isPartial }, theme, context) {
+			if (isPartial) return new Text(theme.fg("warning", "saving…"), 0, 0);
+			if (context.isError) return new Text(theme.fg("error", firstLine(resultText(result))), 0, 0);
+			return new Text(theme.fg("success", "plan saved ✓") + theme.fg("muted", " (waves rebuilt)"), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "plan_intent",
+		label: "Confirm objective",
+		description:
+			"Owner-backed mechanical gate: reformulate the owner's objective for a goal and open a Confirm/Keep chatting form. Only a Confirm answer creates the confirmed objective (intent.txt) — plan_save refuses any content for the goal until this has run. Re-run in discovery to re-confirm a refined statement (e.g. after a grilling round or a Gate 1 rejection).",
+		promptSnippet: "plan_intent: confirm the owner's objective before starting the HLD (owner-backed gate — required once per goal before plan_save)",
+		promptGuidelines: [
+			"Call plan_intent as soon as you can state the objective, and BEFORE any HLD work — plan_save is rejected until it returns confirmed.",
+			"Keep chatting (or Esc) REJECTS the objective — nothing is created; re-elicit with the owner and call plan_intent again with the revised statement. Only Confirm creates it.",
+			"Never reference store paths.",
+		],
+		parameters: Type.Object({
+			goal: Type.String(),
+			statement: Type.String(),
+			openQuestions: Type.Optional(
+				Type.Array(OPEN_QUESTION_SCHEMA, {
+					minItems: 1,
+					maxItems: 12,
+					description:
+						"Declare any still-open decisions here instead of confirming — the harness forms them (auto-paged) BEFORE any card/confirm form; the store stays untouched. Call plan_intent again with openQuestions empty (or omitted) once resolved.",
+				}),
+			),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			// F3: plan_intent mutates the plan store — like every other planning
+			// flow, it requires plan mode ON. Called with the guard off it would
+			// otherwise run unrestricted (the tool_call default-deny hook only
+			// enforces while `enabled`), and the resulting goal gets discarded by
+			// the next activation's sweepStaleGoal, reading as a fabricated "stale
+			// plan discarded" to the owner.
+			if (!enabled || isSubagentChild) {
+				return {
+					content: [{ type: "text", text: "plan mode is off — activate it first (shift+tab or /plan)" }],
+					details: {},
+					isError: true,
+				};
+			}
+			// F7: a capability refusal must be isError:true, never fall through to
+			// runAskForm's own `{ declined: true }` — that path is indistinguishable
+			// from a genuine owner cancel and would fabricate "the owner postponed"
+			// for a caller that can never actually show the form.
+			if (!ctx.hasUI || typeof ctx.ui.custom !== "function") {
+				return {
+					content: [{ type: "text", text: "the objective confirmation form needs the interactive TUI" }],
+					details: {},
+					isError: true,
+				};
+			}
+			try {
+				validateGoalSlug(params.goal);
+			} catch (error) {
+				return { content: [{ type: "text", text: safeError("plan_intent", error) }], details: {}, isError: true };
+			}
+			const sanitizedPreview = params.statement.replace(/\s+/g, " ").trim();
+			if (!sanitizedPreview) {
+				return {
+					content: [{ type: "text", text: "plan_intent needs a non-empty objective statement" }],
+					details: {},
+					isError: true,
+				};
+			}
+			// openQuestions branch: a pre-confirmation safety net, NOT a variant of
+			// Confirm — the statement may still be provisional while questions are
+			// open, so the length cap below applies ONLY to the confirm branch
+			// (hasOpenQuestions === false). Every other guard (slug/statement,
+			// lock/goal-switch, intentGuardViolation, gateFormOpen latch below)
+			// applies unconditionally to BOTH branches.
+			const openQuestions = params.openQuestions ?? [];
+			const hasOpenQuestions = openQuestions.length > 0;
+			// Cap check moved HERE, pre-form: the owner must never sit through the
+			// Confirm/Keep-chatting form only to have confirmIntent reject an
+			// over-cap statement afterwards. Refuse before any entry is appended or
+			// any form opens — confirmIntent's own check (below, on Confirm) stays as
+			// a belt for callers that somehow bypass this one.
+			if (!hasOpenQuestions && sanitizedPreview.length > OBJECTIVE_MAX_LEN) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "objective too long — distill it: WHAT the owner wants and the essential constraints, not HOW (implementation choices belong to the HLD)",
+						},
+					],
+					details: {},
+					isError: true,
+				};
+			}
+			const current = currentPhase(ctx.cwd, true);
+			if (current && current.goal !== params.goal && isPlanningPhase(current.phase)) {
+				return {
+					content: [{ type: "text", text: `one active goal per session — complete or abandon "${current.goal}" first` }],
+					details: {},
+					isError: true,
+				};
+			}
+			// F2: guard the TARGET goal directly (readMachinePhase/goalIsDone),
+			// not the session pointer — an unpointed goal past discovery, or one
+			// already archived in done/, must refuse just as reliably as a pointed
+			// one (previously only `current.phase` was consulted, so Confirm on an
+			// unpointed done goal resurrected it via ensureActiveGoalDir with no
+			// gate at all).
+			const violation = intentGuardViolation(ctx.cwd, params.goal);
+			if (violation) {
+				return { content: [{ type: "text", text: violation }], details: {}, isError: true };
+			}
+			if (gateFormOpen) {
+				return {
+					content: [{ type: "text", text: "a gate form is already open — wait for the owner's answer" }],
+					details: {},
+					isError: true,
+				};
+			}
+			gateFormOpen = true;
+			try {
+				// SAFETY NET: openQuestions lets the model reach plan_intent with open
+				// decisions still in hand — declaring them here elicits the SAME paged
+				// form ask_smart_plan renders (models fill fields they can see),
+				// resolved BEFORE any card/confirm form. The store stays untouched: no
+				// OBJECTIVE PROPOSAL entry, no Confirm/Keep-chatting form. The
+				// result text tells the model to resolve the answers and re-call
+				// plan_intent with openQuestions empty (or omitted) to confirm.
+				if (hasOpenQuestions) {
+					const collected = await runAskFormPages(ctx, openQuestions);
+					const blocks = Object.entries(collected.answers).map(([q, a]) => `Q: ${q}\nA: ${Array.isArray(a) ? a.join(", ") : a}`);
+					if (collected.declined && collected.unanswered.length > 0) {
+						blocks.push(`UNANSWERED — the owner cancelled before answering these questions (do NOT assume them): ${collected.unanswered.map((q) => q.question).join(" | ")}`);
+						blocks.push("ANSWER RULE: unanswered questions must be re-asked, never assumed.");
+					}
+					blocks.push("Resolve these answers with the owner, then call plan_intent again with openQuestions empty (or omitted) to confirm.");
+					return {
+						content: [{ type: "text", text: blocks.join("\n") }],
+						details: {
+							goal: params.goal,
+							answers: collected.answers,
+							declined: collected.declined,
+							unanswered: collected.unanswered.map((q) => q.question),
+						},
+						isError: false,
+					};
+				}
+				// The proposal in the transcript — this durable card is the single
+				// source for the statement text; the form's side panel does not
+				// repeat it (no detail set below).
+				pi.appendEntry(INTENT_ENTRY_KEY, { goal: params.goal, statement: sanitizedPreview });
+				const question: AskQuestionInput = {
+					question: "Is this the objective?",
+					options: [{ label: "Confirm" }, { label: "Keep chatting" }],
+				};
+				// No built-in "None of the above" here (includeNoneOption: false) —
+				// Confirm/Keep chatting are the only picks; Esc/decline below is
+				// the explicit-rejection path's exact equivalent (same result text).
+				const result = await runAskForm(ctx, [question], { includeNoneOption: false });
+				if ("declined" in result) {
+					return {
+						content: [{ type: "text", text: INTENT_KEEP_CHATTING_TEXT }],
+						details: { goal: params.goal, declined: true },
+						isError: false,
+					};
+				}
+				const answer = result.answers[question.question];
+				const label = typeof answer === "string" ? answer : Array.isArray(answer) ? answer[0] : undefined;
+				if (label === "Confirm") {
+					// F6 (TOCTOU): the guards above ran before the form await — a
+					// parallel tool call could have switched/repointed the session
+					// goal or advanced/completed THIS goal while the owner was
+					// answering. Re-run both checks now, right before the write; any
+					// violation refuses with no write, never a stale-checked confirm.
+					const currentNow = currentPhase(ctx.cwd, true);
+					if (currentNow && currentNow.goal !== params.goal && isPlanningPhase(currentNow.phase)) {
+						return {
+							content: [{ type: "text", text: `one active goal per session — complete or abandon "${currentNow.goal}" first` }],
+							details: {},
+							isError: true,
+						};
+					}
+					const violationNow = intentGuardViolation(ctx.cwd, params.goal);
+					if (violationNow) {
+						return { content: [{ type: "text", text: violationNow }], details: {}, isError: true };
+					}
+					try {
+						confirmIntent(ctx.cwd, params.goal, params.statement);
+					} catch (error) {
+						return { content: [{ type: "text", text: safeError("plan_intent", error) }], details: {}, isError: true };
+					}
+					// Anti-leak: the pre-intent investigation flag must not survive
+					// into a later goal confirmed in the same session.
+					investigationDone = false;
+					refreshWidget(ctx);
+					return {
+						content: [{ type: "text", text: "objective confirmed — proceed: optional grilling round, then HLD co-design and plan_save" }],
+						details: { goal: params.goal, confirmed: true },
+						isError: false,
+					};
+				}
+				// Only "Keep chatting" remains — the form has no other option (Esc/
+				// decline above is this same explicit-rejection path's equivalent).
+				// Corrections happen in the conversation itself — no note dialog.
+				return {
+					content: [{ type: "text", text: INTENT_KEEP_CHATTING_TEXT }],
+					details: { goal: params.goal, keepChatting: true },
+					isError: false,
+				};
+			} finally {
+				gateFormOpen = false;
+			}
+		},
+
+		renderCall(args, theme, _context) {
+			const n = args.openQuestions?.length ?? 0;
+			const label = n > 0 ? `asking ${n} open question${n === 1 ? "" : "s"}` : "proposing objective";
+			return new Text(`${toolCallLabel(theme, label)} ${theme.fg("accent", args.goal)}`, 0, 0);
+		},
+
+		renderResult(result, { isPartial }, theme, context) {
+			if (isPartial) return new Text(theme.fg("warning", "confirming…"), 0, 0);
+			const text = firstLine(resultText(result));
+			if (context.isError) return new Text(theme.fg("error", text), 0, 0);
+			const details = result.details as { confirmed?: boolean; declined?: boolean; keepChatting?: boolean; unanswered?: string[] } | undefined;
+			if (details?.confirmed) return new Text(theme.fg("success", "objective confirmed ✓"), 0, 0);
+			if (details?.declined || details?.keepChatting) return new Text(theme.fg("warning", "keep chatting — objective rejected"), 0, 0);
+			if (details?.unanswered) return new Text(theme.fg("muted", `open questions asked (${details.unanswered.length} unanswered)`), 0, 0);
+			return new Text(theme.fg("muted", text), 0, 0);
 		},
 	});
 
@@ -473,6 +1329,17 @@ export default function planGuard(pi: ExtensionAPI): void {
 				return { content: [{ type: "text", text: safeError("journal_append", error) }], details: {}, isError: true };
 			}
 		},
+
+		renderCall(args, theme, _context) {
+			const preview = truncateToWidth(firstLine(args.lines), 60);
+			return new Text(`${toolCallLabel(theme, "noting")} ${theme.fg("accent", `"${preview}"`)}`, 0, 0);
+		},
+
+		renderResult(result, { isPartial }, theme, context) {
+			if (isPartial) return new Text(theme.fg("warning", "noting…"), 0, 0);
+			if (context.isError) return new Text(theme.fg("error", firstLine(resultText(result))), 0, 0);
+			return new Text(theme.fg("success", "noted ✓"), 0, 0);
+		},
 	});
 
 	pi.registerTool({
@@ -492,6 +1359,28 @@ export default function planGuard(pi: ExtensionAPI): void {
 				return { content: [{ type: "text", text: safeError("plan_recall", error) }], details: {}, isError: true };
 			}
 		},
+
+		renderCall(args, theme, _context) {
+			let text = toolCallLabel(theme, "recalling plans");
+			if (args.query) text += ` ${theme.fg("accent", args.query)}`;
+			return new Text(text, 0, 0);
+		},
+
+		renderResult(result, { expanded, isPartial }, theme, context) {
+			if (isPartial) return new Text(theme.fg("warning", "recalling…"), 0, 0);
+			const text = resultText(result);
+			if (context.isError) return new Text(theme.fg("error", firstLine(text)), 0, 0);
+			const lines = text.split("\n").filter((l) => l.trim().length > 0);
+			if (lines.length === 0) return new Text(theme.fg("muted", "no matching plans"), 0, 0);
+			const shown = expanded ? lines.slice(0, 30) : lines.slice(0, 3);
+			let out = shown.map((l) => theme.fg("text", truncateToWidth(l, 100))).join("\n");
+			const hidden = lines.length - shown.length;
+			if (hidden > 0) {
+				const more = expanded ? `... ${hidden} more lines` : `... ${hidden} more (${keyHint("app.tools.expand", "to expand")})`;
+				out += `\n${theme.fg("dim", more)}`;
+			}
+			return new Text(out, 0, 0);
+		},
 	});
 
 	pi.registerTool({
@@ -510,6 +1399,20 @@ export default function planGuard(pi: ExtensionAPI): void {
 			} catch (error) {
 				return { content: [{ type: "text", text: safeError("plan_next", error) }], details: {}, isError: true };
 			}
+		},
+
+		renderCall(args, theme, _context) {
+			return new Text(`${toolCallLabel(theme, "what's ready?")} ${theme.fg("accent", args.goal)}`, 0, 0);
+		},
+
+		renderResult(result, { isPartial }, theme, context) {
+			if (isPartial) return new Text(theme.fg("warning", "checking…"), 0, 0);
+			const text = resultText(result);
+			if (context.isError) return new Text(theme.fg("error", firstLine(text)), 0, 0);
+			const ids = [...text.matchAll(/^- (\S+):/gm)].map((m) => m[1]);
+			if (ids.length > 0) return new Text(theme.fg("accent", `ready: ${ids.join(" ")}`), 0, 0);
+			if (text.includes("no Tasks section")) return new Text(theme.fg("muted", "no tasks yet"), 0, 0);
+			return new Text(theme.fg("success", "all done ✓"), 0, 0);
 		},
 	});
 
@@ -531,10 +1434,29 @@ export default function planGuard(pi: ExtensionAPI): void {
 				const text = updateTaskStatus(ctx.cwd, params.goal, params.taskId, params.status);
 				noteCwd(ctx);
 				refreshWidget(ctx);
+				// Live progress on the working message, execute only: the guard is
+				// already off by the time real task work happens (Gate 2 released
+				// it), so this is the one place execute's own progress can still
+				// reach the working line — refreshed on every task-status call.
+				if (currentPhase(ctx.cwd, true)?.phase === "execute") {
+					const view = getPlanView(ctx.cwd, params.goal);
+					if (view) ctx.ui.setWorkingMessage(`◈ plan · execute — implementing (${view.doneCount}/${view.total} done)`);
+				}
 				return { content: [{ type: "text", text }], details: { goal: params.goal, taskId: params.taskId, status: params.status } };
 			} catch (error) {
 				return { content: [{ type: "text", text: safeError("plan_task_update", error) }], details: {}, isError: true };
 			}
+		},
+
+		renderCall(args, theme, _context) {
+			const verb = TASK_STATUS_VERB[args.status] ?? args.status;
+			return new Text(`${toolCallLabel(theme, `${args.taskId} →`)} ${theme.fg("accent", verb)}`, 0, 0);
+		},
+
+		renderResult(result, { isPartial }, theme, context) {
+			if (isPartial) return new Text(theme.fg("warning", "updating…"), 0, 0);
+			const text = firstLine(resultText(result));
+			return new Text(theme.fg(context.isError ? "error" : "success", text), 0, 0);
 		},
 	});
 
@@ -567,41 +1489,46 @@ export default function planGuard(pi: ExtensionAPI): void {
 				const failed = results.filter((r) => !r.ok).length;
 				const body = results.map((r) => `${r.ok ? "PASS" : "FAIL"} (${r.ms}ms) ${r.command}`).join("\n");
 				const headline = failed === 0 ? `DoD: ${results.length}/${results.length} PASS.` : `DoD FAILED: ${failed}/${results.length} failed.`;
+				if (failed === 0) sessionState.dodPassed = true;
 				return { content: [{ type: "text", text: `${headline}\n${body}` }], details: { passed: failed === 0 }, isError: failed > 0 };
 			} catch (error) {
 				return { content: [{ type: "text", text: safeError("plan_verify", error) }], details: {}, isError: true };
 			}
 		},
-	});
 
-	pi.registerTool({
-		name: "plan_present",
-		label: "Present plan panel",
-		description: "Render the structured implementation-plan panel (waves + live checklist) in the transcript for the owner.",
-		promptSnippet: "plan_present: render the structured plan panel for the owner",
-		promptGuidelines: [
-			"Call plan_present AFTER posting the human abstraction in chat and BEFORE opening the approval form.",
-		],
-		parameters: Type.Object({
-			goal: Type.String(),
-		}),
-		async execute(_id, params, _signal, _onUpdate, ctx) {
-			noteCwd(ctx);
-			try {
-				const view = getPlanView(ctx.cwd, params.goal);
-				if (!view) throw new PlanStoreValidationError(`no active plan for goal "${params.goal}" — save one first via plan_save`);
-				pi.appendEntry(PRESENT_ENTRY_KEY, { goal: params.goal });
-				presentedGoal = params.goal;
-				return {
-					content: [{ type: "text", text: "Implementation-plan panel rendered above. Now open the approval form (releasePlanGuardOnAnswer: true) — the full plan is visible to the owner." }],
-					details: { goal: params.goal },
-				};
-			} catch (error) {
-				return { content: [{ type: "text", text: safeError("plan_present", error) }], details: {}, isError: true };
-			}
+		renderCall(args, theme, _context) {
+			return new Text(`${toolCallLabel(theme, "running DoD checks")} ${theme.fg("accent", args.goal)}`, 0, 0);
+		},
+
+		renderResult(result, { expanded, isPartial }, theme, context) {
+			if (isPartial) return new Text(theme.fg("warning", "running DoD checks…"), 0, 0);
+			const text = resultText(result);
+			const lines = text.split("\n").filter(Boolean);
+			const headline = lines[0] ?? "";
+			// A caught error (safeError text) never starts with "DoD" — the two
+			// real DoD headlines always do ("DoD: N/N PASS." / "DoD FAILED: …").
+			if (context.isError && !headline.startsWith("DoD")) return new Text(theme.fg("error", headline), 0, 0);
+			const rows = lines.slice(1).map((row) => {
+				const m = row.match(/^(PASS|FAIL) \((\d+)ms\) (.*)$/);
+				if (!m) return { failed: false, line: theme.fg("dim", row) };
+				const ok = m[1] === "PASS";
+				const glyph = ok ? theme.fg("success", "✓") : theme.fg("error", "✗");
+				return { failed: !ok, line: `${glyph} ${theme.fg("dim", `(${m[2]}ms)`)} ${theme.fg(ok ? "text" : "error", m[3])}` };
+			});
+			const color = headline.startsWith("DoD FAILED") ? "error" : headline.startsWith("DoD:") ? "success" : "muted";
+			const summary = theme.fg(color, theme.bold(headline));
+			// Collapsed: headline plus only the failing rows (all-pass stays a
+			// single line); expanded: the full per-command breakdown.
+			const shown = expanded ? rows : rows.filter((r) => r.failed);
+			if (shown.length === 0) return new Text(summary, 0, 0);
+			return new Text([summary, ...shown.map((r) => r.line)].join("\n"), 0, 0);
 		},
 	});
 
+	// plan_present (tool) is gone: the two review gates are harness-driven —
+	// runReviewGate appends PRESENT_ENTRY_KEY itself inside plan_advance /
+	// ask_smart_plan's phaseGate branch. PRESENT_ENTRY_KEY and its renderer
+	// survive so old transcripts (pre-0.10.0) keep rendering their panel.
 	pi.registerEntryRenderer(PRESENT_ENTRY_KEY, (entry, _opts, theme) => {
 		const goal = (entry.data as { goal?: string } | undefined)?.goal ?? "";
 		const view = lastCwd ? getPlanView(lastCwd, goal) : null;
@@ -613,29 +1540,21 @@ export default function planGuard(pi: ExtensionAPI): void {
 		};
 	});
 
-	pi.registerTool({
-		name: "plan_approve",
-		label: "Approve & persist plan",
-		description: "Persist the owner-approved plan to the durable store. Call ONLY after Gate 1 (the owner approved the contract via form).",
-		promptSnippet: "plan_approve: persist the approved plan durably",
-		promptGuidelines: [
-			"Call plan_approve immediately AFTER the Gate 1 approval click and BEFORE opening the Gate 2 authorization form.",
-		],
-		parameters: Type.Object({
-			goal: Type.String(),
-		}),
-		async execute(_id, params, _signal, _onUpdate, ctx) {
-			noteCwd(ctx);
-			try {
-				const dest = persistApproved(ctx.cwd, params.goal);
-				return {
-					content: [{ type: "text", text: `Plan approved and persisted durably (${params.goal}). Now open the Gate 2 authorization form.` }],
-					details: { goal: params.goal },
-				};
-			} catch (error) {
-				return { content: [{ type: "text", text: safeError("plan_approve", error) }], details: {}, isError: true };
-			}
-		},
+	// INTENT_ENTRY_KEY: the "OBJECTIVE PROPOSAL" card plan_intent appends to
+	// the main transcript right before opening its Confirm/Keep chatting form
+	// (see the plan_intent tool below) — same pattern as
+	// PRESENT_ENTRY_KEY above, data-driven from the appended entry itself
+	// rather than a store re-read (the statement isn't persisted until Confirm).
+	pi.registerEntryRenderer(INTENT_ENTRY_KEY, (entry, _opts, theme) => {
+		const data = entry.data as { goal?: string; statement?: string } | undefined;
+		const goal = data?.goal ?? "";
+		const statement = data?.statement ?? "";
+		return {
+			render(width = 80): string[] {
+				return renderIntentPanel(goal, statement, theme, width);
+			},
+			invalidate() {},
+		};
 	});
 
 	pi.registerTool({
@@ -650,7 +1569,11 @@ export default function planGuard(pi: ExtensionAPI): void {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			try {
 				const completed = completeGoal(ctx.cwd, params.goal);
+				if (completed) sessionState.completed = true;
 				refreshWidget(ctx);
+				// Mandatory reset: plan_complete always restores pi's default
+				// working message — pi never clears a custom one on its own.
+				ctx.ui.setWorkingMessage();
 				return {
 					content: [{ type: "text", text: completed ? `Goal ${params.goal} completed.` : `No active goal ${params.goal}.` }],
 					details: { goal: params.goal, completed },
@@ -658,6 +1581,18 @@ export default function planGuard(pi: ExtensionAPI): void {
 			} catch (error) {
 				return { content: [{ type: "text", text: safeError("plan_complete", error) }], details: {}, isError: true };
 			}
+		},
+
+		renderCall(args, theme, _context) {
+			return new Text(`${toolCallLabel(theme, "completing")} ${theme.fg("accent", args.goal)}`, 0, 0);
+		},
+
+		renderResult(result, { isPartial }, theme, context) {
+			if (isPartial) return new Text(theme.fg("warning", "completing…"), 0, 0);
+			const text = firstLine(resultText(result));
+			if (context.isError) return new Text(theme.fg("error", text), 0, 0);
+			const details = result.details as { completed?: boolean } | undefined;
+			return new Text(theme.fg(details?.completed ? "success" : "muted", details?.completed ? "goal completed ✓" : text), 0, 0);
 		},
 	});
 
@@ -730,35 +1665,161 @@ export default function planGuard(pi: ExtensionAPI): void {
 	// 1) bash: allowlist of read-only commands (src/bash-guard.ts).
 	// 2) DEFAULT-DENY for everything else: only reading, planning-store tools
 	//    and web research run — unknown or third-party tools are blocked too.
-	pi.on("tool_call", async (event, _ctx) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (!enabled) return undefined;
 		if (isToolCallEventType("bash", event)) {
 			if (!isReadOnlyCommand(event.input.command)) {
 				return { block: true, reason: BASH_BLOCK_REASON };
 			}
+			// Latch: a permitted (read-only) bash call is investigation, not chat.
+			if (!isSubagentChild) investigationDone = true;
 			return undefined;
 		}
-		if (!effectiveAllowedTools().has(event.toolName)) {
+		const allowed = phaseAllowedTools(ctx);
+		if (!allowed.has(event.toolName)) {
 			return {
 				block: true,
 				reason: isSubagentChild
 					? `Your parent session is in plan mode — "${event.toolName}" is not available to read-only subagents (exploration only: read, read-only bash, web research, nested subagent spawn). Report findings to the parent; never touch the plan store or planning tools.`
-					: `Plan mode is active — "${event.toolName}" is not available while planning (only reading, planning-store tools and web research are allowed). Repo changes wait until the user exits plan mode.`,
+					: `Plan mode is active — "${event.toolName}" is not available in the current phase (${currentPhase(ctx.cwd, true)?.phase ?? "discovery"}). Repo changes wait until the user exits plan mode.`,
 			};
 		}
+		// Latch: any other allowed (permitted) tool call is investigation too.
+		if (!isSubagentChild) investigationDone = true;
 		return undefined;
 	});
 
 	// FIX 3 (T5): while the guard is active, remind the model it is read-only
 	// on every bash result — it keeps designing instead of trying to write.
-	pi.on("tool_result", (event, _ctx) => {
-		if (!enabled || event.toolName !== "bash") return undefined;
-		return { content: [...event.content, { type: "text", text: "[plan mode: read-only guard active — do NOT write/edit; design only]" }] };
+	// Plan-store / form tools additionally receive the phase's next-action hint.
+	// E2: the hint is scoped to planning tools (`plan_*` + ask_smart_plan) — it
+	// is useless (and costs a store read) on every read/bash/web result. Only
+	// active while the guard is on.
+	pi.on("tool_result", (event, ctx) => {
+		if (!enabled) return undefined;
+		const toolName = event.toolName;
+		const aside: string[] = [];
+		if (toolName === "bash") {
+			aside.push("[plan mode: read-only guard active — do NOT write/edit; design only]");
+		}
+		if (!isSubagentChild && (toolName === "ask_smart_plan" || toolName.startsWith("plan_"))) {
+			const current = currentPhase(ctx.cwd, true);
+			if (current) {
+				const snapshot = buildPhaseSnapshot(ctx, current);
+				aside.push(nextActionHint(current.phase, snapshot));
+			}
+		}
+		if (aside.length === 0) return undefined;
+		return { content: [...event.content, ...aside.map((text) => ({ type: "text" as const, text }))] };
+	});
+
+	// Finalize-retry at agent_settled (parent only): if a planning-phase turn
+	// closed in prose instead of the phase's structured tool, the harness
+	// regenerates that turn with a steer (max 2 retries per phase), then stops
+	// and notifies the owner. turn_end hands us the closing assistant message
+	// of each turn directly (typed) — we keep only the latest one, since
+	// agent_settled fires once the run is fully settled (no pending retry/
+	// continuation) and only that final turn matters for the verdict.
+	let lastTurn: { message: TurnEndEvent["message"]; toolResults: TurnEndEvent["toolResults"] } | null = null;
+	pi.on("turn_end", (event) => {
+		if (isSubagentChild) return;
+		lastTurn = { message: event.message, toolResults: event.toolResults };
+	});
+	pi.on("agent_settled", async (_event, ctx) => {
+		if (!enabled || isSubagentChild) return;
+		if (!lastTurn) return;
+		// Only regenerate when the session is genuinely idle and nothing is
+		// queued (no pending user/steer messages, no open form). B3: a blocking
+		// ask_smart_plan form being open means the model is legitimately waiting
+		// on the owner's answer — never steer mid-form.
+		if (!ctx.isIdle() || ctx.hasPendingMessages() || uiPromptOpen) return;
+		// A run triggered by our own steer never re-steers itself.
+		if (regenInFlight) {
+			regenInFlight = false;
+			return;
+		}
+
+		// GAP FIX: an empty store (no goal ever named) must NOT bail here — that
+		// is exactly the field-failure scenario (a model that never enters the
+		// machine at all). Null resolves to phase "discovery", same as every
+		// other null-current call site.
+		const current = currentPhase(ctx.cwd, true);
+		const phase = current?.phase ?? "discovery";
+		const assistant = lastTurn.message;
+		if (assistant.role !== "assistant") return;
+		const toolNames = assistant.content.filter((c) => c.type === "toolCall").map((c) => c.name);
+		const last = assistant.content.at(-1);
+		const endedWithText = last?.type === "text";
+
+		const snapshot = buildPhaseSnapshot(ctx, current);
+		const verdict = finalizeVerdict(phase, toolNames, endedWithText, snapshot);
+		if (verdict.ok) {
+			retryCount = 0;
+			return;
+		}
+		if (retryCount >= 2) {
+			// Give up: surface to the owner instead of nudging forever.
+			ctx.ui.notify(`Plan phase "${phase}": repeated prose closes after ${retryCount + 1} attempts — check the last exchange.`, "warning");
+			retryCount = 0;
+			return;
+		}
+		retryCount += 1;
+		regenInFlight = true;
+		// E1: the verdict carries the phase+key; the RETRY ATTEMPT lives in the
+		// caller's counter. Re-cable the escalation through FINALIZE_RULES so the
+		// steer text matches the real attempt (finalizeVerdict only knows a
+		// generic attempt-1 template by design). The pre-intent and post-intent
+		// discovery branches each carry their OWN key: FINALIZE_RULES.discovery.
+		// steer is the wrong text for both (it names plan_advance as if the HLD
+		// were already complete) — route by verdict.key instead of blindly
+		// re-deriving from the phase.
+		const rule = FINALIZE_RULES[phase];
+		const steer =
+			verdict.key === DISCOVERY_PRE_INTENT_KEY
+				? discoveryPreIntentSteer(retryCount)
+				: verdict.key === DISCOVERY_POST_INTENT_KEY
+					? discoveryPostIntentSteer(retryCount)
+					: rule
+						? rule.steer(retryCount, verdict.missing)
+						: verdict.steer;
+		if (ctx.isIdle()) {
+			pi.sendUserMessage(steer, {});
+		} else {
+			pi.sendUserMessage(steer, { deliverAs: "followUp" });
+		}
+	});
+
+	// B3: track blocking extension UI forms so the settle-retry never steers
+	// while the owner is actively answering one.
+	pi.on("ui_prompt_start", () => {
+		uiPromptOpen = true;
+	});
+	pi.on("ui_prompt_end", () => {
+		uiPromptOpen = false;
+	});
+
+	// After context compaction wipes the transcript's texture, the model can
+	// lose track of goal/phase/next-action. One-shot recap delivered on the
+	// NEXT turn (never mid-compaction) re-orients it without re-injecting the
+	// full phase prompt out of band.
+	pi.on("session_compact", (_event, ctx) => {
+		if (!enabled || isSubagentChild) return;
+		const current = currentPhase(ctx.cwd, true);
+		if (!current) return;
+		const snapshot = buildPhaseSnapshot(ctx, current);
+		const hint = nextActionHint(current.phase, snapshot);
+		const recap = `◈ Plan mode recap (post-compaction). Goal: ${current.goal}. Phase: ${current.phase}. ${hint}`;
+		pi.sendMessage({ customType: MESSAGE_TYPE, content: recap, display: true, details: { goal: current.goal, source: "command" } }, { deliverAs: "nextTurn" });
 	});
 
 	// Per-turn phase injection: only the current state-machine phase (+ global
 	// constraints) reaches the model. Appended to the system prompt, not stored.
 	pi.on("before_agent_start", async (event, ctx) => {
+		// B2: a real owner turn (any new user prompt) resets the prose-close
+		// retry budget for the phase. Our own regenerate steers also pass through
+		// this hook — regenInFlight is still set for them, so they are skipped and
+		// keep their escalating attempt number.
+		if (!isSubagentChild && !regenInFlight) retryCount = 0;
 		noteCwd(ctx);
 		const injection = planInjection(ctx.cwd);
 		if (!injection) return undefined;
@@ -774,8 +1835,13 @@ export default function planGuard(pi: ExtensionAPI): void {
 		isSubagentChild = Number.isFinite(childDepth) && childDepth > 0;
 		if (isSubagentChild && process.env.PI_SMART_PLAN === "1") {
 			enabled = true;
-			restrictTools();
+			restrictTools(ctx);
 			noteCwd(ctx);
+			// Observability: record the self-activation in the child's session log so
+			// a maintainer can verify the guard engaged on inherited plan mode and at
+			// which subagent depth. Separate key on purpose — must NOT collide with
+			// STORE_KEY, which the parent reads back to restore its own state.
+			pi.appendEntry("plan-guard-child", { inherited: true, depth: childDepth });
 			return;
 		}
 		let restored: { enabled: boolean; tools?: string[] } | undefined;
@@ -786,12 +1852,31 @@ export default function planGuard(pi: ExtensionAPI): void {
 			}
 		}
 		enabled = restored?.enabled ?? false;
-		toolsBeforePlanMode = restored?.tools;
+		// A restored session may have persisted a tool name that no longer exists
+		// (e.g. plan_approve, removed in 0.10.0) — intersect against the
+		// currently-registered catalogue before it ever reaches setActiveTools.
+		if (restored?.tools) {
+			const registeredNames = new Set(pi.getAllTools().map((tool) => tool.name));
+			toolsBeforePlanMode = restored.tools.filter((name) => registeredNames.has(name));
+		} else {
+			toolsBeforePlanMode = undefined;
+		}
 		if (!enabled && pi.getFlag("plan") === true) {
 			enabled = true;
+			// Fresh activation via the --plan flag (never a plain resume): same
+			// tombstone purge + H1 sweep as set()'s ON branch, so a new session
+			// with --plan always starts clean.
+			const purged = sweepStaleGoal(ctx.cwd);
+			// session_start has no confirmed interactive turn underway yet —
+			// only notify when there's a UI to receive it, and never block on it.
+			if (ctx.hasUI) {
+				for (const goal of purged) {
+					ctx.ui.notify(`stale plan '${goal}' from a previous session was discarded`, "info");
+				}
+			}
 			pi.appendEntry(STORE_KEY, { enabled, tools: undefined });
 		}
-		if (enabled) restrictTools();
+		if (enabled) restrictTools(ctx);
 		else restoreTools();
 		noteCwd(ctx);
 		syncStatus(ctx);

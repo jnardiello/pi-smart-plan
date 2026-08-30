@@ -13,7 +13,19 @@
  * - curl output/upload/verb flags (-o, -O, --output, --remote-name, --upload,
  *   -T, -X POST/PUT/DELETE/PATCH) treated as destructive;
  * - harmless noise redirects (2>&1, >/dev/null, 2>/dev/null) stripped before
- *   matching so common read pipelines keep working.
+ *   matching so common read pipelines keep working;
+ * - compound lines (`&&`, `||`, `;`, `|`) are split quote-aware and EVERY
+ *   segment must be allowlisted — a safe first segment no longer promotes the
+ *   rest of the line (closes the `echo x && ./evil` bypass), and `cd <path>`
+ *   segments plus transparent wrappers (timeout/command/env) are peeled first;
+ * - `find -ok / -okdir` (interactive exec — same class as -exec) treated as
+ *   destructive alongside -delete/-exec/-execdir/-fprint*;
+ * - awk/sed/sort are allowlisted by command NAME only, so each is additionally
+ *   vetted at the point its SAFE_PATTERN matches (see INTERPRETER_GUARDS):
+ *   awk `system(...)`, a `|` (pipe to/from a command), or `>`/`>>` (print
+ *   redirect) inside the program; sed GNU `w`/`W` (write) or `e` (exec)
+ *   commands inside the script; sort `-o`/`--output` (in-place overwrite) —
+ *   any hit blocks the whole segment, conservative by design.
  */
 
 /** Destructive patterns — tested against the WHOLE command string, so they
@@ -35,7 +47,7 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
 	/\bshred\b/i,
 	/(^|[^<])>(?!>)/, // single redirect (>> handled below; 2>&1 stripped earlier)
 	/>>/,
-	/\bfind\b[^|;&]*\s-(delete|exec|execdir|fprint\w*)\b/i,
+	/\bfind\b[^|;&]*\s-(delete|exec|execdir|okdir|ok|fprint\w*)\b/i,
 	/\bsed\b[^|;&]*\s-i\b/i,
 	/\bnpm\s+(install|uninstall|update|ci|link|unlink|publish|pack|exec|init)/i,
 	/\byarn\s+(add|remove|install|publish|up)/i,
@@ -114,6 +126,43 @@ const SAFE_PATTERNS: RegExp[] = [
 	/^\s*wget\s+-O\s*-\s/i, // wget to stdout only
 ];
 
+/** Per-interpreter extra vetting for SAFE_PATTERNS entries that allowlist a
+ * command by NAME only (awk/sed/sort): the write/exec primitive can hide in
+ * the (often single-quoted) program or flag text that neither
+ * DESTRUCTIVE_PATTERNS nor the bare command-name allowlist ever separately
+ * inspects. Each `dangerous` check runs ONLY on a segment whose own `safe`
+ * pattern already matched, against that segment's cleaned text (post
+ * wrapper-stripping) — so every heuristic below is deliberately
+ * conservative: when a construct could be either a real command or an
+ * innocent regex/argument, it blocks.
+ *
+ * - awk: `system(...)` execs a shell; `|` pipes `print`/`getline` to or from
+ *   a command string; `>`/`>>` redirects `print` output to a file. Any `|`
+ *   anywhere in the program blocks the segment — including inside a regex
+ *   alternation like `/foo|bar/` — because a top-level pipe would already
+ *   have been split into its own segment by splitSegments, so a `|` surviving
+ *   inside one segment can only be quoted awk-program text, and we cannot
+ *   distinguish "pipe to a command" from "regex alternation" without a real
+ *   awk parser.
+ * - sed (only `sed -n ...` is ever allowlisted): GNU `w`/`W` writes the
+ *   matched/pattern-space text to a file, `e` execs a shell command. A real
+ *   sed parser would require the letter to sit at a command position (after
+ *   `;`, a newline, an address, or script-start) to avoid flagging a regex
+ *   address that merely contains the letter (e.g. `/we/p`). We don't have
+ *   one, so — conservative-deny — this instead blocks any `w`/`W`/`e`
+ *   immediately followed by whitespace and another token, i.e. "looks like a
+ *   command with an argument". This can over-block an address regex that
+ *   happens to contain that shape (e.g. `/some error/p`) — accepted, per
+ *   this file's block-when-unsure design.
+ * - sort: `-o`/`--output` overwrites a file in place (the `sort -o f f` PoC
+ *   overwrites its own input). `o` is not shared with any other sort short
+ *   flag, so any `-`-prefixed cluster containing `o` is treated as `-o`. */
+const INTERPRETER_GUARDS: { safe: RegExp; dangerous: (segment: string) => boolean }[] = [
+	{ safe: /^\s*awk\b/, dangerous: (s) => /\bsystem\s*\(/.test(s) || /\|/.test(s) || /(^|[^<])>(?!>)/.test(s) || />>/.test(s) },
+	{ safe: /^\s*sed\s+-n/i, dangerous: (s) => /[wWe]\s+\S/.test(s) },
+	{ safe: /^\s*sort\b/, dangerous: (s) => /(^|\s)-[a-zA-Z]*o/.test(s) || /--output\b/.test(s) },
+];
+
 /** Strip harmless noise redirects so common read pipelines keep passing
  * (tolerant of optional whitespace around the redirect). */
 function normalize(command: string): string {
@@ -123,9 +172,96 @@ function normalize(command: string): string {
 		.replaceAll(/\s*>\s*\/dev\/null/g, "");
 }
 
-/** True when the command may run unchanged during plan mode. */
+/** Split a command line into `&&`/`||`/`;`/`|` segments, never splitting inside
+ * single or double quotes (minimal char-by-char splitter, no full bash parser).
+ * Returns `null` when the command contains `$(` or a backtick outside single
+ * quotes — command substitution we cannot analyze, so the caller blocks the
+ * whole line conservatively. */
+function splitSegments(command: string): string[] | null {
+	const segments: string[] = [];
+	let current = "";
+	let inSingle = false;
+	let inDouble = false;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		const next = command[i + 1];
+		if (inSingle) { if (ch === "'") inSingle = false; current += ch; continue; }
+		if (inDouble) {
+			if ((ch === "$" && next === "(") || ch === "`") return null; // expands within double quotes
+			if (ch === '"') inDouble = false;
+			current += ch;
+			continue;
+		}
+		if (ch === "'") { inSingle = true; current += ch; continue; }
+		if (ch === '"') { inDouble = true; current += ch; continue; }
+		// Outer level: a literal newline ends the command (bash reads two commands),
+		// so it must split like `;`/`|` — never be absorbed into the current segment.
+		if (ch === "\n" || ch === "\r") { segments.push(current); current = ""; continue; }
+		if (ch === "$" && next === "(") return null; // $(...) outside quotes
+		if (ch === "`") return null; // backtick command substitution
+		if ((ch === "&" && next === "&") || (ch === "|" && next === "|")) {
+			segments.push(current);
+			current = "";
+			i++;
+			continue;
+		}
+		if (ch === ";" || ch === "|") { segments.push(current); current = ""; continue; }
+		current += ch;
+	}
+	segments.push(current);
+	return segments;
+}
+
+/** Strip transparent wrapper prefixes from a segment (repeatable, so nested
+ * wrappers peel left-to-right): `timeout <dur>`, `command`, and `env` followed
+ * by simple `VAR=val` assignments (simple values only — anything quoting,
+ * redirecting or substituting is left in place and thus fails the allowlist).
+ * `xargs` is deliberately NOT transparent: it executes arbitrary arguments. */
+function stripWrappers(segment: string): string {
+	let rest = segment;
+	for (;;) {
+		const t = rest.trimStart();
+		if (t === "") return rest;
+		const lead = rest.slice(0, rest.length - t.length);
+		const timeout = t.match(/^timeout\s+\S+\s*/);
+		if (timeout) { rest = lead + t.slice(timeout[0].length); continue; }
+		const command = t.match(/^command\b\s*/);
+		if (command) { rest = lead + t.slice(command[0].length); continue; }
+		const env = t.match(/^env\b\s*/);
+		if (env) {
+			rest = lead + t.slice(env[0].length);
+			for (;;) {
+				const s = rest.trimStart();
+				const lead2 = rest.slice(0, rest.length - s.length);
+				const assign = s.match(/^[A-Za-z_][A-Za-z0-9_]*=[^\s'"&<>;|()$`]*(?:\s|$)/);
+				if (!assign) break;
+				rest = lead2 + s.slice(assign[0].length);
+			}
+			continue;
+		}
+		return rest;
+	}
+}
+
+/** True when the command may run unchanged during plan mode — every compound
+ * segment must be allowlisted, not just the first one. */
 export function isReadOnlyCommand(command: string): boolean {
 	const normalized = normalize(command);
+	// 1) Destructive patterns on the WHOLE string first — catches destructive
+	//    fragments hidden inside any segment.
 	if (DESTRUCTIVE_PATTERNS.some((pattern) => pattern.test(normalized))) return false;
-	return SAFE_PATTERNS.some((pattern) => pattern.test(normalized));
+	// 2) Command substitution we cannot analyze ($(...) / backticks) → block.
+	const segments = splitSegments(normalized);
+	if (segments === null) return false;
+	// 3) EVERY segment (after peeling wrappers) must match a SAFE pattern.
+	for (const segment of segments) {
+		const cleaned = stripWrappers(segment);
+		if (cleaned.trim() === "") continue; // empty segment → ignore
+		if (/^\s*cd\b/.test(cleaned)) continue; // `cd <path>` alone is read-only
+		if (!SAFE_PATTERNS.some((pattern) => pattern.test(cleaned))) return false;
+		// A SAFE_PATTERN match only allowlists the command NAME — awk/sed/sort
+		// still need their program/flag text vetted (see INTERPRETER_GUARDS).
+		if (INTERPRETER_GUARDS.some((guard) => guard.safe.test(cleaned) && guard.dangerous(cleaned))) return false;
+	}
+	return true;
 }

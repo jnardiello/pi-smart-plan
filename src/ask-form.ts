@@ -13,12 +13,61 @@ export type AskQuestion = {
 	options: { label: string; description?: string; preview?: string }[];
 };
 
+/** Lenient option shape accepted at the tool boundary: a bare string is
+ * shorthand for `{ label }` — a real session lost a round trip to
+ * `options.M: must be object` when the model passed plain strings. */
+export type AskOptionInput = string | { label: string; description?: string; preview?: string };
+
+/** Lenient question shape accepted at the tool boundary (options may be bare
+ * strings). Normalized to `AskQuestion` via `normalizeAskQuestions` before any
+ * downstream code sees it — a strict widening, existing `AskQuestion[]`
+ * callers keep compiling unchanged. */
+export type AskQuestionInput = {
+	question: string;
+	header?: string;
+	detail?: string;
+	multiSelect?: boolean;
+	options: AskOptionInput[];
+};
+
 export type AskFormResult = { declined: true } | { answers: Record<string, string | string[]> };
+
+/** Maximum questions rendered per sequential form page. Auto-paging splits any
+ * larger question set into multiple sequential forms, so an overflow can never
+ * be rejected (the old schema hard-rejected >4 questions, which made the model
+ * silently decide the dropped question — this paging makes that impossible). */
+export const ASK_FORM_PAGE_MAX = 4;
+
+/** Aggregated outcome of a paged form run (sequential pages of at most
+ * ASK_FORM_PAGE_MAX questions). On cancellation (`declined`) every question
+ * from the cancelled page onward is reported in `unanswered` — answers are
+ * never invented for questions the owner never saw. */
+export type PagedAskFormResult = {
+	declined: boolean;
+	answers: Record<string, string | string[]>;
+	unanswered: AskQuestion[];
+};
 
 const CUSTOM = "None of the above";
 const PREVIEW_MIN = 80;
 
-export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]): Promise<AskFormResult> {
+/** Coerces bare-string options to `{ label }`; called at the entry of both
+ * `runAskForm` and `runAskFormPages` so all downstream code keeps seeing the
+ * strict `AskQuestion` shape regardless of what the tool boundary received. */
+export function normalizeAskQuestions(questions: AskQuestionInput[]): AskQuestion[] {
+	return questions.map((q) => ({
+		...q,
+		options: q.options.map((opt) => (typeof opt === "string" ? { label: opt } : opt)),
+	}));
+}
+
+export async function runAskForm(
+	ctx: ExtensionContext,
+	questionsInput: AskQuestionInput[],
+	opts?: { includeNoneOption?: boolean },
+): Promise<AskFormResult> {
+	const includeNoneOption = opts?.includeNoneOption ?? true;
+	const questions = normalizeAskQuestions(questionsInput);
 	if (!ctx.hasUI || typeof ctx.ui.custom !== "function") {
 		return { declined: true };
 	}
@@ -55,7 +104,7 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 		}
 
 		function optionsOf(q: AskQuestion): { label: string; description?: string; preview?: string; custom?: boolean }[] {
-			return [...q.options, { label: CUSTOM, custom: true }];
+			return includeNoneOption ? [...q.options, { label: CUSTOM, custom: true }] : [...q.options];
 		}
 
 		function refresh(): void {
@@ -400,4 +449,28 @@ export async function runAskForm(ctx: ExtensionContext, questions: AskQuestion[]
 	});
 
 	return result ?? { declined: true };
+}
+
+/** Run `runAskForm` over `questions` as sequential pages of at most `pageMax`
+ * (default ASK_FORM_PAGE_MAX), aggregating every page's answers into a single
+ * result keyed by the original question text — original order preserved. If a
+ * page is cancelled (`declined`), the answers collected so far are kept and all
+ * questions from the cancelled page onward are reported as `unanswered`; the
+ * tool never invents them. */
+export async function runAskFormPages(
+	ctx: ExtensionContext,
+	questionsInput: AskQuestionInput[],
+	pageMax: number = ASK_FORM_PAGE_MAX,
+): Promise<PagedAskFormResult> {
+	const questions = normalizeAskQuestions(questionsInput);
+	const answers: Record<string, string | string[]> = {};
+	for (let i = 0; i < questions.length; i += pageMax) {
+		const page = questions.slice(i, i + pageMax);
+		const result = await runAskForm(ctx, page);
+		if ("declined" in result) {
+			return { declined: true, answers, unanswered: questions.slice(i) };
+		}
+		Object.assign(answers, result.answers);
+	}
+	return { declined: false, answers, unanswered: [] };
 }

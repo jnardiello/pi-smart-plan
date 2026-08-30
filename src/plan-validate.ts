@@ -7,7 +7,14 @@
  * Also derives the execution waves server-side so the model never hand-writes
  * them.
  *
- * Plans without a `## Tasks` heading are treated as drafts and skipped.
+ * Also the single source of truth for the phase enum (re-exported by
+ * phase-machine.ts, never redefined) and for the save-time deliverable-shape
+ * check: every plan_save must carry the full HLD shape — non-empty
+ * ## HLD/Scope/Non-goals/Decisions/DoD with canonical English headings,
+ * body text in any language — regardless of phase (see validatePhaseShape).
+ *
+ * Plans without a `## Tasks` heading are treated as drafts and skipped by
+ * the task-graph functions below.
  */
 
 export interface PlanTask {
@@ -19,37 +26,93 @@ export interface PlanTask {
 	hasDoneCheck: boolean;
 }
 
-/** Lifecycle phases of the plan state machine (canonical order). */
-export const PHASES = ["discovery", "hld", "decompose", "ablate", "present", "execute"] as const;
+/**
+ * Lifecycle phases of the plan state machine (canonical order), exactly two
+ * owner touchpoints:
+ *   discovery (chat, save HLD) → simplify (auto trim + cut log) →
+ *   review_hld (Gate 1: present + approve) → decompose (auto DAG) →
+ *   review_final (Gate 2: present + yes/no) → execute (guard released).
+ */
+export const PHASES = ["discovery", "simplify", "review_hld", "decompose", "review_final", "execute"] as const;
 export type Phase = (typeof PHASES)[number];
+
+/**
+ * Maps every phase name pi-smart-plan has ever written — pre-0.10 legacy
+ * names (hld/ablate/present) and today's canonical names — onto the current
+ * Phase set. Read-only: callers normalize a value coming off disk or out of
+ * plan content; nothing here ever rewrites a store.
+ */
+const LEGACY_PHASE_MAP: Record<string, Phase> = {
+	discovery: "discovery",
+	hld: "discovery", // pre-0.10: separate HLD-writing phase, folded into discovery
+	simplify: "simplify",
+	ablate: "simplify", // pre-0.10 name
+	review_hld: "review_hld",
+	present: "review_hld", // pre-0.10 name
+	decompose: "decompose",
+	review_final: "review_final",
+	execute: "execute",
+};
+
+/** Normalize a raw phase string (current canonical name or a pre-0.10 legacy
+ * name) to today's Phase, or undefined when unrecognized. */
+export function normalizePhase(value: string): Phase | undefined {
+	return LEGACY_PHASE_MAP[value];
+}
 
 const PHASE_LINE = /^phase:\s*(\w+)\s*$/m;
 
-/** Explicit `phase:` marker from the plan status block, when valid. */
+/** Explicit `phase:` marker from the plan status block, normalized through
+ * normalizePhase (accepts pre-0.10 legacy values too), when present and
+ * recognized. */
 export function parsePhaseLine(content: string): Phase | undefined {
 	const match = PHASE_LINE.exec(content);
-	const value = match?.[1] as Phase | undefined;
-	return value && PHASES.includes(value) ? value : undefined;
+	return match ? normalizePhase(match[1]) : undefined;
 }
 
 /**
- * Current phase of a plan: explicit `phase:` line wins; otherwise inferred
- * from structure (HLD/Tasks sections) and the guard state. Fallbacks are
- * best-effort — the workflow mandates setting the explicit line at transitions.
+ * Structural fallback phase, used only when no machine-tracked phase.txt
+ * exists yet (see plan-store.ts's resolvePhase = readMachinePhase ??
+ * inferPhase) — purely derived from guard state and plan shape, never from an
+ * explicit marker. `!guardOn` always means `execute` (the guard being off IS
+ * the execute signal). Otherwise: no HLD section → still converging
+ * (discovery); HLD without tasks → the DAG hasn't been written yet
+ * (decompose); HLD with tasks → ready for the Gate 1 review (review_hld).
  */
 export function inferPhase(content: string, guardOn: boolean): Phase {
 	if (!guardOn) return "execute";
-	const explicit = parsePhaseLine(content);
-	if (explicit && explicit !== "execute") return explicit;
 	const hasHld = /^##\s+HLD\b/m.test(content);
+	if (!hasHld) return "discovery";
 	const tasks = parseTasks(content);
-	if (tasks.length === 0) return hasHld ? "decompose" : "discovery";
-	return hasHld ? "present" : "decompose";
+	if (tasks.length === 0) return "decompose";
+	return "review_hld";
 }
 
 export interface ValidationIssue {
 	task?: string;
 	message: string;
+}
+
+/** Text of a top-level `## Name` section (without the heading), or "" when
+ * the section is absent or empty. Single source of truth — plan-store.ts's
+ * own `extractSection` copy is expected to import this instead of
+ * duplicating it. */
+export function sectionText(content: string, name: string): string {
+	const lines = content.split("\n");
+	const start = lines.findIndex((line) => new RegExp(`^##\\s+${name}\\b`).test(line));
+	if (start === -1) return "";
+	const out: string[] = [];
+	for (let i = start + 1; i < lines.length; i++) {
+		const line = lines[i];
+		// Narrow the possibly-undefined index access (noUncheckedIndexedAccess)
+		// cleanly before touching the value — no casts. `i < lines.length` makes
+		// the undefined branch unreachable at runtime, but the guard satisfies
+		// strict and keeps the copy loop behavior identical.
+		if (line === undefined) break;
+		if (/^##\s/.test(line)) break;
+		out.push(line);
+	}
+	return out.join("\n").trim();
 }
 
 const TASK_HEADER = /^\s*-\s*\[( |x)\]\s*([A-Za-z0-9][A-Za-z0-9_-]*):\s*(.*)$/;
@@ -242,33 +305,6 @@ export function readyFrontier(tasks: PlanTask[]): PlanTask[] {
 	return tasks.filter((t) => !t.done && t.deps.every((dep) => doneIds.has(dep)));
 }
 
-/** Preconditions each explicit `phase:` value must satisfy structurally.
- * `execute` is governed by the guard, not by plan content. */
-const PHASE_PRECONDITIONS: Record<string, { hld?: boolean; tasks?: boolean }> = {
-	discovery: {},
-	hld: {},
-	decompose: { hld: true },
-	ablate: { hld: true, tasks: true },
-	present: { hld: true, tasks: true },
-};
-
-/** Reject illegal phase jumps on save: an explicit `phase:` line must be
- * backed by the structure it claims (HLD section, task list). */
-export function validatePhaseTransition(content: string): ValidationIssue[] {
-	const phase = parsePhaseLine(content);
-	if (!phase || phase === "execute") return [];
-	const pre = PHASE_PRECONDITIONS[phase];
-	if (!pre) return [];
-	const issues: ValidationIssue[] = [];
-	if (pre.hld && !/^##\s+HLD\b/m.test(content)) {
-		issues.push({ message: `phase "${phase}" requires a ## HLD section (confirm the design first)` });
-	}
-	if (pre.tasks && parseTasks(content).length === 0) {
-		issues.push({ message: `phase "${phase}" requires at least one task in ## Tasks` });
-	}
-	return issues;
-}
-
 /** Extract executable DoD commands from the `## DoD` section. */
 export function parseDoD(content: string): string[] {
 	const lines = content.split("\n");
@@ -282,6 +318,69 @@ export function parseDoD(content: string): string[] {
 		if (trimmed.length > 0 && !trimmed.startsWith("#")) commands.push(trimmed);
 	}
 	return commands;
+}
+
+/** Sections every plan_save must carry, whatever the current phase — ideation
+ * happens in chat, not across partial saves. */
+const REQUIRED_SECTIONS = ["HLD", "Scope", "Non-goals", "Decisions", "DoD"] as const;
+
+/** Phases whose deliverable additionally requires a non-empty ## Tasks DAG. */
+const TASK_REQUIRED_PHASES: ReadonlySet<Phase> = new Set<Phase>(["decompose", "review_final", "execute"]);
+
+const CANONICAL_HEADINGS_NOTE =
+	"section headings must use the CANONICAL ENGLISH names (## HLD, ## Scope, ## Non-goals, ## Decisions, ## DoD, ## Tasks); body text may be in any language.";
+
+/** Every top-level `## ` heading present in `content`, verbatim and in
+ * document order — shown back to the model in the diagnostic below so a plan
+ * with e.g. `## Decisioni chiuse` sees exactly what it wrote. */
+function presentHeadings(content: string): string[] {
+	return content
+		.split("\n")
+		.filter((line) => /^##\s+\S/.test(line))
+		.map((line) => line.trim());
+}
+
+/** One diagnostic issue for any missing-section case: names what's missing,
+ * shows every heading actually found, and states the canonical-names fix —
+ * a single round trip instead of five separate nags. */
+function missingSectionsIssue(content: string, missingNames: readonly string[]): ValidationIssue {
+	const found = presentHeadings(content);
+	const foundText = found.length > 0 ? found.join(", ") : "(none found)";
+	return {
+		message: `missing required section(s): ${missingNames.map((name) => `## ${name}`).join(", ")}. Headings found in the plan: ${foundText}. ${CANONICAL_HEADINGS_NOTE}`,
+	};
+}
+
+/**
+ * Save-time deliverable-shape check. Every plan_save must carry the full HLD
+ * shape regardless of phase: non-empty ## HLD, ## Scope, ## Non-goals,
+ * ## Decisions, ## DoD with at least one executable DoD command (reuses
+ * parseDoD). decompose/review_final/execute additionally require at least
+ * one parsed task. Missing sections collapse into a single diagnostic issue
+ * (see missingSectionsIssue) rather than one per section. Extra sections
+ * beyond the required set are always allowed.
+ */
+export function validatePhaseShape(phase: Phase, content: string): ValidationIssue[] {
+	const issues: ValidationIssue[] = [];
+	const missingSections = REQUIRED_SECTIONS.filter((name) => !sectionText(content, name));
+	if (missingSections.length > 0) {
+		issues.push(missingSectionsIssue(content, missingSections));
+	} else if (parseDoD(content).length === 0) {
+		issues.push({ message: "## DoD has no executable command line — list at least one command, one per line" });
+	}
+	if (TASK_REQUIRED_PHASES.has(phase) && parseTasks(content).length === 0) {
+		issues.push({ message: "no tasks in ## Tasks — define the task DAG (id/deps/owns/done per task)" });
+	}
+	return issues;
+}
+
+/** Human-readable error text for PlanStoreValidationError on a shape-invalid
+ * plan_save. Mirrors validationErrorMessage's bullet format. */
+export function shapeErrorMessage(phase: Phase, issues: ValidationIssue[]): string {
+	return (
+		`plan_save rejected — content does not meet the "${phase}" deliverable shape:\n` +
+		issues.map((issue) => `- ${issue.task ? `${issue.task}: ` : ""}${issue.message}`).join("\n")
+	);
 }
 
 /** True when `file` falls inside one of the owns entries. */
