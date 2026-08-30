@@ -33,7 +33,6 @@ import { parseTasks, validatePhaseShape, validateTaskGraph } from "./plan-valida
 import type { Phase } from "./plan-validate.ts";
 
 export { PHASES } from "./plan-validate.ts";
-export type { Phase, PlanTask } from "./plan-validate.ts";
 
 // ---------------------------------------------------------------------------
 // PhaseSnapshot
@@ -129,38 +128,30 @@ export function phaseDeliverableReady(phase: Phase, snapshot: PhaseSnapshot): { 
 			for (const issue of validatePhaseShape("discovery", content)) missing.push(issue.message);
 			break;
 		}
-		case "simplify": {
-			// LOCAL MISSION: the HLD trimmed and still shape-valid, plus a
-			// journaled cut log for this phase (or one line: nothing to cut).
+		case "simplify":
+		case "review_hld": {
+			// LOCAL MISSION: simplify — the HLD trimmed and still shape-valid, plus
+			// a journaled cut log for this phase (or one line: nothing to cut).
+			// review_hld — the HLD still shape-valid; readiness is purely
+			// content-derived (Gate 1 itself is a harness-owned form, index.ts,
+			// opened when the model calls plan_advance — not tracked here). Same
+			// shape check for both; only simplify additionally requires the log.
 			const content = snapshotPlan(snapshot);
-			for (const issue of validatePhaseShape("simplify", content)) missing.push(issue.message);
-			if ((snapshot.journalEntriesForPhase ?? 0) === 0) {
+			for (const issue of validatePhaseShape(phase, content)) missing.push(issue.message);
+			if (phase === "simplify" && (snapshot.journalEntriesForPhase ?? 0) === 0) {
 				missing.push("no simplification cut-log journaled this phase — journal each cut, or one line why nothing to cut");
 			}
 			break;
 		}
-		case "review_hld": {
-			// LOCAL MISSION: the HLD still shape-valid — readiness is purely
-			// content-derived. Gate 1 itself is a harness-owned form (index.ts),
-			// opened when the model calls plan_advance — not tracked here.
-			const content = snapshotPlan(snapshot);
-			for (const issue of validatePhaseShape("review_hld", content)) missing.push(issue.message);
-			break;
-		}
-		case "decompose": {
-			// LOCAL MISSION: a mechanically valid ## Tasks DAG (deps/owns/done).
-			const content = snapshotPlan(snapshot);
-			for (const issue of validatePhaseShape("decompose", content)) missing.push(issue.message);
-			for (const issue of validateTaskGraph(parseTasks(content))) missing.push(issue.task ? `${issue.task}: ${issue.message}` : issue.message);
-			break;
-		}
+		case "decompose":
 		case "review_final": {
-			// LOCAL MISSION: the full contract (HLD + validated DAG) still
-			// shape-valid — readiness is purely content-derived. Gate 2 itself is
-			// a harness-owned form (index.ts), opened when the model calls
-			// plan_advance — not tracked here.
+			// LOCAL MISSION: decompose — a mechanically valid ## Tasks DAG
+			// (deps/owns/done). review_final — the full contract (HLD + validated
+			// DAG) still shape-valid; readiness is purely content-derived (Gate 2
+			// itself is a harness-owned form, index.ts, opened when the model calls
+			// plan_advance — not tracked here). Identical check for both.
 			const content = snapshotPlan(snapshot);
-			for (const issue of validatePhaseShape("review_final", content)) missing.push(issue.message);
+			for (const issue of validatePhaseShape(phase, content)) missing.push(issue.message);
 			for (const issue of validateTaskGraph(parseTasks(content))) missing.push(issue.task ? `${issue.task}: ${issue.message}` : issue.message);
 			break;
 		}
@@ -232,22 +223,25 @@ const EXECUTE_TOOLS: readonly string[] = ["plan_verify", "plan_task_update", "pl
 
 // INVARIANT: all five planning phases — discovery, simplify, review_hld,
 // decompose, review_final — share exactly ONE tool surface (BASE + ALWAYS +
-// PLANNING + INTENT + ADVANCE). review_hld/review_final need no tool beyond
-// that: a field test proved pi's setActiveTools only takes effect on the
-// model's NEXT turn, so a mid-run tool GRANT (e.g. handing out a presentation
-// tool only inside review phases) never reaches the model that would need it
-// in the same run. Only REMOVALS can be enforced mid-run, backstopped by the
-// tool_call guard — so review gates are harness-driven (index.ts opens the
-// gate form when plan_advance is called) instead of tool-driven. INTENT_TOOLS
-// (plan_intent) is part of this shared planning surface but deliberately
-// excluded from execute's surface below — objective confirmation/
-// re-confirmation is a planning-only concern.
+// PLANNING + INTENT + ADVANCE), a single Set instance (PLANNING_SURFACE)
+// reused across all five keys below. review_hld/review_final need no tool
+// beyond that: a field test proved pi's setActiveTools only takes effect on
+// the model's NEXT turn, so a mid-run tool GRANT (e.g. handing out a
+// presentation tool only inside review phases) never reaches the model that
+// would need it in the same run. Only REMOVALS can be enforced mid-run,
+// backstopped by the tool_call guard — so review gates are harness-driven
+// (index.ts opens the gate form when plan_advance is called) instead of
+// tool-driven. INTENT_TOOLS (plan_intent) is part of this shared planning
+// surface but deliberately excluded from execute's surface below — objective
+// confirmation/re-confirmation is a planning-only concern.
+const PLANNING_SURFACE: ReadonlySet<string> = new Set<string>([...BASE_TOOLS, ...ALWAYS_TOOLS, ...PLANNING_TOOLS, ...INTENT_TOOLS, ...ADVANCE_TOOLS]);
+
 export const PHASE_ALLOWED_TOOLS: Record<Phase, ReadonlySet<string>> = {
-	discovery: new Set<string>([...BASE_TOOLS, ...ALWAYS_TOOLS, ...PLANNING_TOOLS, ...INTENT_TOOLS, ...ADVANCE_TOOLS]),
-	simplify: new Set<string>([...BASE_TOOLS, ...ALWAYS_TOOLS, ...PLANNING_TOOLS, ...INTENT_TOOLS, ...ADVANCE_TOOLS]),
-	review_hld: new Set<string>([...BASE_TOOLS, ...ALWAYS_TOOLS, ...PLANNING_TOOLS, ...INTENT_TOOLS, ...ADVANCE_TOOLS]),
-	decompose: new Set<string>([...BASE_TOOLS, ...ALWAYS_TOOLS, ...PLANNING_TOOLS, ...INTENT_TOOLS, ...ADVANCE_TOOLS]),
-	review_final: new Set<string>([...BASE_TOOLS, ...ALWAYS_TOOLS, ...PLANNING_TOOLS, ...INTENT_TOOLS, ...ADVANCE_TOOLS]),
+	discovery: PLANNING_SURFACE,
+	simplify: PLANNING_SURFACE,
+	review_hld: PLANNING_SURFACE,
+	decompose: PLANNING_SURFACE,
+	review_final: PLANNING_SURFACE,
 	execute: new Set<string>([...BASE_TOOLS, ...ALWAYS_TOOLS, ...PLANNING_TOOLS, ...EXECUTE_TOOLS]),
 };
 
@@ -273,6 +267,16 @@ export interface FinalizeRule {
 	steer: (attempt: number, missing: string[]) => string;
 }
 
+/** Appends the escalation clause at attempt ≥ 2 ("Escalation (attempt N):
+ * <hint> — further prose closes will be treated as drift."), else returns
+ * `base` unchanged. `hint` is the escalation-specific action clause (e.g.
+ * "call plan_advance", "keep closing with X"). Shared by the four steer
+ * builders below — the escalation shape (wording, attempt number, drift
+ * warning) is byte-identical across them; only `base` and `hint` differ. */
+function withEscalation(base: string, attempt: number, hint: string): string {
+	return attempt >= 2 ? `${base} Escalation (attempt ${attempt}): ${hint} — further prose closes will be treated as drift.` : base;
+}
+
 /** Firm owner-facing steer: cites the phase, the required tool, states the
  * answer was discarded and regenerated, and escalates on later attempts. */
 function steerText(phase: string, toolHint: string, attempt: number, missing: string[]): string {
@@ -280,9 +284,7 @@ function steerText(phase: string, toolHint: string, attempt: number, missing: st
 	const base =
 		`Your ${phase} turn closed in prose — this answer was discarded and regenerated by the harness. ` +
 		`End owner-facing turns in ${phase} with ${toolHint}, never plain prose.${gaps}`;
-	return attempt >= 2
-		? `${base} Escalation (attempt ${attempt}): keep closing with ${toolHint} — further prose closes will be treated as drift.`
-		: base;
+	return withEscalation(base, attempt, `keep closing with ${toolHint}`);
 }
 
 /** discovery-only steer: fires exclusively once the deliverable is COMPLETE
@@ -295,9 +297,7 @@ function discoveryReadySteer(attempt: number, missing: string[]): string {
 	const base =
 		"Discovery's deliverable is COMPLETE (goal named, HLD with Scope/Non-goals/Decisions/DoD saved) — the previous close violated the " +
 		`closing contract. Continue by calling plan_advance now; never end this turn by asking the owner "how do you want to proceed".${gaps}`;
-	return attempt >= 2
-		? `${base} Escalation (attempt ${attempt}): call plan_advance — further prose closes will be treated as drift.`
-		: base;
+	return withEscalation(base, attempt, "call plan_advance");
 }
 
 /** discovery-only steer for the PRE-intent gap: a run that has already used
@@ -314,9 +314,7 @@ export function discoveryPreIntentSteer(attempt: number): string {
 		"still open, put it to the owner as an ask_smart_plan form NOW, before plan_intent — never enumerate options in prose. Call " +
 		"plan_intent only once nothing is open: propose a kebab-case goal slug and confirm the objective — or call plan_intent " +
 		"declaring any open decisions in openQuestions, the harness forms them before any confirmation.";
-	return attempt >= 2
-		? `${base} Escalation (attempt ${attempt}): close with ask_smart_plan (open decisions) or plan_intent (nothing open) — further prose closes will be treated as drift.`
-		: base;
+	return withEscalation(base, attempt, "close with ask_smart_plan (open decisions) or plan_intent (nothing open)");
 }
 
 /** Distinct verdict key for the pre-intent discovery branch (see
@@ -345,9 +343,7 @@ export function discoveryPostIntentSteer(attempt: number): string {
 		"The objective is confirmed — put any open question to the owner as an ask_smart_plan form (its JSON questions vector) now, " +
 		"or advance the work: plan_save the HLD, journal_append clarifications, re-run plan_intent if the objective materially changed, " +
 		"or plan_advance once the deliverable is complete. NEVER close this turn with bare prose.";
-	return attempt >= 2
-		? `${base} Escalation (attempt ${attempt}): close with ask_smart_plan, plan_save, journal_append or plan_advance — further prose closes will be treated as drift.`
-		: base;
+	return withEscalation(base, attempt, "close with ask_smart_plan, plan_save, journal_append or plan_advance");
 }
 
 /** Distinct verdict key for the post-intent discovery branch (see

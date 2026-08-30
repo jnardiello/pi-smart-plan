@@ -6,7 +6,6 @@ import { GLOBAL_CONSTRAINTS, PHASE_PROMPTS } from "../src/prompts.ts";
 import {
 	savePlan,
 	appendJournal,
-	hasActivePlans,
 	currentPhase,
 	updateTaskStatus,
 	readMachinePhase,
@@ -26,7 +25,7 @@ import {
 	isPartiallyStaged,
 	PlanStoreValidationError,
 } from "../src/plan-store.ts";
-import { inferPhase, parsePhaseLine, normalizePhase, PHASES } from "../src/plan-validate.ts";
+import { PHASES } from "../src/plan-validate.ts";
 import { setAbandonGraceMs, DEFAULT_ABANDON_GRACE_MS, hasPendingAbandon, cancelAbandon } from "../src/abandon.ts";
 import { statSync, readFileSync, writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -390,8 +389,8 @@ expectReject("missing done", fullPlan("dup").replace("  done: echo t2\n", ""), '
 
 console.log("\n[V3 — phase line is machine-managed]");
 // Phase transitions no longer live in plan content: savePlan strips any
-// model-echoed `phase:` line; the gate (phaseDeliverableReady + form) owns the
-// phase. "present" is still a recognized pre-0.10 legacy value (→ review_hld).
+// model-echoed `phase:` line regardless of the word after it; the gate
+// (phaseDeliverableReady + form) owns the phase.
 seedIntent(CWD, "phased-ok");
 savePlan(CWD, "phased-ok", `phase: present\n${fullPlan("phased-ok")}`);
 check("model-supplied phase: line stripped on save", !readFileSync(join(expectedStore, "phased-ok", "plan.md"), "utf8").includes("phase: present"));
@@ -406,16 +405,6 @@ check("waves regenerated server-side", readFileSync(savedPath, "utf8").includes(
 seedIntent(CWD, "draft");
 const draftPath = savePlan(CWD, "draft", canonicalHLD("draft"));
 check("HLD-only draft (no Tasks) saved as-is, no waves section", !readFileSync(draftPath, "utf8").includes("waves"));
-check("hasActivePlans true after save", hasActivePlans(CWD));
-
-console.log("\n[phase inference]");
-// parsePhaseLine now routes through normalizePhase too — a pre-0.10 legacy
-// value on the line comes back mapped to its current name, not the raw string.
-check("explicit legacy line normalized on read", parsePhaseLine("# P\nphase: present\n") === "review_hld");
-check("invalid phase ignored", parsePhaseLine("phase: banana\n") === undefined);
-check("no HLD/no tasks → discovery", inferPhase("# nothing", true) === "discovery");
-check("guard off → execute", inferPhase(fullPlan("infer"), false) === "execute");
-check("normalizePhase maps every legacy + current name", normalizePhase("hld") === "discovery" && normalizePhase("ablate") === "simplify" && normalizePhase("present") === "review_hld" && normalizePhase("decompose") === "decompose");
 
 console.log("\n[V2 — task lifecycle: owns + dep discipline]");
 // dep discipline first (on a separate goal, touched BEFORE demo below so the
@@ -435,7 +424,7 @@ rmSync(join(CWD, "rogue.txt"));
 const okMsg = updateTaskStatus(CWD, "demo", "T1", "done");
 check("clean delta → done accepted", okMsg.includes("owns + deps verified"));
 check("checkbox flipped server-side", readFileSync(savedPath, "utf8").includes("- [x] T1:"));
-check("currentPhase picks demo (last write via the done-close journal append)", currentPhase(CWD, false)?.goal === "demo");
+check("currentPhase picks demo (last write via the done-close journal append)", currentPhase(CWD)?.goal === "demo");
 
 console.log("\n[V2b — injection follows store]");
 await ensureGuardOn();
@@ -1015,7 +1004,7 @@ check("walk: implementation briefing queued (not returned inline), delivered per
 console.log("\n[re-guard mid-execute — no regression to review]");
 await ensureGuardOn();
 check("re-guard: currentPhase still execute, execute-only tools active, plan_advance excluded (review/planning-only)",
-	currentPhase(CWD, true)?.goal === WALK && currentPhase(CWD, true)?.phase === "execute" &&
+	currentPhase(CWD)?.goal === WALK && currentPhase(CWD)?.phase === "execute" &&
 	["plan_verify", "plan_task_update", "plan_next"].every((t) => activeTools.includes(t)) && !activeTools.includes("plan_advance"));
 await ensureGuardOff();
 
@@ -1104,13 +1093,13 @@ savePlan(CWD3, "goaly", canonicalHLD("goaly")); // strictly later write → newe
 appendJournal(CWD3, "goalx", "touch to reclaim the pointer");
 check("pointer wins over raw mtime: goalx's plan.md is still older than goaly's, yet currentPhase now reports goalx",
 	statSync(join(expectedStore3, "goalx", "plan.md")).mtimeMs <= statSync(join(expectedStore3, "goaly", "plan.md")).mtimeMs &&
-	currentPhase(CWD3, true)?.goal === "goalx");
+	currentPhase(CWD3)?.goal === "goalx");
 const completed = completeGoal(CWD3, "goalx");
 // Mtime fallback is GONE from currentPhase (pointer-only, 0.10.0): no
 // active.txt → null, even though "goaly" is still a live, resolvable goal on
 // disk — there is no scan-for-the-newest-goal fallback anymore.
 check("completeGoal clears the pointer; currentPhase is null with no fallback to the remaining goal (goaly)",
-	completed === true && !existsSync(join(expectedStore3, "active.txt")) && currentPhase(CWD3, true) === null);
+	completed === true && !existsSync(join(expectedStore3, "active.txt")) && currentPhase(CWD3) === null);
 
 // ===========================================================================
 // NEW battery — post-HLD prose-close regeneration + adapted finalize-retry /
@@ -1160,7 +1149,7 @@ await fireProseRun("(regenerated — ignore)");
 sent.length = 0;
 // CWD4 is untouched so far in this file (no active.txt) — the empty-store
 // field-failure scenario itself: currentPhase resolves to null.
-check("pre-intent battery starts from a null-current cwd (empty store)", currentPhase(CWD4, true) === null);
+check("pre-intent battery starts from a null-current cwd (empty store)", currentPhase(CWD4) === null);
 await tc(toolEvent("read"), makeCtx(CWD4)); // permitted call → latches investigationDone
 await fireProseRun("Here's the full plan in prose — happy to start implementing it whenever you say go.", makeCtx(CWD4));
 const preIntentSteer = sent.at(-1);
@@ -1426,13 +1415,13 @@ check("abandon(a): active.txt gone, abandoned.txt written with '<goal>\\n<epoch-
 check("abandon(a): warning notify fires naming the goal and 'discarded', goal dir still alive during the grace window",
 	notifications.some(([msg, type]) => msg.includes("abgoal") && msg.includes("discarded") && type === "warning") && existsSync(goalDirPath4("abgoal")));
 check("abandon(a): currentPhase null during grace (pointer gone, injection off), an abandon timer is now pending",
-	currentPhase(CWD4, false) === null && hasPendingAbandon(CWD4) === true);
+	currentPhase(CWD4) === null && hasPendingAbandon(CWD4) === true);
 
 console.log("\n[abandon (b) — re-engage within grace cancels the purge and restores the pointer]");
 notifications.length = 0;
 await ensureGuardOn(makeCtx(CWD4));
 check("abandon(b): pointer restored to abgoal, tombstone removed",
-	currentPhase(CWD4, true)?.goal === "abgoal" && currentPhase(CWD4, true)?.phase === "discovery" && !existsSync(tombstonePath4()));
+	currentPhase(CWD4)?.goal === "abgoal" && currentPhase(CWD4)?.phase === "discovery" && !existsSync(tombstonePath4()));
 check("abandon(b): 'kept' notify fires, no abandon timer left pending after the restore",
 	notifications.some(([msg, type]) => msg.includes("abgoal") && msg.includes("kept") && type === "info") && hasPendingAbandon(CWD4) === false);
 
@@ -1461,7 +1450,7 @@ const gate2KeepResult = await registered.tools.get("plan_advance").execute("id",
 check("abandon(d): Gate 2 released the guard into execute, NO tombstone created (isPlanningPhase(execute) is false)",
 	gate2KeepResult.details?.released === true && readMachinePhase(CWD4, GATE2KEEP) === "execute" && !existsSync(tombstonePath4()));
 check("abandon(d): pointer + store stay intact, no abandon-warning notify fired",
-	currentPhase(CWD4, false)?.goal === GATE2KEEP && existsSync(join(goalDirPath4(GATE2KEEP), "plan.md")) && !notifications.some(([msg]) => msg.includes("will be discarded")));
+	currentPhase(CWD4)?.goal === GATE2KEEP && existsSync(join(goalDirPath4(GATE2KEEP), "plan.md")) && !notifications.some(([msg]) => msg.includes("will be discarded")));
 
 console.log("\n[abandon (f) — simulated process death: a stale tombstone is purged before currentPhase ever resolves it]");
 await ensureGuardOff(makeCtx(CWD4));
@@ -1475,7 +1464,7 @@ check("abandon(f) setup: no pointer, a stale tombstone on disk, goal dir still t
 notifications.length = 0;
 await ensureGuardOn(makeCtx(CWD4)); // fresh activation — purgeTombstone runs unconditionally, age-agnostic, BEFORE currentPhase is ever consulted
 check("abandon(f): stale tombstone purges the goal dir + itself before currentPhase ever resolves it, currentPhase null",
-	!existsSync(goalDirPath4(DEADGOAL)) && !existsSync(tombstonePath4()) && currentPhase(CWD4, true) === null);
+	!existsSync(goalDirPath4(DEADGOAL)) && !existsSync(tombstonePath4()) && currentPhase(CWD4) === null);
 check("abandon(f): the fresh-activation sweep notifies about the discarded stale plan",
 	notifications.some(([msg, type]) => msg.includes(DEADGOAL) && msg.includes("discarded") && type === "info"));
 
@@ -1493,7 +1482,7 @@ const purgedPartial = purgeTombstone(CWD4);
 check("abandon(g): purgeTombstone returns null (nothing discarded), goal kept (dir + re-saved plan.md content intact)",
 	purgedPartial === null && readFileSync(join(goalDirPath4(PARTIALGOAL), "plan.md"), "utf8").includes("re-saved mid-grace"));
 check("abandon(g): only the stale tombstone is dropped, pointer stays intact",
-	!existsSync(tombstonePath4()) && currentPhase(CWD4, false)?.goal === PARTIALGOAL);
+	!existsSync(tombstonePath4()) && currentPhase(CWD4)?.goal === PARTIALGOAL);
 
 // ===========================================================================
 // NEW battery — gitStagedFiles / isPartiallyStaged: pure function, real git

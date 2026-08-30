@@ -36,7 +36,7 @@ export type AskFormResult = { declined: true } | { answers: Record<string, strin
  * larger question set into multiple sequential forms, so an overflow can never
  * be rejected (the old schema hard-rejected >4 questions, which made the model
  * silently decide the dropped question — this paging makes that impossible). */
-export const ASK_FORM_PAGE_MAX = 4;
+const ASK_FORM_PAGE_MAX = 4;
 
 /** Aggregated outcome of a paged form run (sequential pages of at most
  * ASK_FORM_PAGE_MAX questions). On cancellation (`declined`) every question
@@ -125,10 +125,6 @@ export async function runAskForm(
 			done({ answers: out });
 		}
 
-		function finishIfReady(): void {
-			if (allAnswered()) finish();
-		}
-
 		function allAnswered(): boolean {
 			return questions.every((q) => answers.has(qKey(q)));
 		}
@@ -145,6 +141,11 @@ export async function runAskForm(
 			refresh();
 		}
 
+		// editMode (which gates whether the editor is even receiving input, and
+		// therefore whether onSubmit can fire at all) is set true only from the
+		// single-select path below — a multiSelect question's custom pick is
+		// confirmed directly via Space/Enter, never through this editor. So `q`
+		// here is always single-select; there is no multiSelect branch to handle.
 		editor.onSubmit = (value) => {
 			const q = questions[tab];
 			if (!q) return;
@@ -153,25 +154,12 @@ export async function runAskForm(
 				// Empty note on the built-in "None of the above": the note is OPTIONAL — accept as-is.
 				editMode = false;
 				editor.setText("");
-				if (q.multiSelect) {
-					multiPicks.set(qKey(q), [CUSTOM]);
-					answers.set(qKey(q), [CUSTOM]);
-				} else {
-					saveSingle(q, CUSTOM);
-				}
+				saveSingle(q, CUSTOM);
 				refresh();
 				return;
 			}
 			editMode = false;
 			editor.setText("");
-			if (q.multiSelect) {
-				const picks = multiPicks.get(qKey(q)) ?? [];
-				picks.push(trimmed.includes(CUSTOM) ? trimmed : `${CUSTOM} — ${trimmed}`);
-				multiPicks.set(qKey(q), picks);
-				answers.set(qKey(q), picks);
-				refresh();
-				return;
-			}
 			saveSingle(q, trimmed.includes(CUSTOM) ? trimmed : `${CUSTOM} — ${trimmed}`);
 		};
 
@@ -267,7 +255,7 @@ export async function runAskForm(
 						picks.push(CUSTOM);
 						multiPicks.set(qKey(q), picks);
 						answers.set(qKey(q), picks);
-						finishIfReady();
+						if (allAnswered()) finish();
 						refresh();
 						return;
 					}
@@ -451,21 +439,17 @@ export async function runAskForm(
 	return result ?? { declined: true };
 }
 
-/** Run `runAskForm` over `questions` as sequential pages of at most `pageMax`
- * (default ASK_FORM_PAGE_MAX), aggregating every page's answers into a single
- * result keyed by the original question text — original order preserved. If a
- * page is cancelled (`declined`), the answers collected so far are kept and all
+/** Run `runAskForm` over `questions` as sequential pages of at most
+ * ASK_FORM_PAGE_MAX, aggregating every page's answers into a single result
+ * keyed by the original question text — original order preserved. If a page
+ * is cancelled (`declined`), the answers collected so far are kept and all
  * questions from the cancelled page onward are reported as `unanswered`; the
  * tool never invents them. */
-export async function runAskFormPages(
-	ctx: ExtensionContext,
-	questionsInput: AskQuestionInput[],
-	pageMax: number = ASK_FORM_PAGE_MAX,
-): Promise<PagedAskFormResult> {
+export async function runAskFormPages(ctx: ExtensionContext, questionsInput: AskQuestionInput[]): Promise<PagedAskFormResult> {
 	const questions = normalizeAskQuestions(questionsInput);
 	const answers: Record<string, string | string[]> = {};
-	for (let i = 0; i < questions.length; i += pageMax) {
-		const page = questions.slice(i, i + pageMax);
+	for (let i = 0; i < questions.length; i += ASK_FORM_PAGE_MAX) {
+		const page = questions.slice(i, i + ASK_FORM_PAGE_MAX);
 		const result = await runAskForm(ctx, page);
 		if ("declined" in result) {
 			return { declined: true, answers, unanswered: questions.slice(i) };

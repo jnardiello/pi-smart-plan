@@ -23,8 +23,6 @@ import {
 	buildWavesSection,
 	computeLayers,
 	flipCheckbox,
-	inferPhase,
-	normalizePhase,
 	ownsCovers,
 	parseDoD,
 	parseTasks,
@@ -32,6 +30,7 @@ import {
 	readyFrontier,
 	sectionText,
 	shapeErrorMessage,
+	toPhase,
 	validatePhaseShape,
 	validateTaskGraph,
 	validationErrorMessage,
@@ -109,7 +108,10 @@ export class PlanStoreValidationError extends Error {
 	}
 }
 
-function validateGoal(goal: string): void {
+/** Single goal-slug validation entry point — every internal write path plus
+ * every external caller (e.g. plan_intent) goes through this one function,
+ * without going through a write path. */
+export function validateGoalSlug(goal: string): void {
 	if (!GOAL_PATTERN.test(goal)) {
 		throw new PlanStoreValidationError(
 			`Invalid goal "${goal}": use kebab-case with lowercase letters and digits only (e.g. "fix-crash"). ` +
@@ -119,13 +121,6 @@ function validateGoal(goal: string): void {
 	if (goal === "done") {
 		throw new PlanStoreValidationError(`"done" is a reserved name — pick a different goal slug.`);
 	}
-}
-
-/** Public slug guard — thin wrapper over the internal validateGoal, for callers
- * (e.g. plan_intent) that need to reject a bad goal slug before doing anything
- * else, without going through a write path. */
-export function validateGoalSlug(goal: string): void {
-	validateGoal(goal);
 }
 
 /** Today's date as YYYY-MM-DD (local calendar day). */
@@ -147,14 +142,14 @@ function isoDate(): string {
  * (discovery) the moment their directory is created — phase.txt exists before
  * any plan is written, so a first plan.md that already carries HLD+Tasks can
  * never drag inference to a later phase and deadlock a gate. A pre-v0.10 goal
- * that already exists without phase.txt is migrated ONCE here — inferred from
- * its current plan.md — the first time a write touches it; pure read paths
- * (currentPhase / goalSummaries / resolvePhase) never write phase.txt. Once
- * phase.txt exists the ONLY writer is setMachinePhase (the owner-driven
- * gate): no content ever changes the phase again.
+ * that already exists without phase.txt is pinned to discovery the same way,
+ * the first time a write touches it; pure read paths (currentPhase /
+ * goalSummaries / resolvePhase) never write phase.txt. Once phase.txt exists
+ * the ONLY writer is setMachinePhase (the owner-driven gate): no content ever
+ * changes the phase again.
  */
 function ensureActiveGoalDir(cwd: string, goal: string): string {
-	validateGoal(goal);
+	validateGoalSlug(goal);
 	const goalDir = activeGoalDir(cwd, goal);
 	const fresh = !existsSync(goalDir);
 	if (fresh) {
@@ -166,15 +161,7 @@ function ensureActiveGoalDir(cwd: string, goal: string): string {
 	}
 	mkdirSync(goalDir, { recursive: true, mode: STORE_DIR_MODE });
 	if (!existsSync(phaseTxtPath(cwd, goal))) {
-		if (fresh) {
-			// New (or re-opened) goal: pin the machine phase to the entry phase.
-			writeFileSync(phaseTxtPath(cwd, goal), "discovery\n", "utf8");
-		} else {
-			// Pre-v0.10 active goal touched by a write for the first time since
-			// phase.txt existed: migrate its phase from the plan it already has.
-			const existing = readOptional(join(goalDir, "plan.md"));
-			writeFileSync(phaseTxtPath(cwd, goal), `${inferPhase(existing, true)}\n`, "utf8");
-		}
+		writeFileSync(phaseTxtPath(cwd, goal), "discovery\n", "utf8");
 	}
 	writeFileSync(activePointerPath(cwd), `${goal}\n`, "utf8");
 	return goalDir;
@@ -200,13 +187,12 @@ function stripPhaseLine(content: string): string {
 }
 
 /** Read the machine-managed phase for a goal (undefined when never set). Raw
- * file values are mapped through normalizePhase — legacy names on disk (e.g.
- * "hld") come back as their new-name equivalent WITHOUT rewriting the file;
- * unknown/garbage content returns undefined. */
+ * file content is validated through toPhase; unknown/garbage content returns
+ * undefined. */
 export function readMachinePhase(cwd: string, goal: string): Phase | undefined {
 	try {
 		const raw = readFileSync(phaseTxtPath(cwd, goal), "utf8").trim();
-		return normalizePhase(raw);
+		return toPhase(raw);
 	} catch {
 		return undefined;
 	}
@@ -224,7 +210,7 @@ export function isPlanningPhase(phase: Phase): boolean {
  * the phase marker. Never touches plan.md content: the marker stays in a
  * machine-only file the model cannot read or write. */
 export function setMachinePhase(cwd: string, goal: string, phase: Phase): void {
-	validateGoal(goal);
+	validateGoalSlug(goal);
 	if (!PHASES.includes(phase)) throw new PlanStoreValidationError(`invalid phase "${phase}"`);
 	ensureActiveGoalDir(cwd, goal);
 	writeFileSync(phaseTxtPath(cwd, goal), `${phase}\n`, "utf8");
@@ -234,12 +220,6 @@ export function setMachinePhase(cwd: string, goal: string, phase: Phase): void {
  * assembly; returns CONTENT, never paths. */
 export function readPlan(cwd: string, goal: string): string {
 	return readOptional(join(activeGoalDir(cwd, goal), "plan.md"));
-}
-
-/** Non-empty journal lines for a goal (0 when absent). */
-export function journalLineCount(cwd: string, goal: string): number {
-	const lines = readOptional(join(activeGoalDir(cwd, goal), "journal.md")).split("\n").filter((l) => l.trim().length > 0);
-	return lines.length;
 }
 
 /** Per-line date prefix appendJournal stamps on every non-empty journal line
@@ -314,17 +294,27 @@ export function confirmIntent(cwd: string, goal: string, statement: string): voi
 	appendJournal(cwd, goal, `intent confirmed: ${sanitized}`);
 }
 
-/** Parse intent.txt's raw content (`<statement>\n<epoch-ms>\n`), same parse
- * style as readTombstone: null on a missing/unparsable file (empty statement
- * line or non-numeric timestamp). Shared by readIntent and recall's done-goal
- * lookup (which reads from done/<goal>/, outside the active-goal path). */
-function parseIntent(raw: string): { statement: string; at: number } | null {
+/** Parse a `<label>\n<epoch-ms>\n` stamped file's raw content into
+ * `{label, at}`, or null on a missing/unparsable file (empty first line or a
+ * non-numeric second line). Shared by parseIntent (intent.txt, label = the
+ * confirmed statement) and readTombstone (abandoned.txt, label = the
+ * tombstoned goal) — same on-disk shape, different field name at the call
+ * site. */
+function parseStamped(raw: string): { label: string; at: number } | null {
 	if (!raw.trim()) return null;
-	const [statementLine, atLine] = raw.split("\n");
-	const statement = (statementLine ?? "").trim();
+	const [firstLine, atLine] = raw.split("\n");
+	const label = (firstLine ?? "").trim();
 	const at = Number((atLine ?? "").trim());
-	if (!statement || !Number.isFinite(at)) return null;
-	return { statement, at };
+	if (!label || !Number.isFinite(at)) return null;
+	return { label, at };
+}
+
+/** Parse intent.txt's raw content, same shape as readTombstone. Shared by
+ * readIntent and recall's done-goal lookup (which reads from done/<goal>/,
+ * outside the active-goal path). */
+function parseIntent(raw: string): { statement: string; at: number } | null {
+	const parsed = parseStamped(raw);
+	return parsed ? { statement: parsed.label, at: parsed.at } : null;
 }
 
 /** Parsed content of a confirmed objective (intent.txt), or null when absent
@@ -346,7 +336,7 @@ function readIntentEitherPosition(cwd: string, goal: string): { statement: strin
 }
 
 export function savePlan(cwd: string, goal: string, content: string): string {
-	validateGoal(goal);
+	validateGoalSlug(goal);
 	// Read-only check (readIntentEitherPosition never writes): a save with no
 	// confirmed objective — active OR archived (F1: a completed goal's
 	// intent.txt lives in done/<goal>/ until ensureActiveGoalDir reopens it
@@ -458,43 +448,38 @@ export function recall(cwd: string, query?: string): string {
 	// `done` is the completion bucket, not a goal: never list it as active.
 	const active = listGoalDirs(root).filter((name) => name !== "done");
 	const doneRoot = join(root, "done");
-	const done = listGoalDirs(doneRoot).map((name) => ({ name, done: true }));
+	const done = listGoalDirs(doneRoot);
 
 	const sections: string[] = [];
 	const activeHeading = active.length ? `Active goals:\n${active.map((g) => `- ${g}`).join("\n")}` : "Active goals: none";
 	sections.push(activeHeading);
-	const doneHeading = done.length ? `Done goals:\n${done.map((g) => `- ${g.name}`).join("\n")}` : "Done goals: none";
+	const doneHeading = done.length ? `Done goals:\n${done.map((g) => `- ${g}`).join("\n")}` : "Done goals: none";
 	sections.push(doneHeading);
 
+	// Single unified list — active entries first (sorted), then done entries
+	// (sorted), each carrying its own dir + display tag; the two branches
+	// below iterate it once instead of duplicating themselves per bucket.
+	const goals = [
+		...active.map((goal) => ({ goal, dir: join(root, goal), tag: "(active)" })),
+		...done.map((goal) => ({ goal, dir: join(doneRoot, goal), tag: "(done)" })),
+	];
+
 	if (needle === "") {
-		for (const g of active) {
-			const plan = readOptional(join(root, g, "plan.md"));
-			sections.push(`\n- ${g}: ${planHeadline(plan, g)}`);
-		}
-		for (const g of done) {
-			const plan = readOptional(join(doneRoot, g.name, "plan.md"));
-			sections.push(`\n- ${g.name}: ${planHeadline(plan, g.name)}`);
+		for (const { goal, dir } of goals) {
+			const plan = readOptional(join(dir, "plan.md"));
+			sections.push(`\n- ${goal}: ${planHeadline(plan, goal)}`);
 		}
 		return sections.join("\n");
 	}
 
 	const hits: string[] = [];
-	for (const g of active) {
-		const plan = readOptional(join(root, g, "plan.md"));
-		const journal = readOptional(join(root, g, "journal.md"));
-		const intent = readIntent(cwd, g)?.statement ?? "";
+	for (const { goal, dir, tag } of goals) {
+		const plan = readOptional(join(dir, "plan.md"));
+		const journal = readOptional(join(dir, "journal.md"));
+		const intent = parseIntent(readOptional(join(dir, "intent.txt")))?.statement ?? "";
 		if ((intent + "\n" + plan + "\n" + journal).toLowerCase().includes(needle)) {
 			const intentBlock = intent ? `\n### intent\n${intent}\n` : "";
-			hits.push(`\n## ${g} (active)\n${intentBlock}\n### plan.md\n${plan}\n\n### journal.md (last ${JOURNAL_TAIL} lines)\n${journalTail(journal)}`);
-		}
-	}
-	for (const g of done) {
-		const plan = readOptional(join(doneRoot, g.name, "plan.md"));
-		const journal = readOptional(join(doneRoot, g.name, "journal.md"));
-		const intent = parseIntent(readOptional(join(doneRoot, g.name, "intent.txt")))?.statement ?? "";
-		if ((intent + "\n" + plan + "\n" + journal).toLowerCase().includes(needle)) {
-			const intentBlock = intent ? `\n### intent\n${intent}\n` : "";
-			hits.push(`\n## ${g.name} (done)\n${intentBlock}\n### plan.md\n${plan}\n\n### journal.md (last ${JOURNAL_TAIL} lines)\n${journalTail(journal)}`);
+			hits.push(`\n## ${goal} ${tag}\n${intentBlock}\n### plan.md\n${plan}\n\n### journal.md (last ${JOURNAL_TAIL} lines)\n${journalTail(journal)}`);
 		}
 	}
 	if (hits.length === 0) {
@@ -510,7 +495,7 @@ export function recall(cwd: string, query?: string): string {
  * does not exist.
  */
 export function completeGoal(cwd: string, goal: string): boolean {
-	validateGoal(goal);
+	validateGoalSlug(goal);
 	const goalDir = activeGoalDir(cwd, goal);
 	if (!existsSync(goalDir)) return false;
 	const doneDir = doneGoalDir(cwd, goal);
@@ -610,45 +595,31 @@ export function purgeTombstone(cwd: string): string | null {
 /** Parsed content of a pending tombstone (abandoned.txt), or null when absent
  * or unparsable. */
 export function readTombstone(cwd: string): { goal: string; at: number } | null {
-	const raw = readOptional(tombstonePath(cwd));
-	if (!raw.trim()) return null;
-	const [goalLine, atLine] = raw.split("\n");
-	const goal = (goalLine ?? "").trim();
-	const at = Number((atLine ?? "").trim());
-	if (!goal || !Number.isFinite(at)) return null;
-	return { goal, at };
-}
-
-/** True when at least one active goal in this repo's store has a plan.md. */
-export function hasActivePlans(cwd: string): boolean {
-	const root = storeRoot(cwd);
-	for (const name of listGoalDirs(root)) {
-		if (name !== "done" && existsSync(join(root, name, "plan.md"))) return true;
-	}
-	return false;
+	const parsed = parseStamped(readOptional(tombstonePath(cwd)));
+	return parsed ? { goal: parsed.label, at: parsed.at } : null;
 }
 
 /**
  * Pure phase resolution for read paths (currentPhase, goalSummaries, ...):
  * the machine-managed phase.txt always wins — even with the guard off or
  * re-engaged, which is what keeps a goal re-guarded mid-execute staying in
- * execute — and legacy goals without phase.txt fall back to inference from
- * content + guard state (inferPhase's own guardOn branch still applies
- * there). Never writes to disk; write-path migration lives in
- * ensureActiveGoalDir instead.
+ * execute. A goal with no phase.txt yet falls back to discovery (the entry
+ * phase — ensureActiveGoalDir pins every write-touched goal to phase.txt
+ * immediately, so this is only a transient pre-write default). Never writes
+ * to disk; write-path pinning lives in ensureActiveGoalDir instead.
  */
-function resolvePhase(cwd: string, goal: string, content: string, guardOn: boolean): Phase {
-	return readMachinePhase(cwd, goal) ?? inferPhase(content, guardOn);
+function resolvePhase(cwd: string, goal: string): Phase {
+	return readMachinePhase(cwd, goal) ?? "discovery";
 }
 
 /** One summary line per active goal: phase, progress, ready frontier (widget/dialog). */
-export function goalSummaries(cwd: string, guardOn: boolean): string[] {
+export function goalSummaries(cwd: string): string[] {
 	const root = storeRoot(cwd);
 	const lines: string[] = [];
 	for (const name of listGoalDirs(root)) {
 		if (name === "done") continue;
 		const content = readOptional(join(root, name, "plan.md"));
-		const phase = resolvePhase(cwd, name, content, guardOn);
+		const phase = resolvePhase(cwd, name);
 		const tasks = parseTasks(content);
 		if (tasks.length === 0) {
 			lines.push(`${name} [${phase}] (no tasks yet)`);
@@ -669,13 +640,24 @@ export function goalSummaries(cwd: string, guardOn: boolean): string[] {
  * active.txt is the only resume path (0.10.0 was never published, so there
  * are no pre-pointer sessions to support), and inert orphan goal dirs are
  * still listed elsewhere (goalSummaries / plan_recall / plan_exit's dialog). */
-export function currentPhase(cwd: string, guardOn: boolean): { goal: string; phase: Phase } | null {
+export function currentPhase(cwd: string): { goal: string; phase: Phase } | null {
 	const pointer = readActivePointer(cwd);
 	if (!pointer) return null;
 	const planPath = join(activeGoalDir(cwd, pointer), "plan.md");
 	if (!existsSync(planPath) && !existsSync(phaseTxtPath(cwd, pointer))) return null;
-	const content = readOptional(planPath);
-	return { goal: pointer, phase: resolvePhase(cwd, pointer, content, guardOn) };
+	return { goal: pointer, phase: resolvePhase(cwd, pointer) };
+}
+
+/** Read a goal's plan.md, throwing the standard "no active plan" error when
+ * it's empty/absent. Shared by every read path that must hard-refuse before
+ * proceeding without one: nextTasks, updateTaskStatus, persistApproved and
+ * getDoD. */
+function requirePlan(cwd: string, goal: string): string {
+	const content = readPlan(cwd, goal);
+	if (!content) {
+		throw new PlanStoreValidationError(`no active plan for goal "${goal}" — save one first via plan_save`);
+	}
+	return content;
 }
 
 /**
@@ -683,11 +665,8 @@ export function currentPhase(cwd: string, guardOn: boolean): { goal: string; pha
  * are all done. Returns CONTENT (never paths); throws when no plan exists.
  */
 export function nextTasks(cwd: string, goal: string): string {
-	validateGoal(goal);
-	const content = readOptional(join(activeGoalDir(cwd, goal), "plan.md"));
-	if (!content) {
-		throw new PlanStoreValidationError(`no active plan for goal "${goal}" — save one first via plan_save`);
-	}
+	validateGoalSlug(goal);
+	const content = requirePlan(cwd, goal);
 	const tasks = parseTasks(content);
 	if (tasks.length === 0) {
 		return `Plan for "${goal}" has no Tasks section yet.`;
@@ -709,10 +688,11 @@ export function nextTasks(cwd: string, goal: string): string {
 
 // --- task lifecycle: owns verification + dependency discipline ---------------
 
-/** Dirty files (modified + untracked, renames split) relative to repo root.
- * Returns null outside a git worktree or when git fails — callers degrade to
- * the weaker all-owns check. */
-function gitDirtyFiles(cwd: string): string[] | null {
+/** Raw non-empty `git status --porcelain` lines for cwd, or null outside a
+ * git worktree or when git fails. Shared by gitDirtyFiles and gitStagedFiles
+ * — they run the identical command and differ only in how they turn a
+ * porcelain line into their own return shape. */
+function gitPorcelainLines(cwd: string): string[] | null {
 	try {
 		if (!existsSync(join(cwd, ".git"))) return null;
 		const out = execFileSync("git", ["status", "--porcelain"], {
@@ -720,13 +700,19 @@ function gitDirtyFiles(cwd: string): string[] | null {
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "ignore"],
 		});
-		return out
-			.split("\n")
-			.filter((line) => line.trim().length > 0)
-			.flatMap((line) => line.slice(3).trim().replace(/^"|"$/g, "").split(" -> "));
+		return out.split("\n").filter((line) => line.trim().length > 0);
 	} catch {
 		return null;
 	}
+}
+
+/** Dirty files (modified + untracked, renames split) relative to repo root.
+ * Returns null outside a git worktree or when git fails — callers degrade to
+ * the weaker all-owns check. */
+function gitDirtyFiles(cwd: string): string[] | null {
+	const lines = gitPorcelainLines(cwd);
+	if (lines === null) return null;
+	return lines.flatMap((line) => line.slice(3).trim().replace(/^"|"$/g, "").split(" -> "));
 }
 
 /** Staged files (index differs from HEAD) relative to repo root — the SAME
@@ -737,20 +723,11 @@ function gitDirtyFiles(cwd: string): string[] | null {
  * since callers here never need to distinguish "no git" from "no staged
  * files"). */
 export function gitStagedFiles(cwd: string): { code: string; path: string }[] {
-	try {
-		if (!existsSync(join(cwd, ".git"))) return [];
-		const out = execFileSync("git", ["status", "--porcelain"], {
-			cwd,
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
-		});
-		return out
-			.split("\n")
-			.filter((line) => line.trim().length > 0 && line[0] !== " " && line[0] !== "?")
-			.map((line) => ({ code: line.slice(0, 2), path: line.slice(3).trim().replace(/^"|"$/g, "") }));
-	} catch {
-		return [];
-	}
+	const lines = gitPorcelainLines(cwd);
+	if (lines === null) return [];
+	return lines
+		.filter((line) => line[0] !== " " && line[0] !== "?")
+		.map((line) => ({ code: line.slice(0, 2), path: line.slice(3).trim().replace(/^"|"$/g, "") }));
 }
 
 /** True when BOTH porcelain columns are non-space (e.g. "MM", "AM") — the
@@ -816,13 +793,12 @@ function writeClaims(cwd: string, goal: string, claims: Record<string, string[]>
  * touched. Transitions are journaled.
  */
 export function updateTaskStatus(cwd: string, goal: string, taskId: string, status: string): string {
-	validateGoal(goal);
+	validateGoalSlug(goal);
 	if (!(status === "pending" || status === "in_progress" || status === "blocked" || status === "done")) {
 		throw new PlanStoreValidationError(`invalid status "${status}" — use pending | in_progress | blocked | done`);
 	}
 	const planPath = join(activeGoalDir(cwd, goal), "plan.md");
-	const content = readOptional(planPath);
-	if (!content) throw new PlanStoreValidationError(`no active plan for goal "${goal}" — save one first via plan_save`);
+	const content = requirePlan(cwd, goal);
 	const tasks = parseTasks(content);
 	const task = tasks.find((t) => t.id === taskId);
 	if (!task) throw new PlanStoreValidationError(`unknown task "${taskId}" in goal "${goal}"`);
@@ -863,8 +839,8 @@ export function updateTaskStatus(cwd: string, goal: string, taskId: string, stat
 			delete claims[taskId];
 			writeClaims(cwd, goal, claims);
 		}
+		appendJournal(cwd, goal, `task ${taskId} closed (owns verified)`);
 	}
-	if (status === "done") appendJournal(cwd, goal, `task ${taskId} closed (owns verified)`);
 	return `Task ${taskId} → ${status}${status === "done" ? " (owns + deps verified)" : ""}.`;
 }
 
@@ -893,7 +869,7 @@ export interface PlanView {
 
 /** Structured snapshot of a goal's plan for UI rendering (live panel). */
 export function getPlanView(cwd: string, goal: string): PlanView | null {
-	const content = readOptional(join(activeGoalDir(cwd, goal), "plan.md"));
+	const content = readPlan(cwd, goal);
 	if (!content) return null;
 	const tasks = parseTasks(content);
 	const layers = computeLayers(tasks) ?? new Map();
@@ -933,9 +909,8 @@ function approvedRoot(): string {
  * contract). Returns the destination path — internal use only.
  */
 export function persistApproved(cwd: string, goal: string): string {
-	validateGoal(goal);
-	const content = readOptional(join(activeGoalDir(cwd, goal), "plan.md"));
-	if (!content) throw new PlanStoreValidationError(`no active plan for goal "${goal}" — save one first via plan_save`);
+	validateGoalSlug(goal);
+	const content = requirePlan(cwd, goal);
 	const destDir = join(approvedRoot(), repoSlug(cwd), goal);
 	mkdirSync(destDir, { recursive: true });
 	const dest = join(destDir, "plan.md");
@@ -956,7 +931,5 @@ export function approvedGoals(cwd: string): string[] {
 
 /** Executable DoD commands of a goal's plan (mechanical delivery gate). */
 export function getDoD(cwd: string, goal: string): string[] {
-	const content = readOptional(join(activeGoalDir(cwd, goal), "plan.md"));
-	if (!content) throw new PlanStoreValidationError(`no active plan for goal "${goal}" — save one first via plan_save`);
-	return parseDoD(content);
+	return parseDoD(requirePlan(cwd, goal));
 }

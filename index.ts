@@ -19,16 +19,14 @@
  *   store paths.
  *
  * The plan is written into the external store via plan_save / journal_append.
- * ctrl+p sends a short goal-elicitation prompt; the full goal workflow is
- * injected only by /plan.
  */
 import { execFileSync } from "node:child_process";
-import { isToolCallEventType, keyHint, type ExtensionAPI, type ExtensionContext, type TurnEndEvent } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType, type ExtensionAPI, type ExtensionContext, type TurnEndEvent } from "@earendil-works/pi-coding-agent";
 import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { runAskForm, runAskFormPages, type AskQuestionInput } from "./src/ask-form.ts";
 import { GLOBAL_CONSTRAINTS, PHASE_PROMPTS, SUBAGENT_CONSTRAINTS, planBootstrapMessage } from "./src/prompts.ts";
-import { firstLine, renderIntentPanel, renderPlanPanel, resultText, toolCallLabel } from "./src/render.ts";
+import { phaseMissionLine, renderIntentPanel, renderPlanPanel, stripLocalMission, toolRenderers } from "./src/render.ts";
 import { PHASES, type Phase } from "./src/plan-validate.ts";
 import { isReadOnlyCommand } from "./src/bash-guard.ts";
 import {
@@ -89,11 +87,6 @@ const PHASE_NEXT: Record<Phase, Phase | undefined> = {
 	execute: undefined,
 };
 
-/** plan_task_update's renderCall verb per status — "claimed"/"done" read more
- * naturally in a one-liner than the raw enum values (pending/blocked pass
- * through unchanged). */
-const TASK_STATUS_VERB: Record<string, string> = { in_progress: "claimed", done: "done", blocked: "blocked", pending: "pending" };
-
 /** Session flags the phase-deliverable snapshot can't derive from plan content
  * alone. Session-global (not per-goal) — reset in restoreTools (guard off);
  * never duplicated into the store. */
@@ -127,7 +120,7 @@ const CHILD_MODE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
  * needed here (the phase-machine module stays the single source of truth). */
 function phaseAllowedTools(ctx: { cwd: string }): ReadonlySet<string> {
 	if (isSubagentChild) return CHILD_MODE_ALLOWED_TOOLS;
-	const current = currentPhase(ctx.cwd, true);
+	const current = currentPhase(ctx.cwd);
 	const phase = current?.phase ?? "discovery";
 	return PHASE_ALLOWED_TOOLS[phase];
 }
@@ -138,6 +131,21 @@ function phaseAllowedTools(ctx: { cwd: string }): ReadonlySet<string> {
 function safeError(operation: string, error: unknown): string {
 	const message = error instanceof PlanStoreValidationError ? error.message : "plan store I/O error";
 	return `${operation} failed: ${message}`;
+}
+
+/** Standard single-text-block tool result, success shape — the common
+ * `{content:[{type:"text",…}],details,isError:false}` literal every tool's
+ * execute() returns on its non-error paths, collapsed to one call. isError
+ * is explicit (not omitted) so it matches every existing call site, several
+ * of which already asserted `isError === false` literally. */
+function ok(text: string, details: Record<string, unknown> = {}) {
+	return { content: [{ type: "text" as const, text }], details, isError: false as const };
+}
+
+/** Standard single-text-block tool result, refusal shape — the same literal
+ * as ok() with isError forced true. */
+function refuse(text: string, details: Record<string, unknown> = {}) {
+	return { content: [{ type: "text" as const, text }], details, isError: true as const };
 }
 
 /** F2/F6: guard plan_intent's TARGET goal directly — reading readMachinePhase/
@@ -157,6 +165,39 @@ function intentGuardViolation(cwd: string, goal: string): string | undefined {
 		return `"${goal}" is already completed — plan_intent cannot reopen it; re-opening a completed goal happens automatically on the next plan_save`;
 	}
 	return undefined;
+}
+
+/** Shared TOCTOU guard pair for plan_intent's target goal: the goal-switch
+ * lock (another goal already mid-planning) and intentGuardViolation (locked
+ * post-discovery / already done). Run identically before the form opens and
+ * again (F6) right before confirmIntent writes — both call sites stay, only
+ * the duplicated check logic is shared here. Returns the refuse()-shaped
+ * result, or undefined when the goal is confirmable. */
+function intentRefusal(cwd: string, goal: string): ReturnType<typeof refuse> | undefined {
+	const current = currentPhase(cwd);
+	if (current && current.goal !== goal && isPlanningPhase(current.phase)) {
+		return refuse(`one active goal per session — complete or abandon "${current.goal}" first`);
+	}
+	const violation = intentGuardViolation(cwd, goal);
+	if (violation) return refuse(violation);
+	return undefined;
+}
+
+/** "Q: <question>\nA: <answer>" blocks for every collected answer — the
+ * shared base formatting for both ask_smart_plan's ordinary form path and
+ * plan_intent's openQuestions safety net. Each caller still appends its own
+ * UNANSWERED/ANSWER RULE lines on top (their declined-branch handling
+ * differs). */
+function collectedBlocks(collected: { answers: Record<string, unknown> }): string[] {
+	return Object.entries(collected.answers).map(([q, a]) => `Q: ${q}\nA: ${Array.isArray(a) ? a.join(", ") : a}`);
+}
+
+/** Single-select label from a form answer: the string itself, or the first
+ * item of a multi-select array; undefined for anything else. Shared by
+ * runReviewGate's fixed-label routing and plan_intent's Confirm/Keep-chatting
+ * routing. */
+function pickLabel(answer: unknown): string | undefined {
+	return typeof answer === "string" ? answer : Array.isArray(answer) ? answer[0] : undefined;
 }
 
 let enabled = false;
@@ -216,8 +257,8 @@ let investigationDone = false;
 /** Deliver a plan request as a custom message: content goes to the LLM, the
  * TUI shows only the single-line renderer. Idle → trigger a turn immediately;
  * busy → queue as a non-interrupting followUp. */
-function sendPlan(pi: ExtensionAPI, ctx: ExtensionContext, content: string, goal: string, source: "command" | "shortcut"): void {
-	const payload = { customType: MESSAGE_TYPE, content, display: true, details: { goal, source } };
+function sendPlan(pi: ExtensionAPI, ctx: ExtensionContext, content: string, goal: string): void {
+	const payload = { customType: MESSAGE_TYPE, content, display: true, details: { goal } };
 	if (ctx.isIdle()) {
 		pi.sendMessage(payload, { triggerTurn: true });
 	} else {
@@ -280,22 +321,6 @@ function buildStagedPreflight(staged: { code: string; path: string }[]): string 
 	return lines.join("\n");
 }
 
-/** One-line mission for a phase, pulled straight from its PHASE_PROMPTS entry
- * (single source of truth — never duplicated) — used to tell the model what
- * the phase it just entered is for, right after a transition. Falls back to
- * a bare phase name if the LOCAL MISSION line is ever missing. */
-function phaseMissionLine(phase: Phase): string {
-	const match = PHASE_PROMPTS[phase].match(/^LOCAL MISSION:.*$/m);
-	return match ? match[0] : `phase ${phase}`;
-}
-
-/** Strip the "LOCAL MISSION:" label so a mission line reads naturally inline
- * (the live working message, tool result one-liners) instead of restating
- * the prompt tag. */
-function stripLocalMission(line: string): string {
-	return line.replace(/^LOCAL MISSION:\s*/, "");
-}
-
 /** Live working-message text for a phase — the same LOCAL MISSION line the
  * model itself is briefed with, minus its label, so the owner sees what's
  * happening without reading the raw prompt tag. Set at every transitionPhase
@@ -314,7 +339,7 @@ function queueImplementationBriefing(pi: ExtensionAPI, ctx: ExtensionContext, go
 	const content =
 		"(APPROVED by owner — plan mode released. The owner's answer IS the authorization: start implementing NOW. Do not ask for confirmation again.)\n\n" +
 		phaseMissionLine("execute");
-	sendPlan(pi, ctx, content, goal, "command");
+	sendPlan(pi, ctx, content, goal);
 }
 
 /** Heat ramp for the phase bar: starts neutral gray, warms up to vivid
@@ -347,8 +372,6 @@ function buildHeatBar(current: Phase | null): string {
 	return `${heatFg(240)}▐${RESET}${cells}${heatFg(240)}▌${RESET}`;
 }
 
-/** Live task tracking (Codex update_plan parity): goals, phase, progress and
- * ready frontier rendered as a TUI widget while plan mode is active. */
 /** Live state-machine view (Codex update_plan parity): themed phase pipeline
  * plus per-goal progress and ready frontier, rendered above the editor. */
 function refreshWidget(ctx: ExtensionContext): void {
@@ -358,12 +381,12 @@ function refreshWidget(ctx: ExtensionContext): void {
 	}
 	ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => {
 		const lines: string[] = [];
-		const current = currentPhase(ctx.cwd, true)?.phase ?? "discovery";
+		const current = currentPhase(ctx.cwd)?.phase ?? "discovery";
 		lines.push(theme.fg("accent", theme.bold("◈ PLAN MODE")) + theme.fg("muted", " · read-only"));
 		const usage = ctx.getContextUsage();
 		const usageText = usage?.percent != null ? theme.fg("muted", ` · ctx ${Math.round(usage.percent)}%`) : "";
 		lines.push(`${buildHeatBar(current)}  ${theme.fg("accent", theme.bold(current))}${usageText}`);
-		const goals = goalSummaries(ctx.cwd, enabled);
+		const goals = goalSummaries(ctx.cwd);
 		for (const goal of goals) lines.push(theme.fg("muted", `  ${goal}`));
 		if (current === "discovery" && goals.length === 0) {
 			lines.push(theme.fg("muted", "  → tell me what you want to design together"));
@@ -380,11 +403,11 @@ function planInjection(cwd: string): string | undefined {
 		// Subagent children under parent plan mode never run the plan workflow:
 		// drive them with a dedicated read-only exploration contract instead.
 		if (isSubagentChild) return `${GLOBAL_CONSTRAINTS}\n\n${SUBAGENT_CONSTRAINTS}`;
-		const current = currentPhase(cwd, true);
+		const current = currentPhase(cwd);
 		const phase = current?.phase ?? "discovery";
 		return `${GLOBAL_CONSTRAINTS}\n\n${PHASE_PROMPTS[phase]}`;
 	}
-	const current = currentPhase(cwd, false);
+	const current = currentPhase(cwd);
 	if (current?.phase === "execute") return `${GLOBAL_CONSTRAINTS}\n\n${PHASE_PROMPTS.execute}`;
 	return undefined;
 }
@@ -405,7 +428,7 @@ function sweepStaleGoal(cwd: string): string[] {
 	const purged: string[] = [];
 	const leftover = purgeTombstone(cwd);
 	if (leftover) purged.push(leftover);
-	const pointed = currentPhase(cwd, false);
+	const pointed = currentPhase(cwd);
 	if (!pointed) return purged;
 	const machinePhase = readMachinePhase(cwd, pointed.goal) ?? "discovery";
 	if (isPlanningPhase(machinePhase)) {
@@ -441,6 +464,26 @@ export default function planGuard(pi: ExtensionAPI): void {
 			intentConfirmed: readIntent(ctx.cwd, current.goal) !== null,
 			investigationDone,
 		};
+	}
+
+	/** Shared snapshot→readiness→refuse check for the three "current phase's
+	 * deliverable isn't ready" call sites (ask_smart_plan's phaseGate branch,
+	 * plan_advance re-opening a review phase, plan_advance's self-advance).
+	 * `prefix` and `extraDetails` are the only per-site variance (message
+	 * wording, details shape) — snapshot build, readiness check, hint and the
+	 * `missing` detail field are identical across all three. Returns the
+	 * refuse()-shaped result, or undefined when the deliverable is ready. */
+	function deliverableBlocked(
+		ctx: { cwd: string },
+		current: { goal: string; phase: Phase },
+		prefix: string,
+		extraDetails: Record<string, unknown>,
+	): ReturnType<typeof refuse> | undefined {
+		const snapshot = buildPhaseSnapshot(ctx, current);
+		const verdict = phaseDeliverableReady(current.phase, snapshot);
+		if (verdict.ready) return undefined;
+		const hint = nextActionHint(current.phase, snapshot);
+		return refuse(`${prefix}. Missing: ${verdict.missing.join("; ")}. ${hint}`, { ...extraDetails, missing: verdict.missing });
 	}
 
 	pi.registerFlag("plan", {
@@ -497,7 +540,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 			// restores it. Gate 2's release is excluded automatically: it calls
 			// transitionPhase(…, "execute") immediately before set(false), so
 			// isPlanningPhase is already false by the time this check runs.
-			const pointed = currentPhase(ctx.cwd, enabled);
+			const pointed = currentPhase(ctx.cwd);
 			if (pointed) {
 				const machinePhase = readMachinePhase(ctx.cwd, pointed.goal) ?? "discovery";
 				if (isPlanningPhase(machinePhase)) {
@@ -560,22 +603,14 @@ export default function planGuard(pi: ExtensionAPI): void {
 	 * calls instead of racing them. */
 	async function runReviewGate(ctx: ExtensionContext, goal: string, phase: "review_hld" | "review_final", extraDetail?: string) {
 		if (gateFormOpen) {
-			return {
-				content: [{ type: "text" as const, text: "a gate form is already open — wait for the owner's answer" }],
-				details: {},
-				isError: true,
-			};
+			return refuse("a gate form is already open — wait for the owner's answer");
 		}
 		gateFormOpen = true;
 		try {
 			noteCwd(ctx);
 			const view = getPlanView(ctx.cwd, goal);
 			if (!view) {
-				return {
-					content: [{ type: "text" as const, text: `Gate blocked: no plan view for "${goal}" — save one first via plan_save.` }],
-					details: {},
-					isError: true,
-				};
+				return refuse(`Gate blocked: no plan view for "${goal}" — save one first via plan_save.`);
 			}
 			// The panel in the transcript — same data shape the renderer expects.
 			pi.appendEntry(PRESENT_ENTRY_KEY, { goal });
@@ -616,21 +651,17 @@ export default function planGuard(pi: ExtensionAPI): void {
 			if ("declined" in result) {
 				// F3: the owner cancelled the form outright (declined) — POSTPONE.
 				gatePostponed = true;
-				return {
-					content: [{ type: "text" as const, text: `The owner postponed the gate — staying in ${phase}. A later plan_advance re-opens it.` }],
-					details: { answers: {}, declined: true, phase },
-					isError: false,
-				};
+				return ok(`The owner postponed the gate — staying in ${phase}. A later plan_advance re-opens it.`, { answers: {}, declined: true, phase });
 			}
 			const answer = result.answers[gateQuestion.question];
-			const label = typeof answer === "string" ? answer : Array.isArray(answer) ? answer[0] : undefined;
+			const label = pickLabel(answer);
 			const blocks = [`Q: ${gateQuestion.question}\nA: ${label ?? "(no answer)"}`];
 
 			if (phase === "review_hld") {
 				if (label === "Approve") {
 					transitionPhase(ctx, goal, "decompose", "Gate 1 APPROVED — HLD locked");
 					blocks.push(`(GATE 1 APPROVED — now in decompose. ${phaseMissionLine("decompose")})`);
-					return { content: [{ type: "text" as const, text: blocks.join("\n") }], details: { answers: result.answers, advanced: true, phase: "decompose" } };
+					return ok(blocks.join("\n"), { answers: result.answers, advanced: true, phase: "decompose" });
 				}
 				// Only "Reject" remains — the form has no other option (Esc/decline
 				// above is the sole postpone path).
@@ -639,7 +670,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 				blocks.push(
 					`(GATE 1 REJECTED — back in discovery. ${note ? `Owner's note: ${note}. ` : ""}Re-converge on the HLD with the owner, update it, and journal what changed before the next plan_save.)`,
 				);
-				return { content: [{ type: "text" as const, text: blocks.join("\n") }], details: { answers: result.answers, phase: "discovery" } };
+				return ok(blocks.join("\n"), { answers: result.answers, phase: "discovery" });
 			}
 
 			// review_final
@@ -651,22 +682,14 @@ export default function planGuard(pi: ExtensionAPI): void {
 					try {
 						execFileSync("git", ["restore", "--staged", "--", ...staged.map((e) => e.path)], { cwd: ctx.cwd, stdio: ["ignore", "pipe", "pipe"] });
 					} catch (err) {
-						return {
-							content: [{ type: "text" as const, text: `git restore --staged failed: ${err instanceof Error ? err.message : String(err)} — nothing else changed; staying in review_final.` }],
-							details: { answers: result.answers, phase: "review_final" },
-							isError: true,
-						};
+						return refuse(`git restore --staged failed: ${err instanceof Error ? err.message : String(err)} — nothing else changed; staying in review_final.`, { answers: result.answers, phase: "review_final" });
 					}
 					const remaining = gitStagedFiles(ctx.cwd);
 					if (remaining.length > 0) {
-						return {
-							content: [{
-								type: "text" as const,
-								text: `${remaining.length} staged entr${remaining.length === 1 ? "y" : "ies"} still remain after unstage (${remaining.map((e) => e.path).join(", ")}) — staying in review_final, guard NOT released.`,
-							}],
-							details: { answers: result.answers, phase: "review_final" },
-							isError: true,
-						};
+						return refuse(
+							`${remaining.length} staged entr${remaining.length === 1 ? "y" : "ies"} still remain after unstage (${remaining.map((e) => e.path).join(", ")}) — staying in review_final, guard NOT released.`,
+							{ answers: result.answers, phase: "review_final" },
+						);
 					}
 					appendJournal(ctx.cwd, goal, `Gate 2: unstaged ${staged.length} pre-existing staged entries at owner's request: ${staged.map((e) => e.path).join(", ")}`);
 				} else if (label === "Start anyway") {
@@ -677,20 +700,20 @@ export default function planGuard(pi: ExtensionAPI): void {
 				set(ctx, false, "Plan approved — plan mode OFF, full access restored.", "info");
 				queueImplementationBriefing(pi, ctx, goal);
 				blocks.push("(GATE 2 AUTHORIZED — plan mode released. Wind down this turn; the implementation briefing arrives on the next turn.)");
-				return { content: [{ type: "text" as const, text: blocks.join("\n") }], details: { answers: result.answers, released: true, phase: "execute" } };
+				return ok(blocks.join("\n"), { answers: result.answers, released: true, phase: "execute" });
 			}
 			// Only "Stay in planning" remains — the form has no other option
 			// (Esc/decline above is the sole postpone path).
 			appendJournal(ctx.cwd, goal, "Gate 2: owner stays in planning");
 			blocks.push("(Gate 2 not authorized — staying in review_final.)");
-			return { content: [{ type: "text" as const, text: blocks.join("\n") }], details: { answers: result.answers, phase: "review_final" } };
+			return ok(blocks.join("\n"), { answers: result.answers, phase: "review_final" });
 		} finally {
 			gateFormOpen = false;
 		}
 	}
 
 	pi.registerMessageRenderer(MESSAGE_TYPE, (message, { outputPad }, theme) => {
-		const details = message.details as { goal?: string; source?: string } | undefined;
+		const details = message.details as { goal?: string } | undefined;
 		const goal = details?.goal?.trim();
 		const title = theme.fg("customMessageLabel", "◈ PLAN") + theme.fg("customMessageText", goal ? ` — ${goal}` : " — goal not yet set");
 		const sub = theme.fg("muted", "read-only ") + buildHeatBar(null);
@@ -709,17 +732,13 @@ export default function planGuard(pi: ExtensionAPI): void {
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			if (!enabled) {
-				return { content: [{ type: "text", text: "Plan mode is not active." }], details: { enabled } };
+				return ok("Plan mode is not active.", { enabled });
 			}
 			if (!ctx.hasUI) {
-				return {
-					content: [{ type: "text", text: "Cannot exit plan mode: no interactive UI is available for user confirmation, so plan mode stays active." }],
-					details: { enabled },
-					isError: true,
-				};
+				return refuse("Cannot exit plan mode: no interactive UI is available for user confirmation, so plan mode stays active.", { enabled });
 			}
 			const approved = approvedGoals(ctx.cwd);
-			const summaries = goalSummaries(ctx.cwd, enabled);
+			const summaries = goalSummaries(ctx.cwd);
 			const context = summaries.length > 0
 				? `\n\nActive plans:\n${summaries.map((line) => `• ${line}`).join("\n")}`
 				: "\n\nWARNING: no plan has been saved yet (nothing written via plan_save).";
@@ -741,35 +760,15 @@ export default function planGuard(pi: ExtensionAPI): void {
 						`(APPROVED by owner — plan mode released via plan_exit. The owner's confirmation IS the authorization: start implementing the approved plan(s) [${approved.join(", ")}] NOW. Do not ask again.)\n\n` +
 						phaseMissionLine("execute") +
 						(staged.length > 0 ? `\n\n⚠ ${staged.length} pre-existing staged file(s) present — pi-subagents will reject every worker until they are committed or unstaged.` : "");
-					sendPlan(pi, ctx, briefing, approved.join(", "), "command");
-					return {
-						content: [{ type: "text", text: "Plan mode exited — wind down this turn; the implementation briefing for the approved plan(s) arrives next turn." }],
-						details: { enabled, approved },
-					};
+					sendPlan(pi, ctx, briefing, approved.join(", "));
+					return ok("Plan mode exited — wind down this turn; the implementation briefing for the approved plan(s) arrives next turn.", { enabled, approved });
 				}
-				return { content: [{ type: "text", text: "Plan mode exited." }], details: { enabled } };
+				return ok("Plan mode exited.", { enabled });
 			}
-			return {
-				content: [{ type: "text", text: "The user declined to exit plan mode. Keep planning; file edits stay disabled until plan_exit." }],
-				details: { enabled },
-			};
+			return ok("The user declined to exit plan mode. Keep planning; file edits stay disabled until plan_exit.", { enabled });
 		},
 
-		renderCall(_args, theme, _context) {
-			return new Text(toolCallLabel(theme, "exiting plan mode"), 0, 0);
-		},
-
-		renderResult(result, { isPartial }, theme, context) {
-			if (isPartial) return new Text(theme.fg("warning", "confirming…"), 0, 0);
-			const text = firstLine(resultText(result));
-			if (context.isError) return new Text(theme.fg("error", text), 0, 0);
-			const details = result.details as { enabled?: boolean; approved?: string[] } | undefined;
-			if (details?.enabled === false) {
-				const approved = details.approved?.length ? theme.fg("muted", ` — implementing ${details.approved.join(", ")}`) : "";
-				return new Text(theme.fg("success", "plan mode exited ✓") + approved, 0, 0);
-			}
-			return new Text(theme.fg("muted", text), 0, 0);
-		},
+		...toolRenderers.plan_exit,
 	});
 
 	pi.registerTool({
@@ -836,58 +835,28 @@ export default function planGuard(pi: ExtensionAPI): void {
 			const gateRequested = params.phaseGate === true || params.releasePlanGuardOnAnswer === true;
 			if (!ctx.hasUI) {
 				if (gateRequested) {
-					return {
-						content: [{ type: "text", text: "Gate blocked: no interactive UI is available — the owner gate needs the interactive TUI." }],
-						details: { ui: false },
-						isError: true,
-					};
+					return refuse("Gate blocked: no interactive UI is available — the owner gate needs the interactive TUI.", { ui: false });
 				}
-				return { content: [{ type: "text", text: "No interactive UI; ask in prose." }], details: { ui: false } };
+				return ok("No interactive UI; ask in prose.", { ui: false });
 			}
 
 			if (gateRequested && !isSubagentChild) {
-				const current = currentPhase(ctx.cwd, true);
+				const current = currentPhase(ctx.cwd);
 				if (params.releasePlanGuardOnAnswer === true && params.phaseGate !== true) {
 					if (!current || current.phase !== "review_final") {
-						return {
-							content: [{ type: "text", text: "the guard is released only by the review_final gate (use phaseGate: true)." }],
-							details: {},
-							isError: true,
-						};
+						return refuse("the guard is released only by the review_final gate (use phaseGate: true).");
 					}
 				}
 				if (!current) {
-					return {
-						content: [{ type: "text", text: "Gate blocked: no active goal yet — establish the goal before requesting a phase gate." }],
-						details: {},
-						isError: true,
-					};
+					return refuse("Gate blocked: no active goal yet — establish the goal before requesting a phase gate.");
 				}
 				if (current.phase !== "review_hld" && current.phase !== "review_final") {
-					return {
-						content: [{
-							type: "text",
-							text: `Gate blocked: "${current.phase}" has no owner gate — call plan_advance to self-advance instead.`,
-						}],
-						details: { phase: current.phase },
-						isError: true,
-					};
+					return refuse(`Gate blocked: "${current.phase}" has no owner gate — call plan_advance to self-advance instead.`, { phase: current.phase });
 				}
 				// Deliverable must be complete before the gate form opens; the form
 				// must never open unannounced.
-				const snapshot = buildPhaseSnapshot(ctx, current);
-				const verdict = phaseDeliverableReady(current.phase, snapshot);
-				if (!verdict.ready) {
-					const hint = nextActionHint(current.phase, snapshot);
-					return {
-						content: [{
-							type: "text",
-							text: `Gate "${current.phase}" blocked — the deliverable is not complete. Missing: ${verdict.missing.join("; ")}. ${hint}`,
-						}],
-						details: { gateBlocked: true, phase: current.phase, missing: verdict.missing },
-						isError: true,
-					};
-				}
+				const blocked = deliverableBlocked(ctx, current, `Gate "${current.phase}" blocked — the deliverable is not complete`, { gateBlocked: true, phase: current.phase });
+				if (blocked) return blocked;
 				// The model's own detail (if any) is demoted to extra briefing
 				// appended after the contract summary inside runReviewGate; its
 				// options are never consulted — the labels are fixed.
@@ -902,40 +871,20 @@ export default function planGuard(pi: ExtensionAPI): void {
 			// answers plus the unanswered questions are reported — nothing is ever
 			// invented.
 			const collected = await runAskFormPages(ctx, params.questions);
-			const blocks = Object.entries(collected.answers).map(([q, a]) => `Q: ${q}\nA: ${Array.isArray(a) ? a.join(", ") : a}`);
+			const blocks = collectedBlocks(collected);
 			if (collected.declined) {
-				if (collected.unanswered.length > 0) {
-					blocks.push(`UNANSWERED — the owner cancelled before answering these questions (do NOT assume them): ${collected.unanswered.map((q) => q.question).join(" | ")}`);
-				}
+				// runAskFormPages guarantees unanswered is nonempty on decline (the
+				// question list is never empty, and a decline can only happen mid-
+				// paging, before the last page is reached) — no separate emptiness
+				// check needed here.
+				blocks.push(`UNANSWERED — the owner cancelled before answering these questions (do NOT assume them): ${collected.unanswered.map((q) => q.question).join(" | ")}`);
 				blocks.push("ANSWER RULE: unanswered questions must be re-asked, never assumed.");
-				return { content: [{ type: "text", text: blocks.join("\n") }], details: { answers: collected.answers, declined: true, unanswered: collected.unanswered.map((q) => q.question) } };
+				return ok(blocks.join("\n"), { answers: collected.answers, declined: true, unanswered: collected.unanswered.map((q) => q.question) });
 			}
-			return { content: [{ type: "text", text: blocks.join("\n") }], details: { answers: collected.answers, declined: false, unanswered: [] } };
+			return ok(blocks.join("\n"), { answers: collected.answers, declined: false, unanswered: [] });
 		},
 
-		renderCall(args, theme, _context) {
-			const gate = args.phaseGate === true || args.releasePlanGuardOnAnswer === true;
-			const n = args.questions.length;
-			const label = gate ? "opening the owner gate" : `asking the owner (${n} question${n === 1 ? "" : "s"})`;
-			return new Text(toolCallLabel(theme, label), 0, 0);
-		},
-
-		renderResult(result, { isPartial }, theme, context) {
-			if (isPartial) return new Text(theme.fg("warning", "asking…"), 0, 0);
-			const text = firstLine(resultText(result));
-			if (context.isError) return new Text(theme.fg("error", text), 0, 0);
-			const details = result.details as
-				| { answers?: Record<string, unknown>; declined?: boolean; unanswered?: string[]; advanced?: boolean; released?: boolean; phase?: string }
-				| undefined;
-			if (details?.released) return new Text(theme.fg("success", `authorized ✓ → ${details.phase}`), 0, 0);
-			if (details?.advanced) return new Text(theme.fg("success", `approved ✓ → ${details.phase}`), 0, 0);
-			if (details?.declined) {
-				const unanswered = details.unanswered?.length ? ` (${details.unanswered.length} unanswered)` : "";
-				return new Text(theme.fg("warning", `postponed${unanswered}`), 0, 0);
-			}
-			const count = details?.answers ? Object.keys(details.answers).length : 0;
-			return new Text(theme.fg("success", `answered ✓ (${count})`), 0, 0);
-		},
+		...toolRenderers.ask_smart_plan,
 	});
 
 	pi.registerTool({
@@ -949,77 +898,41 @@ export default function planGuard(pi: ExtensionAPI): void {
 		],
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			const current = currentPhase(ctx.cwd, true);
+			const current = currentPhase(ctx.cwd);
 			if (!current) {
-				return {
-					content: [{ type: "text", text: "plan_advance blocked — no active goal yet; establish the goal before requesting a phase advance." }],
-					details: {},
-					isError: true,
-				};
+				return refuse("plan_advance blocked — no active goal yet; establish the goal before requesting a phase advance.");
 			}
 			// Already IN a review phase: plan_advance RE-OPENS the owner gate — the
 			// harness composes the panel + form itself in this same call; there is
 			// no separate presentation step or tool.
 			if (current.phase === "review_hld" || current.phase === "review_final") {
-				const snapshot = buildPhaseSnapshot(ctx, current);
-				const verdict = phaseDeliverableReady(current.phase, snapshot);
-				if (!verdict.ready) {
-					const hint = nextActionHint(current.phase, snapshot);
-					return {
-						content: [{
-							type: "text",
-							text: `plan_advance blocked — "${current.phase}" deliverable incomplete. Missing: ${verdict.missing.join("; ")}. ${hint}`,
-						}],
-						details: { missing: verdict.missing, phase: current.phase },
-						isError: true,
-					};
-				}
+				const blocked = deliverableBlocked(ctx, current, `plan_advance blocked — "${current.phase}" deliverable incomplete`, { phase: current.phase });
+				if (blocked) return blocked;
 				// F4: the owner gate needs the interactive TUI — refuse before opening
 				// it rather than letting runReviewGate fabricate an owner "postpone"
 				// for a headless caller.
 				if (!ctx.hasUI) {
-					return {
-						content: [{ type: "text", text: `plan_advance blocked — the owner gate for "${current.phase}" needs the interactive TUI; no interactive UI is available.` }],
-						details: { phase: current.phase },
-						isError: true,
-					};
+					return refuse(`plan_advance blocked — the owner gate for "${current.phase}" needs the interactive TUI; no interactive UI is available.`, { phase: current.phase });
 				}
 				return await runReviewGate(ctx, current.goal, current.phase);
 			}
 			const target = PHASE_NEXT[current.phase];
 			if (!target) {
-				return {
-					content: [{ type: "text", text: `plan_advance blocked — "${current.phase}" has no further advance.` }],
-					details: { phase: current.phase },
-					isError: true,
-				};
+				return refuse(`plan_advance blocked — "${current.phase}" has no further advance.`, { phase: current.phase });
 			}
-			const snapshot = buildPhaseSnapshot(ctx, current);
-			const verdict = phaseDeliverableReady(current.phase, snapshot);
-			if (!verdict.ready) {
-				const hint = nextActionHint(current.phase, snapshot);
-				return {
-					content: [{
-						type: "text",
-						text: `plan_advance blocked — "${current.phase}" deliverable incomplete. Missing: ${verdict.missing.join("; ")}. ${hint}`,
-					}],
-					details: { missing: verdict.missing, phase: current.phase, target },
-					isError: true,
-				};
-			}
+			const blocked = deliverableBlocked(ctx, current, `plan_advance blocked — "${current.phase}" deliverable incomplete`, { phase: current.phase, target });
+			if (blocked) return blocked;
 			// Target is a review phase: the owner gate needs the interactive TUI —
 			// refuse BEFORE transitioning so a goal is never stranded in an
 			// ungateable phase.
 			if (target === "review_hld" || target === "review_final") {
 				if (!ctx.hasUI) {
-					return {
-						content: [{ type: "text", text: `plan_advance blocked — the owner gate for "${target}" needs the interactive TUI; no interactive UI is available.` }],
-						details: { phase: current.phase, target },
-						isError: true,
-					};
+					return refuse(`plan_advance blocked — the owner gate for "${target}" needs the interactive TUI; no interactive UI is available.`, { phase: current.phase, target });
 				}
 				transitionPhase(ctx, current.goal, target, `phase advanced: ${current.phase} → ${target}`);
 				const gateResult = await runReviewGate(ctx, current.goal, target);
+				// Pass-through: forwards runReviewGate's own content/details/isError
+				// rather than a fresh literal — doesn't fit the ok()/refuse() shape.
 				return {
 					content: [{ type: "text", text: `(PHASE ADVANCED — now in ${target}. ${phaseMissionLine(target)})\n\n${gateResult.content[0]?.text ?? ""}` }],
 					details: { advanced: true, ...gateResult.details },
@@ -1027,33 +940,10 @@ export default function planGuard(pi: ExtensionAPI): void {
 				};
 			}
 			transitionPhase(ctx, current.goal, target, `phase advanced: ${current.phase} → ${target}`);
-			return {
-				content: [{ type: "text", text: `(PHASE ADVANCED — now in ${target}. ${phaseMissionLine(target)})` }],
-				details: { advanced: true, phase: target },
-			};
+			return ok(`(PHASE ADVANCED — now in ${target}. ${phaseMissionLine(target)})`, { advanced: true, phase: target });
 		},
 
-		renderCall(_args, theme, _context) {
-			return new Text(toolCallLabel(theme, "advancing…"), 0, 0);
-		},
-
-		renderResult(result, { isPartial }, theme, context) {
-			if (isPartial) return new Text(theme.fg("warning", "advancing…"), 0, 0);
-			const text = firstLine(resultText(result));
-			if (context.isError) return new Text(theme.fg("error", text), 0, 0);
-			const details = result.details as { phase?: Phase; declined?: boolean; released?: boolean } | undefined;
-			if (details?.phase) {
-				// Budget leaves room for the "→ <phase> — " prefix and an optional
-				// " (postponed)"/" (guard released)" suffix so the collapsed line
-				// stays on one row at a typical 72-column width.
-				const mission = truncateToWidth(stripLocalMission(phaseMissionLine(details.phase)), 46);
-				let line = theme.fg("success", "→ ") + theme.fg("accent", theme.bold(details.phase)) + theme.fg("muted", ` — ${mission}`);
-				if (details.declined) line += theme.fg("warning", " (postponed)");
-				else if (details.released) line += theme.fg("muted", " (guard released)");
-				return new Text(line, 0, 0);
-			}
-			return new Text(theme.fg("success", text), 0, 0);
-		},
+		...toolRenderers.plan_advance,
 	});
 
 	pi.registerTool({
@@ -1070,21 +960,13 @@ export default function planGuard(pi: ExtensionAPI): void {
 			try {
 				savePlan(ctx.cwd, params.goal, params.content);
 				refreshWidget(ctx);
-				return { content: [{ type: "text", text: `Plan saved for ${params.goal}.` }], details: { goal: params.goal } };
+				return ok(`Plan saved for ${params.goal}.`, { goal: params.goal });
 			} catch (error) {
-				return { content: [{ type: "text", text: safeError("plan_save", error) }], details: {}, isError: true };
+				return refuse(safeError("plan_save", error));
 			}
 		},
 
-		renderCall(args, theme, _context) {
-			return new Text(`${toolCallLabel(theme, "saving plan")} ${theme.fg("accent", args.goal)}`, 0, 0);
-		},
-
-		renderResult(result, { isPartial }, theme, context) {
-			if (isPartial) return new Text(theme.fg("warning", "saving…"), 0, 0);
-			if (context.isError) return new Text(theme.fg("error", firstLine(resultText(result))), 0, 0);
-			return new Text(theme.fg("success", "plan saved ✓") + theme.fg("muted", " (waves rebuilt)"), 0, 0);
-		},
+		...toolRenderers.plan_save,
 	});
 
 	pi.registerTool({
@@ -1118,35 +1000,23 @@ export default function planGuard(pi: ExtensionAPI): void {
 			// the next activation's sweepStaleGoal, reading as a fabricated "stale
 			// plan discarded" to the owner.
 			if (!enabled || isSubagentChild) {
-				return {
-					content: [{ type: "text", text: "plan mode is off — activate it first (shift+tab or /plan)" }],
-					details: {},
-					isError: true,
-				};
+				return refuse("plan mode is off — activate it first (shift+tab or /plan)");
 			}
 			// F7: a capability refusal must be isError:true, never fall through to
 			// runAskForm's own `{ declined: true }` — that path is indistinguishable
 			// from a genuine owner cancel and would fabricate "the owner postponed"
 			// for a caller that can never actually show the form.
 			if (!ctx.hasUI || typeof ctx.ui.custom !== "function") {
-				return {
-					content: [{ type: "text", text: "the objective confirmation form needs the interactive TUI" }],
-					details: {},
-					isError: true,
-				};
+				return refuse("the objective confirmation form needs the interactive TUI");
 			}
 			try {
 				validateGoalSlug(params.goal);
 			} catch (error) {
-				return { content: [{ type: "text", text: safeError("plan_intent", error) }], details: {}, isError: true };
+				return refuse(safeError("plan_intent", error));
 			}
 			const sanitizedPreview = params.statement.replace(/\s+/g, " ").trim();
 			if (!sanitizedPreview) {
-				return {
-					content: [{ type: "text", text: "plan_intent needs a non-empty objective statement" }],
-					details: {},
-					isError: true,
-				};
+				return refuse("plan_intent needs a non-empty objective statement");
 			}
 			// openQuestions branch: a pre-confirmation safety net, NOT a variant of
 			// Confirm — the statement may still be provisional while questions are
@@ -1162,41 +1032,18 @@ export default function planGuard(pi: ExtensionAPI): void {
 			// any form opens — confirmIntent's own check (below, on Confirm) stays as
 			// a belt for callers that somehow bypass this one.
 			if (!hasOpenQuestions && sanitizedPreview.length > OBJECTIVE_MAX_LEN) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "objective too long — distill it: WHAT the owner wants and the essential constraints, not HOW (implementation choices belong to the HLD)",
-						},
-					],
-					details: {},
-					isError: true,
-				};
+				return refuse("objective too long — distill it: WHAT the owner wants and the essential constraints, not HOW (implementation choices belong to the HLD)");
 			}
-			const current = currentPhase(ctx.cwd, true);
-			if (current && current.goal !== params.goal && isPlanningPhase(current.phase)) {
-				return {
-					content: [{ type: "text", text: `one active goal per session — complete or abandon "${current.goal}" first` }],
-					details: {},
-					isError: true,
-				};
-			}
-			// F2: guard the TARGET goal directly (readMachinePhase/goalIsDone),
-			// not the session pointer — an unpointed goal past discovery, or one
-			// already archived in done/, must refuse just as reliably as a pointed
-			// one (previously only `current.phase` was consulted, so Confirm on an
-			// unpointed done goal resurrected it via ensureActiveGoalDir with no
-			// gate at all).
-			const violation = intentGuardViolation(ctx.cwd, params.goal);
-			if (violation) {
-				return { content: [{ type: "text", text: violation }], details: {}, isError: true };
-			}
+			// F2: guard the TARGET goal directly (readMachinePhase/goalIsDone,
+			// via intentGuardViolation), not just the session pointer — an
+			// unpointed goal past discovery, or one already archived in done/,
+			// must refuse just as reliably as a pointed one (previously only
+			// `current.phase` was consulted, so Confirm on an unpointed done goal
+			// resurrected it via ensureActiveGoalDir with no gate at all).
+			const refusal = intentRefusal(ctx.cwd, params.goal);
+			if (refusal) return refusal;
 			if (gateFormOpen) {
-				return {
-					content: [{ type: "text", text: "a gate form is already open — wait for the owner's answer" }],
-					details: {},
-					isError: true,
-				};
+				return refuse("a gate form is already open — wait for the owner's answer");
 			}
 			gateFormOpen = true;
 			try {
@@ -1209,22 +1056,18 @@ export default function planGuard(pi: ExtensionAPI): void {
 				// plan_intent with openQuestions empty (or omitted) to confirm.
 				if (hasOpenQuestions) {
 					const collected = await runAskFormPages(ctx, openQuestions);
-					const blocks = Object.entries(collected.answers).map(([q, a]) => `Q: ${q}\nA: ${Array.isArray(a) ? a.join(", ") : a}`);
+					const blocks = collectedBlocks(collected);
 					if (collected.declined && collected.unanswered.length > 0) {
 						blocks.push(`UNANSWERED — the owner cancelled before answering these questions (do NOT assume them): ${collected.unanswered.map((q) => q.question).join(" | ")}`);
 						blocks.push("ANSWER RULE: unanswered questions must be re-asked, never assumed.");
 					}
 					blocks.push("Resolve these answers with the owner, then call plan_intent again with openQuestions empty (or omitted) to confirm.");
-					return {
-						content: [{ type: "text", text: blocks.join("\n") }],
-						details: {
-							goal: params.goal,
-							answers: collected.answers,
-							declined: collected.declined,
-							unanswered: collected.unanswered.map((q) => q.question),
-						},
-						isError: false,
-					};
+					return ok(blocks.join("\n"), {
+						goal: params.goal,
+						answers: collected.answers,
+						declined: collected.declined,
+						unanswered: collected.unanswered.map((q) => q.question),
+					});
 				}
 				// The proposal in the transcript — this durable card is the single
 				// source for the statement text; the form's side panel does not
@@ -1239,76 +1082,39 @@ export default function planGuard(pi: ExtensionAPI): void {
 				// the explicit-rejection path's exact equivalent (same result text).
 				const result = await runAskForm(ctx, [question], { includeNoneOption: false });
 				if ("declined" in result) {
-					return {
-						content: [{ type: "text", text: INTENT_KEEP_CHATTING_TEXT }],
-						details: { goal: params.goal, declined: true },
-						isError: false,
-					};
+					return ok(INTENT_KEEP_CHATTING_TEXT, { goal: params.goal, declined: true });
 				}
 				const answer = result.answers[question.question];
-				const label = typeof answer === "string" ? answer : Array.isArray(answer) ? answer[0] : undefined;
+				const label = pickLabel(answer);
 				if (label === "Confirm") {
 					// F6 (TOCTOU): the guards above ran before the form await — a
 					// parallel tool call could have switched/repointed the session
 					// goal or advanced/completed THIS goal while the owner was
 					// answering. Re-run both checks now, right before the write; any
 					// violation refuses with no write, never a stale-checked confirm.
-					const currentNow = currentPhase(ctx.cwd, true);
-					if (currentNow && currentNow.goal !== params.goal && isPlanningPhase(currentNow.phase)) {
-						return {
-							content: [{ type: "text", text: `one active goal per session — complete or abandon "${currentNow.goal}" first` }],
-							details: {},
-							isError: true,
-						};
-					}
-					const violationNow = intentGuardViolation(ctx.cwd, params.goal);
-					if (violationNow) {
-						return { content: [{ type: "text", text: violationNow }], details: {}, isError: true };
-					}
+					const refusalNow = intentRefusal(ctx.cwd, params.goal);
+					if (refusalNow) return refusalNow;
 					try {
 						confirmIntent(ctx.cwd, params.goal, params.statement);
 					} catch (error) {
-						return { content: [{ type: "text", text: safeError("plan_intent", error) }], details: {}, isError: true };
+						return refuse(safeError("plan_intent", error));
 					}
 					// Anti-leak: the pre-intent investigation flag must not survive
 					// into a later goal confirmed in the same session.
 					investigationDone = false;
 					refreshWidget(ctx);
-					return {
-						content: [{ type: "text", text: "objective confirmed — proceed: optional grilling round, then HLD co-design and plan_save" }],
-						details: { goal: params.goal, confirmed: true },
-						isError: false,
-					};
+					return ok("objective confirmed — proceed: optional grilling round, then HLD co-design and plan_save", { goal: params.goal, confirmed: true });
 				}
 				// Only "Keep chatting" remains — the form has no other option (Esc/
 				// decline above is this same explicit-rejection path's equivalent).
 				// Corrections happen in the conversation itself — no note dialog.
-				return {
-					content: [{ type: "text", text: INTENT_KEEP_CHATTING_TEXT }],
-					details: { goal: params.goal, keepChatting: true },
-					isError: false,
-				};
+				return ok(INTENT_KEEP_CHATTING_TEXT, { goal: params.goal, keepChatting: true });
 			} finally {
 				gateFormOpen = false;
 			}
 		},
 
-		renderCall(args, theme, _context) {
-			const n = args.openQuestions?.length ?? 0;
-			const label = n > 0 ? `asking ${n} open question${n === 1 ? "" : "s"}` : "proposing objective";
-			return new Text(`${toolCallLabel(theme, label)} ${theme.fg("accent", args.goal)}`, 0, 0);
-		},
-
-		renderResult(result, { isPartial }, theme, context) {
-			if (isPartial) return new Text(theme.fg("warning", "confirming…"), 0, 0);
-			const text = firstLine(resultText(result));
-			if (context.isError) return new Text(theme.fg("error", text), 0, 0);
-			const details = result.details as { confirmed?: boolean; declined?: boolean; keepChatting?: boolean; unanswered?: string[] } | undefined;
-			if (details?.confirmed) return new Text(theme.fg("success", "objective confirmed ✓"), 0, 0);
-			if (details?.declined || details?.keepChatting) return new Text(theme.fg("warning", "keep chatting — objective rejected"), 0, 0);
-			if (details?.unanswered) return new Text(theme.fg("muted", `open questions asked (${details.unanswered.length} unanswered)`), 0, 0);
-			return new Text(theme.fg("muted", text), 0, 0);
-		},
+		...toolRenderers.plan_intent,
 	});
 
 	pi.registerTool({
@@ -1324,22 +1130,13 @@ export default function planGuard(pi: ExtensionAPI): void {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			try {
 				appendJournal(ctx.cwd, params.goal, params.lines);
-				return { content: [{ type: "text", text: `Journal updated for ${params.goal}.` }], details: { goal: params.goal } };
+				return ok(`Journal updated for ${params.goal}.`, { goal: params.goal });
 			} catch (error) {
-				return { content: [{ type: "text", text: safeError("journal_append", error) }], details: {}, isError: true };
+				return refuse(safeError("journal_append", error));
 			}
 		},
 
-		renderCall(args, theme, _context) {
-			const preview = truncateToWidth(firstLine(args.lines), 60);
-			return new Text(`${toolCallLabel(theme, "noting")} ${theme.fg("accent", `"${preview}"`)}`, 0, 0);
-		},
-
-		renderResult(result, { isPartial }, theme, context) {
-			if (isPartial) return new Text(theme.fg("warning", "noting…"), 0, 0);
-			if (context.isError) return new Text(theme.fg("error", firstLine(resultText(result))), 0, 0);
-			return new Text(theme.fg("success", "noted ✓"), 0, 0);
-		},
+		...toolRenderers.journal_append,
 	});
 
 	pi.registerTool({
@@ -1354,33 +1151,13 @@ export default function planGuard(pi: ExtensionAPI): void {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			try {
 				const text = recall(ctx.cwd, params.query);
-				return { content: [{ type: "text", text }], details: {} };
+				return ok(text);
 			} catch (error) {
-				return { content: [{ type: "text", text: safeError("plan_recall", error) }], details: {}, isError: true };
+				return refuse(safeError("plan_recall", error));
 			}
 		},
 
-		renderCall(args, theme, _context) {
-			let text = toolCallLabel(theme, "recalling plans");
-			if (args.query) text += ` ${theme.fg("accent", args.query)}`;
-			return new Text(text, 0, 0);
-		},
-
-		renderResult(result, { expanded, isPartial }, theme, context) {
-			if (isPartial) return new Text(theme.fg("warning", "recalling…"), 0, 0);
-			const text = resultText(result);
-			if (context.isError) return new Text(theme.fg("error", firstLine(text)), 0, 0);
-			const lines = text.split("\n").filter((l) => l.trim().length > 0);
-			if (lines.length === 0) return new Text(theme.fg("muted", "no matching plans"), 0, 0);
-			const shown = expanded ? lines.slice(0, 30) : lines.slice(0, 3);
-			let out = shown.map((l) => theme.fg("text", truncateToWidth(l, 100))).join("\n");
-			const hidden = lines.length - shown.length;
-			if (hidden > 0) {
-				const more = expanded ? `... ${hidden} more lines` : `... ${hidden} more (${keyHint("app.tools.expand", "to expand")})`;
-				out += `\n${theme.fg("dim", more)}`;
-			}
-			return new Text(out, 0, 0);
-		},
+		...toolRenderers.plan_recall,
 	});
 
 	pi.registerTool({
@@ -1395,25 +1172,13 @@ export default function planGuard(pi: ExtensionAPI): void {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			try {
 				const text = nextTasks(ctx.cwd, params.goal);
-				return { content: [{ type: "text", text }], details: { goal: params.goal } };
+				return ok(text, { goal: params.goal });
 			} catch (error) {
-				return { content: [{ type: "text", text: safeError("plan_next", error) }], details: {}, isError: true };
+				return refuse(safeError("plan_next", error));
 			}
 		},
 
-		renderCall(args, theme, _context) {
-			return new Text(`${toolCallLabel(theme, "what's ready?")} ${theme.fg("accent", args.goal)}`, 0, 0);
-		},
-
-		renderResult(result, { isPartial }, theme, context) {
-			if (isPartial) return new Text(theme.fg("warning", "checking…"), 0, 0);
-			const text = resultText(result);
-			if (context.isError) return new Text(theme.fg("error", firstLine(text)), 0, 0);
-			const ids = [...text.matchAll(/^- (\S+):/gm)].map((m) => m[1]);
-			if (ids.length > 0) return new Text(theme.fg("accent", `ready: ${ids.join(" ")}`), 0, 0);
-			if (text.includes("no Tasks section")) return new Text(theme.fg("muted", "no tasks yet"), 0, 0);
-			return new Text(theme.fg("success", "all done ✓"), 0, 0);
-		},
+		...toolRenderers.plan_next,
 	});
 
 	pi.registerTool({
@@ -1438,26 +1203,17 @@ export default function planGuard(pi: ExtensionAPI): void {
 				// already off by the time real task work happens (Gate 2 released
 				// it), so this is the one place execute's own progress can still
 				// reach the working line — refreshed on every task-status call.
-				if (currentPhase(ctx.cwd, true)?.phase === "execute") {
+				if (currentPhase(ctx.cwd)?.phase === "execute") {
 					const view = getPlanView(ctx.cwd, params.goal);
 					if (view) ctx.ui.setWorkingMessage(`◈ plan · execute — implementing (${view.doneCount}/${view.total} done)`);
 				}
-				return { content: [{ type: "text", text }], details: { goal: params.goal, taskId: params.taskId, status: params.status } };
+				return ok(text, { goal: params.goal, taskId: params.taskId, status: params.status });
 			} catch (error) {
-				return { content: [{ type: "text", text: safeError("plan_task_update", error) }], details: {}, isError: true };
+				return refuse(safeError("plan_task_update", error));
 			}
 		},
 
-		renderCall(args, theme, _context) {
-			const verb = TASK_STATUS_VERB[args.status] ?? args.status;
-			return new Text(`${toolCallLabel(theme, `${args.taskId} →`)} ${theme.fg("accent", verb)}`, 0, 0);
-		},
-
-		renderResult(result, { isPartial }, theme, context) {
-			if (isPartial) return new Text(theme.fg("warning", "updating…"), 0, 0);
-			const text = firstLine(resultText(result));
-			return new Text(theme.fg(context.isError ? "error" : "success", text), 0, 0);
-		},
+		...toolRenderers.plan_task_update,
 	});
 
 	pi.registerTool({
@@ -1474,7 +1230,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 			try {
 				const commands = getDoD(ctx.cwd, params.goal);
 				if (commands.length === 0) {
-					return { content: [{ type: "text", text: `No DoD commands in the plan for "${params.goal}".` }], details: { passed: false } };
+					return ok(`No DoD commands in the plan for "${params.goal}".`, { passed: false });
 				}
 				const timeout = params.timeoutMs ?? 120_000;
 				const results = commands.map((command) => {
@@ -1490,39 +1246,14 @@ export default function planGuard(pi: ExtensionAPI): void {
 				const body = results.map((r) => `${r.ok ? "PASS" : "FAIL"} (${r.ms}ms) ${r.command}`).join("\n");
 				const headline = failed === 0 ? `DoD: ${results.length}/${results.length} PASS.` : `DoD FAILED: ${failed}/${results.length} failed.`;
 				if (failed === 0) sessionState.dodPassed = true;
-				return { content: [{ type: "text", text: `${headline}\n${body}` }], details: { passed: failed === 0 }, isError: failed > 0 };
+				const report = `${headline}\n${body}`;
+				return failed === 0 ? ok(report, { passed: true }) : refuse(report, { passed: false });
 			} catch (error) {
-				return { content: [{ type: "text", text: safeError("plan_verify", error) }], details: {}, isError: true };
+				return refuse(safeError("plan_verify", error));
 			}
 		},
 
-		renderCall(args, theme, _context) {
-			return new Text(`${toolCallLabel(theme, "running DoD checks")} ${theme.fg("accent", args.goal)}`, 0, 0);
-		},
-
-		renderResult(result, { expanded, isPartial }, theme, context) {
-			if (isPartial) return new Text(theme.fg("warning", "running DoD checks…"), 0, 0);
-			const text = resultText(result);
-			const lines = text.split("\n").filter(Boolean);
-			const headline = lines[0] ?? "";
-			// A caught error (safeError text) never starts with "DoD" — the two
-			// real DoD headlines always do ("DoD: N/N PASS." / "DoD FAILED: …").
-			if (context.isError && !headline.startsWith("DoD")) return new Text(theme.fg("error", headline), 0, 0);
-			const rows = lines.slice(1).map((row) => {
-				const m = row.match(/^(PASS|FAIL) \((\d+)ms\) (.*)$/);
-				if (!m) return { failed: false, line: theme.fg("dim", row) };
-				const ok = m[1] === "PASS";
-				const glyph = ok ? theme.fg("success", "✓") : theme.fg("error", "✗");
-				return { failed: !ok, line: `${glyph} ${theme.fg("dim", `(${m[2]}ms)`)} ${theme.fg(ok ? "text" : "error", m[3])}` };
-			});
-			const color = headline.startsWith("DoD FAILED") ? "error" : headline.startsWith("DoD:") ? "success" : "muted";
-			const summary = theme.fg(color, theme.bold(headline));
-			// Collapsed: headline plus only the failing rows (all-pass stays a
-			// single line); expanded: the full per-command breakdown.
-			const shown = expanded ? rows : rows.filter((r) => r.failed);
-			if (shown.length === 0) return new Text(summary, 0, 0);
-			return new Text([summary, ...shown.map((r) => r.line)].join("\n"), 0, 0);
-		},
+		...toolRenderers.plan_verify,
 	});
 
 	// plan_present (tool) is gone: the two review gates are harness-driven —
@@ -1574,26 +1305,13 @@ export default function planGuard(pi: ExtensionAPI): void {
 				// Mandatory reset: plan_complete always restores pi's default
 				// working message — pi never clears a custom one on its own.
 				ctx.ui.setWorkingMessage();
-				return {
-					content: [{ type: "text", text: completed ? `Goal ${params.goal} completed.` : `No active goal ${params.goal}.` }],
-					details: { goal: params.goal, completed },
-				};
+				return ok(completed ? `Goal ${params.goal} completed.` : `No active goal ${params.goal}.`, { goal: params.goal, completed });
 			} catch (error) {
-				return { content: [{ type: "text", text: safeError("plan_complete", error) }], details: {}, isError: true };
+				return refuse(safeError("plan_complete", error));
 			}
 		},
 
-		renderCall(args, theme, _context) {
-			return new Text(`${toolCallLabel(theme, "completing")} ${theme.fg("accent", args.goal)}`, 0, 0);
-		},
-
-		renderResult(result, { isPartial }, theme, context) {
-			if (isPartial) return new Text(theme.fg("warning", "completing…"), 0, 0);
-			const text = firstLine(resultText(result));
-			if (context.isError) return new Text(theme.fg("error", text), 0, 0);
-			const details = result.details as { completed?: boolean } | undefined;
-			return new Text(theme.fg(details?.completed ? "success" : "muted", details?.completed ? "goal completed ✓" : text), 0, 0);
-		},
+		...toolRenderers.plan_complete,
 	});
 
 	pi.registerCommand("plan", {
@@ -1604,7 +1322,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 			if (!enabled) {
 				set(ctx, true, "Plan mode ON — file edits disabled; write the plan via plan_save.", "warning");
 			}
-			sendPlan(pi, ctx, planBootstrapMessage(args), args.trim(), "command");
+			sendPlan(pi, ctx, planBootstrapMessage(args), args.trim());
 		},
 	});
 
@@ -1639,7 +1357,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 	pi.registerCommand("plan-status", {
 		description: "Dump plan-mode state (goals, phases, frontier) — no LLM turn",
 		handler: async (_args, ctx) => {
-			const lines = goalSummaries(ctx.cwd, enabled);
+			const lines = goalSummaries(ctx.cwd);
 			ctx.ui.notify(lines.length > 0 ? lines.join("\n") : "No active goals.", enabled ? "warning" : "info");
 		},
 	});
@@ -1681,7 +1399,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 				block: true,
 				reason: isSubagentChild
 					? `Your parent session is in plan mode — "${event.toolName}" is not available to read-only subagents (exploration only: read, read-only bash, web research, nested subagent spawn). Report findings to the parent; never touch the plan store or planning tools.`
-					: `Plan mode is active — "${event.toolName}" is not available in the current phase (${currentPhase(ctx.cwd, true)?.phase ?? "discovery"}). Repo changes wait until the user exits plan mode.`,
+					: `Plan mode is active — "${event.toolName}" is not available in the current phase (${currentPhase(ctx.cwd)?.phase ?? "discovery"}). Repo changes wait until the user exits plan mode.`,
 			};
 		}
 		// Latch: any other allowed (permitted) tool call is investigation too.
@@ -1703,7 +1421,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 			aside.push("[plan mode: read-only guard active — do NOT write/edit; design only]");
 		}
 		if (!isSubagentChild && (toolName === "ask_smart_plan" || toolName.startsWith("plan_"))) {
-			const current = currentPhase(ctx.cwd, true);
+			const current = currentPhase(ctx.cwd);
 			if (current) {
 				const snapshot = buildPhaseSnapshot(ctx, current);
 				aside.push(nextActionHint(current.phase, snapshot));
@@ -1720,10 +1438,10 @@ export default function planGuard(pi: ExtensionAPI): void {
 	// of each turn directly (typed) — we keep only the latest one, since
 	// agent_settled fires once the run is fully settled (no pending retry/
 	// continuation) and only that final turn matters for the verdict.
-	let lastTurn: { message: TurnEndEvent["message"]; toolResults: TurnEndEvent["toolResults"] } | null = null;
+	let lastTurn: { message: TurnEndEvent["message"] } | null = null;
 	pi.on("turn_end", (event) => {
 		if (isSubagentChild) return;
-		lastTurn = { message: event.message, toolResults: event.toolResults };
+		lastTurn = { message: event.message };
 	});
 	pi.on("agent_settled", async (_event, ctx) => {
 		if (!enabled || isSubagentChild) return;
@@ -1743,7 +1461,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 		// is exactly the field-failure scenario (a model that never enters the
 		// machine at all). Null resolves to phase "discovery", same as every
 		// other null-current call site.
-		const current = currentPhase(ctx.cwd, true);
+		const current = currentPhase(ctx.cwd);
 		const phase = current?.phase ?? "discovery";
 		const assistant = lastTurn.message;
 		if (assistant.role !== "assistant") return;
@@ -1779,9 +1497,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 				? discoveryPreIntentSteer(retryCount)
 				: verdict.key === DISCOVERY_POST_INTENT_KEY
 					? discoveryPostIntentSteer(retryCount)
-					: rule
-						? rule.steer(retryCount, verdict.missing)
-						: verdict.steer;
+					: rule!.steer(retryCount, verdict.missing);
 		if (ctx.isIdle()) {
 			pi.sendUserMessage(steer, {});
 		} else {
@@ -1804,12 +1520,12 @@ export default function planGuard(pi: ExtensionAPI): void {
 	// full phase prompt out of band.
 	pi.on("session_compact", (_event, ctx) => {
 		if (!enabled || isSubagentChild) return;
-		const current = currentPhase(ctx.cwd, true);
+		const current = currentPhase(ctx.cwd);
 		if (!current) return;
 		const snapshot = buildPhaseSnapshot(ctx, current);
 		const hint = nextActionHint(current.phase, snapshot);
 		const recap = `◈ Plan mode recap (post-compaction). Goal: ${current.goal}. Phase: ${current.phase}. ${hint}`;
-		pi.sendMessage({ customType: MESSAGE_TYPE, content: recap, display: true, details: { goal: current.goal, source: "command" } }, { deliverAs: "nextTurn" });
+		pi.sendMessage({ customType: MESSAGE_TYPE, content: recap, display: true, details: { goal: current.goal } }, { deliverAs: "nextTurn" });
 	});
 
 	// Per-turn phase injection: only the current state-machine phase (+ global

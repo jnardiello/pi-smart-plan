@@ -36,56 +36,11 @@ export interface PlanTask {
 export const PHASES = ["discovery", "simplify", "review_hld", "decompose", "review_final", "execute"] as const;
 export type Phase = (typeof PHASES)[number];
 
-/**
- * Maps every phase name pi-smart-plan has ever written — pre-0.10 legacy
- * names (hld/ablate/present) and today's canonical names — onto the current
- * Phase set. Read-only: callers normalize a value coming off disk or out of
- * plan content; nothing here ever rewrites a store.
- */
-const LEGACY_PHASE_MAP: Record<string, Phase> = {
-	discovery: "discovery",
-	hld: "discovery", // pre-0.10: separate HLD-writing phase, folded into discovery
-	simplify: "simplify",
-	ablate: "simplify", // pre-0.10 name
-	review_hld: "review_hld",
-	present: "review_hld", // pre-0.10 name
-	decompose: "decompose",
-	review_final: "review_final",
-	execute: "execute",
-};
-
-/** Normalize a raw phase string (current canonical name or a pre-0.10 legacy
- * name) to today's Phase, or undefined when unrecognized. */
-export function normalizePhase(value: string): Phase | undefined {
-	return LEGACY_PHASE_MAP[value];
-}
-
-const PHASE_LINE = /^phase:\s*(\w+)\s*$/m;
-
-/** Explicit `phase:` marker from the plan status block, normalized through
- * normalizePhase (accepts pre-0.10 legacy values too), when present and
- * recognized. */
-export function parsePhaseLine(content: string): Phase | undefined {
-	const match = PHASE_LINE.exec(content);
-	return match ? normalizePhase(match[1]) : undefined;
-}
-
-/**
- * Structural fallback phase, used only when no machine-tracked phase.txt
- * exists yet (see plan-store.ts's resolvePhase = readMachinePhase ??
- * inferPhase) — purely derived from guard state and plan shape, never from an
- * explicit marker. `!guardOn` always means `execute` (the guard being off IS
- * the execute signal). Otherwise: no HLD section → still converging
- * (discovery); HLD without tasks → the DAG hasn't been written yet
- * (decompose); HLD with tasks → ready for the Gate 1 review (review_hld).
- */
-export function inferPhase(content: string, guardOn: boolean): Phase {
-	if (!guardOn) return "execute";
-	const hasHld = /^##\s+HLD\b/m.test(content);
-	if (!hasHld) return "discovery";
-	const tasks = parseTasks(content);
-	if (tasks.length === 0) return "decompose";
-	return "review_hld";
+/** Validate a raw phase.txt value against the canonical Phase set — the only
+ * check readMachinePhase needs (phase.txt only ever holds one of today's
+ * canonical names). Undefined when the value isn't recognized. */
+export function toPhase(value: string): Phase | undefined {
+	return (PHASES as readonly string[]).includes(value) ? (value as Phase) : undefined;
 }
 
 export interface ValidationIssue {
@@ -93,26 +48,37 @@ export interface ValidationIssue {
 	message: string;
 }
 
+/** Locate a top-level `## <heading>` section: from the line matching
+ * `headingRe` to just before the next `^##` heading, or the end of `lines`.
+ * Null when `headingRe` matches nothing. Shared by every "find `## X`, run
+ * until the next section" scan below (sectionText, parseTasks,
+ * applyWavesSection, parseDoD) — callers differ only in what they do with
+ * the span; the per-site heading regex (including waves' case-insensitive
+ * `/i`) is passed in and never altered here. */
+function sectionSpan(lines: string[], headingRe: RegExp): { start: number; end: number } | null {
+	const start = lines.findIndex((line) => headingRe.test(line));
+	if (start === -1) return null;
+	let end = lines.length;
+	for (let i = start + 1; i < lines.length; i++) {
+		if (/^##\s/.test(lines[i])) {
+			end = i;
+			break;
+		}
+	}
+	return { start, end };
+}
+
 /** Text of a top-level `## Name` section (without the heading), or "" when
- * the section is absent or empty. Single source of truth — plan-store.ts's
- * own `extractSection` copy is expected to import this instead of
- * duplicating it. */
+ * the section is absent or empty. Single source of truth — plan-store.ts
+ * imports this directly rather than keeping its own copy. */
 export function sectionText(content: string, name: string): string {
 	const lines = content.split("\n");
-	const start = lines.findIndex((line) => new RegExp(`^##\\s+${name}\\b`).test(line));
-	if (start === -1) return "";
-	const out: string[] = [];
-	for (let i = start + 1; i < lines.length; i++) {
-		const line = lines[i];
-		// Narrow the possibly-undefined index access (noUncheckedIndexedAccess)
-		// cleanly before touching the value — no casts. `i < lines.length` makes
-		// the undefined branch unreachable at runtime, but the guard satisfies
-		// strict and keeps the copy loop behavior identical.
-		if (line === undefined) break;
-		if (/^##\s/.test(line)) break;
-		out.push(line);
-	}
-	return out.join("\n").trim();
+	const span = sectionSpan(lines, new RegExp(`^##\\s+${name}\\b`));
+	if (!span) return "";
+	return lines
+		.slice(span.start + 1, span.end)
+		.join("\n")
+		.trim();
 }
 
 const TASK_HEADER = /^\s*-\s*\[( |x)\]\s*([A-Za-z0-9][A-Za-z0-9_-]*):\s*(.*)$/;
@@ -131,14 +97,13 @@ function parseList(raw: string | undefined): string[] {
 /** Extract tasks from the `## Tasks` section; [] when the section is absent. */
 export function parseTasks(content: string): PlanTask[] {
 	const lines = content.split("\n");
-	const start = lines.findIndex((line) => /^##\s+Tasks\b/.test(line));
-	if (start === -1) return [];
+	const span = sectionSpan(lines, /^##\s+Tasks\b/);
+	if (!span) return [];
 
 	const tasks: PlanTask[] = [];
 	let current: PlanTask | undefined;
-	for (let i = start + 1; i < lines.length; i++) {
+	for (let i = span.start + 1; i < span.end; i++) {
 		const line = lines[i];
-		if (/^##\s/.test(line)) break; // next section
 		const header = TASK_HEADER.exec(line);
 		if (header) {
 			current = {
@@ -284,19 +249,12 @@ export function buildWavesSection(tasks: PlanTask[], layers: Map<string, number>
 /** Replace an existing derived-waves section, or append one. */
 export function applyWavesSection(content: string, section: string): string {
 	const lines = content.split("\n");
-	const start = lines.findIndex((line) => /^##\s+Review\s+—\s+waves/i.test(line));
-	if (start === -1) {
+	const span = sectionSpan(lines, /^##\s+Review\s+—\s+waves/i);
+	if (!span) {
 		const trimmed = content.replace(/\s+$/, "");
 		return `${trimmed}\n\n${section}\n`;
 	}
-	let end = lines.length;
-	for (let i = start + 1; i < lines.length; i++) {
-		if (/^##\s/.test(lines[i])) {
-			end = i;
-			break;
-		}
-	}
-	return [...lines.slice(0, start), ...section.split("\n"), "", ...lines.slice(end)].join("\n");
+	return [...lines.slice(0, span.start), ...section.split("\n"), "", ...lines.slice(span.end)].join("\n");
 }
 
 /** Tasks whose deps are all done and which are not done themselves. */
@@ -308,12 +266,11 @@ export function readyFrontier(tasks: PlanTask[]): PlanTask[] {
 /** Extract executable DoD commands from the `## DoD` section. */
 export function parseDoD(content: string): string[] {
 	const lines = content.split("\n");
-	const start = lines.findIndex((line) => /^##\s+DoD\b/.test(line));
-	if (start === -1) return [];
+	const span = sectionSpan(lines, /^##\s+DoD\b/);
+	if (!span) return [];
 	const commands: string[] = [];
-	for (let i = start + 1; i < lines.length; i++) {
+	for (let i = span.start + 1; i < span.end; i++) {
 		const line = lines[i];
-		if (/^##\s/.test(line)) break;
 		const trimmed = line.trim().replace(/^-\s*/, "").replace(/^`+|`+$/g, "").trim();
 		if (trimmed.length > 0 && !trimmed.startsWith("#")) commands.push(trimmed);
 	}

@@ -6,7 +6,10 @@
  * what lets test/smoke.mjs exercise them directly against a plain mock
  * theme object instead of a real pi session.
  */
-import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { keyHint } from "@earendil-works/pi-coding-agent";
+import { Text, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import type { Phase } from "./plan-validate.ts";
+import { PHASE_PROMPTS } from "./prompts.ts";
 import type { PlanView, PlanViewTask } from "./plan-store.ts";
 
 /** Structural theme contract these renderers depend on — the same {fg, bold}
@@ -173,7 +176,7 @@ export function renderIntentPanel(goal: string, statement: string, theme: PanelT
 	return lines;
 }
 
-// ---- tiny renderCall/renderResult helpers (index.ts's 12 tool renderers) --
+// ---- tiny renderCall/renderResult helpers (index.ts's 11 tool renderers) --
 // Same "pure, testable" contract as the panel renderers above, just shaped
 // for one-liner tool rows instead of multi-line panels.
 
@@ -199,3 +202,258 @@ export function firstLine(text: string): string {
 export function toolCallLabel(theme: PanelTheme, verb: string): string {
 	return theme.fg("toolTitle", theme.bold(`▪ ${verb}`));
 }
+
+/** One-line mission for a phase, pulled straight from its PHASE_PROMPTS entry
+ * (single source of truth — never duplicated) — used to tell the model what
+ * the phase it just entered is for, right after a transition. Falls back to
+ * a bare phase name if the LOCAL MISSION line is ever missing. */
+export function phaseMissionLine(phase: Phase): string {
+	const match = PHASE_PROMPTS[phase].match(/^LOCAL MISSION:.*$/m);
+	return match ? match[0] : `phase ${phase}`;
+}
+
+/** Strip the "LOCAL MISSION:" label so a mission line reads naturally inline
+ * (the live working message, tool result one-liners) instead of restating
+ * the prompt tag. */
+export function stripLocalMission(line: string): string {
+	return line.replace(/^LOCAL MISSION:\s*/, "");
+}
+
+/** plan_task_update's renderCall verb per status — "claimed"/"done" read more
+ * naturally in a one-liner than the raw enum values (pending/blocked pass
+ * through unchanged). */
+const TASK_STATUS_VERB: Record<string, string> = { in_progress: "claimed", done: "done", blocked: "blocked", pending: "pending" };
+
+/** Shared renderResult prelude: while the result is still partial, a themed
+ * "<verb>…" placeholder; once settled, an optional themed error line — the
+ * exact `if (context.isError) return new Text(theme.fg("error", …), 0, 0)`
+ * early-return that 9 of the 11 tools share. errorText is omitted by the two
+ * tools (plan_task_update, plan_verify) whose own isError handling isn't
+ * this simple early-return; they call this only for the isPartial line and
+ * keep their own logic below it. Returns the Text to return immediately, or
+ * undefined to fall through into the tool's own ready-state body. */
+export function stdResult(theme: PanelTheme, isPartial: boolean, verb: string, isError?: boolean, errorText?: string): Text | undefined {
+	if (isPartial) return new Text(theme.fg("warning", `${verb}…`), 0, 0);
+	if (isError && errorText !== undefined) return new Text(theme.fg("error", errorText), 0, 0);
+	return undefined;
+}
+
+/** Result-context shape every renderResult reads isError from — duck-typed,
+ * same rationale as resultText's. */
+interface RenderContext {
+	isError?: boolean;
+}
+
+/** The second renderResult argument: isPartial always, expanded only for the
+ * two tools (plan_recall, plan_verify) with a collapsed/expanded body. */
+interface ResultOpts {
+	isPartial: boolean;
+	expanded?: boolean;
+}
+
+/** Every tool's {renderCall, renderResult} pair, keyed by tool name —
+ * spread into that tool's registerTool({…}) call in index.ts. Loosely typed
+ * on purpose (the 11 pairs are genuinely heterogeneous in their args/result
+ * shapes); each function body below is still precisely typed against what it
+ * actually reads. */
+export const toolRenderers: Record<string, { renderCall: (...args: any[]) => Text; renderResult: (...args: any[]) => Text }> = {
+	plan_exit: {
+		renderCall(_args: unknown, theme: PanelTheme, _context: unknown) {
+			return new Text(toolCallLabel(theme, "exiting plan mode"), 0, 0);
+		},
+		renderResult(result: { content: Array<{ type: string; text?: string }>; details?: unknown }, { isPartial }: ResultOpts, theme: PanelTheme, context: RenderContext) {
+			const text = firstLine(resultText(result));
+			const prelude = stdResult(theme, isPartial, "confirming", context.isError, text);
+			if (prelude) return prelude;
+			const details = result.details as { enabled?: boolean; approved?: string[] } | undefined;
+			if (details?.enabled === false) {
+				const approved = details.approved?.length ? theme.fg("muted", ` — implementing ${details.approved.join(", ")}`) : "";
+				return new Text(theme.fg("success", "plan mode exited ✓") + approved, 0, 0);
+			}
+			return new Text(theme.fg("muted", text), 0, 0);
+		},
+	},
+
+	ask_smart_plan: {
+		renderCall(args: { phaseGate?: boolean; releasePlanGuardOnAnswer?: boolean; questions: unknown[] }, theme: PanelTheme, _context: unknown) {
+			const gate = args.phaseGate === true || args.releasePlanGuardOnAnswer === true;
+			const n = args.questions.length;
+			const label = gate ? "opening the owner gate" : `asking the owner (${n} question${n === 1 ? "" : "s"})`;
+			return new Text(toolCallLabel(theme, label), 0, 0);
+		},
+		renderResult(result: { content: Array<{ type: string; text?: string }>; details?: unknown }, { isPartial }: ResultOpts, theme: PanelTheme, context: RenderContext) {
+			const text = firstLine(resultText(result));
+			const prelude = stdResult(theme, isPartial, "asking", context.isError, text);
+			if (prelude) return prelude;
+			const details = result.details as
+				| { answers?: Record<string, unknown>; declined?: boolean; unanswered?: string[]; advanced?: boolean; released?: boolean; phase?: string }
+				| undefined;
+			if (details?.released) return new Text(theme.fg("success", `authorized ✓ → ${details.phase}`), 0, 0);
+			if (details?.advanced) return new Text(theme.fg("success", `approved ✓ → ${details.phase}`), 0, 0);
+			if (details?.declined) {
+				const unanswered = details.unanswered?.length ? ` (${details.unanswered.length} unanswered)` : "";
+				return new Text(theme.fg("warning", `postponed${unanswered}`), 0, 0);
+			}
+			const count = details?.answers ? Object.keys(details.answers).length : 0;
+			return new Text(theme.fg("success", `answered ✓ (${count})`), 0, 0);
+		},
+	},
+
+	plan_advance: {
+		renderCall(_args: unknown, theme: PanelTheme, _context: unknown) {
+			return new Text(toolCallLabel(theme, "advancing…"), 0, 0);
+		},
+		renderResult(result: { content: Array<{ type: string; text?: string }>; details?: unknown }, { isPartial }: ResultOpts, theme: PanelTheme, context: RenderContext) {
+			const text = firstLine(resultText(result));
+			const prelude = stdResult(theme, isPartial, "advancing", context.isError, text);
+			if (prelude) return prelude;
+			const details = result.details as { phase?: Phase; declined?: boolean; released?: boolean } | undefined;
+			if (details?.phase) {
+				// Budget leaves room for the "→ <phase> — " prefix and an optional
+				// " (postponed)"/" (guard released)" suffix so the collapsed line
+				// stays on one row at a typical 72-column width.
+				const mission = truncateToWidth(stripLocalMission(phaseMissionLine(details.phase)), 46);
+				let line = theme.fg("success", "→ ") + theme.fg("accent", theme.bold(details.phase)) + theme.fg("muted", ` — ${mission}`);
+				if (details.declined) line += theme.fg("warning", " (postponed)");
+				else if (details.released) line += theme.fg("muted", " (guard released)");
+				return new Text(line, 0, 0);
+			}
+			return new Text(theme.fg("success", text), 0, 0);
+		},
+	},
+
+	plan_save: {
+		renderCall(args: { goal: string }, theme: PanelTheme, _context: unknown) {
+			return new Text(`${toolCallLabel(theme, "saving plan")} ${theme.fg("accent", args.goal)}`, 0, 0);
+		},
+		renderResult(result: { content: Array<{ type: string; text?: string }> }, { isPartial }: ResultOpts, theme: PanelTheme, context: RenderContext) {
+			const prelude = stdResult(theme, isPartial, "saving", context.isError, firstLine(resultText(result)));
+			if (prelude) return prelude;
+			return new Text(theme.fg("success", "plan saved ✓") + theme.fg("muted", " (waves rebuilt)"), 0, 0);
+		},
+	},
+
+	plan_intent: {
+		renderCall(args: { openQuestions?: unknown[]; goal: string }, theme: PanelTheme, _context: unknown) {
+			const n = args.openQuestions?.length ?? 0;
+			const label = n > 0 ? `asking ${n} open question${n === 1 ? "" : "s"}` : "proposing objective";
+			return new Text(`${toolCallLabel(theme, label)} ${theme.fg("accent", args.goal)}`, 0, 0);
+		},
+		renderResult(result: { content: Array<{ type: string; text?: string }>; details?: unknown }, { isPartial }: ResultOpts, theme: PanelTheme, context: RenderContext) {
+			const text = firstLine(resultText(result));
+			const prelude = stdResult(theme, isPartial, "confirming", context.isError, text);
+			if (prelude) return prelude;
+			const details = result.details as { confirmed?: boolean; declined?: boolean; keepChatting?: boolean; unanswered?: string[] } | undefined;
+			if (details?.confirmed) return new Text(theme.fg("success", "objective confirmed ✓"), 0, 0);
+			if (details?.declined || details?.keepChatting) return new Text(theme.fg("warning", "keep chatting — objective rejected"), 0, 0);
+			if (details?.unanswered) return new Text(theme.fg("muted", `open questions asked (${details.unanswered.length} unanswered)`), 0, 0);
+			return new Text(theme.fg("muted", text), 0, 0);
+		},
+	},
+
+	journal_append: {
+		renderCall(args: { lines: string }, theme: PanelTheme, _context: unknown) {
+			const preview = truncateToWidth(firstLine(args.lines), 60);
+			return new Text(`${toolCallLabel(theme, "noting")} ${theme.fg("accent", `"${preview}"`)}`, 0, 0);
+		},
+		renderResult(result: { content: Array<{ type: string; text?: string }> }, { isPartial }: ResultOpts, theme: PanelTheme, context: RenderContext) {
+			const prelude = stdResult(theme, isPartial, "noting", context.isError, firstLine(resultText(result)));
+			if (prelude) return prelude;
+			return new Text(theme.fg("success", "noted ✓"), 0, 0);
+		},
+	},
+
+	plan_recall: {
+		renderCall(args: { query?: string }, theme: PanelTheme, _context: unknown) {
+			let text = toolCallLabel(theme, "recalling plans");
+			if (args.query) text += ` ${theme.fg("accent", args.query)}`;
+			return new Text(text, 0, 0);
+		},
+		renderResult(result: { content: Array<{ type: string; text?: string }> }, { expanded, isPartial }: ResultOpts, theme: PanelTheme, context: RenderContext) {
+			const text = resultText(result);
+			const prelude = stdResult(theme, isPartial, "recalling", context.isError, firstLine(text));
+			if (prelude) return prelude;
+			const lines = text.split("\n").filter((l) => l.trim().length > 0);
+			if (lines.length === 0) return new Text(theme.fg("muted", "no matching plans"), 0, 0);
+			const shown = expanded ? lines.slice(0, 30) : lines.slice(0, 3);
+			let out = shown.map((l) => theme.fg("text", truncateToWidth(l, 100))).join("\n");
+			const hidden = lines.length - shown.length;
+			if (hidden > 0) {
+				const more = expanded ? `... ${hidden} more lines` : `... ${hidden} more (${keyHint("app.tools.expand", "to expand")})`;
+				out += `\n${theme.fg("dim", more)}`;
+			}
+			return new Text(out, 0, 0);
+		},
+	},
+
+	plan_next: {
+		renderCall(args: { goal: string }, theme: PanelTheme, _context: unknown) {
+			return new Text(`${toolCallLabel(theme, "what's ready?")} ${theme.fg("accent", args.goal)}`, 0, 0);
+		},
+		renderResult(result: { content: Array<{ type: string; text?: string }> }, { isPartial }: ResultOpts, theme: PanelTheme, context: RenderContext) {
+			const text = resultText(result);
+			const prelude = stdResult(theme, isPartial, "checking", context.isError, firstLine(text));
+			if (prelude) return prelude;
+			const ids = [...text.matchAll(/^- (\S+):/gm)].map((m) => m[1]);
+			if (ids.length > 0) return new Text(theme.fg("accent", `ready: ${ids.join(" ")}`), 0, 0);
+			if (text.includes("no Tasks section")) return new Text(theme.fg("muted", "no tasks yet"), 0, 0);
+			return new Text(theme.fg("success", "all done ✓"), 0, 0);
+		},
+	},
+
+	plan_task_update: {
+		renderCall(args: { taskId: string; status: string }, theme: PanelTheme, _context: unknown) {
+			const verb = TASK_STATUS_VERB[args.status] ?? args.status;
+			return new Text(`${toolCallLabel(theme, `${args.taskId} →`)} ${theme.fg("accent", verb)}`, 0, 0);
+		},
+		renderResult(result: { content: Array<{ type: string; text?: string }> }, { isPartial }: ResultOpts, theme: PanelTheme, context: RenderContext) {
+			const prelude = stdResult(theme, isPartial, "updating");
+			if (prelude) return prelude;
+			const text = firstLine(resultText(result));
+			return new Text(theme.fg(context.isError ? "error" : "success", text), 0, 0);
+		},
+	},
+
+	plan_verify: {
+		renderCall(args: { goal: string }, theme: PanelTheme, _context: unknown) {
+			return new Text(`${toolCallLabel(theme, "running DoD checks")} ${theme.fg("accent", args.goal)}`, 0, 0);
+		},
+		renderResult(result: { content: Array<{ type: string; text?: string }> }, { expanded, isPartial }: ResultOpts, theme: PanelTheme, context: RenderContext) {
+			const prelude = stdResult(theme, isPartial, "running DoD checks");
+			if (prelude) return prelude;
+			const text = resultText(result);
+			const lines = text.split("\n").filter(Boolean);
+			const headline = lines[0] ?? "";
+			// A caught error (safeError text) never starts with "DoD" — the two
+			// real DoD headlines always do ("DoD: N/N PASS." / "DoD FAILED: …").
+			if (context.isError && !headline.startsWith("DoD")) return new Text(theme.fg("error", headline), 0, 0);
+			const rows = lines.slice(1).map((row) => {
+				const m = row.match(/^(PASS|FAIL) \((\d+)ms\) (.*)$/);
+				if (!m) return { failed: false, line: theme.fg("dim", row) };
+				const passed = m[1] === "PASS";
+				const glyph = passed ? theme.fg("success", "✓") : theme.fg("error", "✗");
+				return { failed: !passed, line: `${glyph} ${theme.fg("dim", `(${m[2]}ms)`)} ${theme.fg(passed ? "text" : "error", m[3])}` };
+			});
+			const color = headline.startsWith("DoD FAILED") ? "error" : headline.startsWith("DoD:") ? "success" : "muted";
+			const summary = theme.fg(color, theme.bold(headline));
+			// Collapsed: headline plus only the failing rows (all-pass stays a
+			// single line); expanded: the full per-command breakdown.
+			const shown = expanded ? rows : rows.filter((r) => r.failed);
+			if (shown.length === 0) return new Text(summary, 0, 0);
+			return new Text([summary, ...shown.map((r) => r.line)].join("\n"), 0, 0);
+		},
+	},
+
+	plan_complete: {
+		renderCall(args: { goal: string }, theme: PanelTheme, _context: unknown) {
+			return new Text(`${toolCallLabel(theme, "completing")} ${theme.fg("accent", args.goal)}`, 0, 0);
+		},
+		renderResult(result: { content: Array<{ type: string; text?: string }>; details?: unknown }, { isPartial }: ResultOpts, theme: PanelTheme, context: RenderContext) {
+			const text = firstLine(resultText(result));
+			const prelude = stdResult(theme, isPartial, "completing", context.isError, text);
+			if (prelude) return prelude;
+			const details = result.details as { completed?: boolean } | undefined;
+			return new Text(theme.fg(details?.completed ? "success" : "muted", details?.completed ? "goal completed ✓" : text), 0, 0);
+		},
+	},
+};

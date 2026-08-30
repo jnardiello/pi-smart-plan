@@ -1,7 +1,7 @@
 // Unit tests for the pure phase machine — src/phase-machine.ts + the parts of
-// src/plan-validate.ts it re-uses (phase enum, legacy-name mapping, save-time
-// deliverable-shape validation) + src/plan-store.ts's isPlanningPhase +
-// src/abandon.ts's pure in-process abandon-grace timer. Run: node test/phase-machine.mjs
+// src/plan-validate.ts it re-uses (phase enum, save-time deliverable-shape
+// validation) + src/plan-store.ts's isPlanningPhase + src/abandon.ts's pure
+// in-process abandon-grace timer. Run: node test/phase-machine.mjs
 import {
 	PHASES,
 	PHASE_ALLOWED_TOOLS,
@@ -14,13 +14,7 @@ import {
 	DISCOVERY_POST_INTENT_KEY,
 	discoveryPostIntentSteer,
 } from "../src/phase-machine.ts";
-import {
-	normalizePhase,
-	parsePhaseLine,
-	inferPhase,
-	validatePhaseShape,
-	shapeErrorMessage,
-} from "../src/plan-validate.ts";
+import { validatePhaseShape, shapeErrorMessage } from "../src/plan-validate.ts";
 import { isPlanningPhase } from "../src/plan-store.ts";
 import {
 	DEFAULT_ABANDON_GRACE_MS,
@@ -151,21 +145,6 @@ console.log("\n[PHASES — six-phase order]");
 check("PHASES is the six canonical phase names, in order",
 	JSON.stringify([...PHASES]) === JSON.stringify(["discovery", "simplify", "review_hld", "decompose", "review_final", "execute"]));
 check("isPlanningPhase is true for the five planning phases, false for execute", PHASES.every((p) => isPlanningPhase(p) === (p !== "execute")));
-
-console.log("\n[normalizePhase / LEGACY_PHASE_MAP (private, exercised via normalizePhase) — legacy mapping in one loop]");
-check("every legacy name maps to its current name",
-	[["hld", "discovery"], ["ablate", "simplify"], ["present", "review_hld"]].every(([legacy, current]) => normalizePhase(legacy) === current));
-check("every canonical name maps to itself (identity)", PHASES.every((p) => normalizePhase(p) === p));
-check("unrecognized/empty input → undefined", ["banana", ""].every((v) => normalizePhase(v) === undefined));
-check("parsePhaseLine trims whitespace and routes legacy names through normalizePhase",
-	parsePhaseLine("phase:   discovery   \n") === "discovery" && parsePhaseLine("phase: ablate\n") === "simplify");
-check("parsePhaseLine: unrecognized value → undefined", parsePhaseLine("phase: banana\n") === undefined);
-
-console.log("\n[inferPhase]");
-check("guard off → execute (overrides content shape)", inferPhase(COMPLETE_WITH_TASKS, false) === "execute");
-check("no ## HLD → discovery", inferPhase(ITALIAN_HEADINGS, true) === "discovery");
-check("## HLD without tasks → decompose", inferPhase(COMPLETE_HLD, true) === "decompose");
-check("## HLD with tasks → review_hld", inferPhase(COMPLETE_WITH_TASKS, true) === "review_hld");
 
 console.log("\n[PHASE_ALLOWED_TOOLS]");
 check("allowlist covers all six phases", PHASES.every((p) => PHASE_ALLOWED_TOOLS[p] instanceof Set));
