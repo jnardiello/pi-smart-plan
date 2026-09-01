@@ -41,7 +41,7 @@ import {
 	discoveryPostIntentSteer,
 	type PhaseSnapshot,
 } from "./src/phase-machine.ts";
-import { savePlan, appendJournal, recall, approvedGoals, completeGoal, confirmIntent, currentPhase, getDoD, getPlanView, gitStagedFiles, goalExists, goalIsDone, goalSummaries, isPartiallyStaged, isPlanningPhase, journalEntriesSincePhaseStart, nextTasks, persistApproved, purgeTombstone, readIntent, readMachinePhase, readPlan, restoreTombstonedGoal, setMachinePhase, storeRoot, tombstoneActiveGoal, updateTaskStatus, validateGoalSlug, OBJECTIVE_MAX_LEN, PlanStoreValidationError, type PlanView } from "./src/plan-store.ts";
+import { savePlan, appendJournal, recall, completeGoal, confirmIntent, currentPhase, getDoD, getPlanView, gitStagedFiles, goalExists, goalIsDone, goalSummaries, isApprovedGoal, isPartiallyStaged, isPlanningPhase, journalEntriesSincePhaseStart, nextTasks, persistApproved, purgeTombstone, readIntent, readMachinePhase, readPlan, restoreTombstonedGoal, setMachinePhase, storeRoot, tombstoneActiveGoal, updateTaskStatus, validateGoalSlug, OBJECTIVE_MAX_LEN, PlanStoreValidationError, type PlanView } from "./src/plan-store.ts";
 import { cancelAbandon, getAbandonGraceMs, scheduleAbandon } from "./src/abandon.ts";
 import { startLiveWatch } from "./src/live-watch.ts";
 
@@ -115,13 +115,14 @@ const CHILD_MODE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
 	"subagent_wait",
 ]);
 
-/** Phase-aware tool surface for the CURRENT phase (parent only). When no goal
- * is set yet the phase is discovery. A pure lookup into PHASE_ALLOWED_TOOLS —
- * plan_save is already present in every phase there, so no re-add hack is
- * needed here (the phase-machine module stays the single source of truth). */
+/** Phase-aware tool surface for the phase this session OWNS (parent only).
+ * A session that owns no goal is a new session: discovery, never another
+ * session's phase. A pure lookup into PHASE_ALLOWED_TOOLS — plan_save is
+ * already present in every phase there, so no re-add hack is needed here (the
+ * phase-machine module stays the single source of truth). */
 function phaseAllowedTools(ctx: { cwd: string }): ReadonlySet<string> {
 	if (isSubagentChild) return CHILD_MODE_ALLOWED_TOOLS;
-	const current = displayPhase(ctx.cwd);
+	const current = ownedPhase(ctx.cwd);
 	const phase = current?.phase ?? "discovery";
 	return PHASE_ALLOWED_TOOLS[phase];
 }
@@ -217,48 +218,34 @@ let enabled = false;
  *
  * The store's active.txt pointer is repo-wide and shared by every session on
  * the same repo, so it cannot answer "which goal does THIS session act on".
- * This does: undefined means the session has not claimed a goal and falls
- * back to the shared pointer (single-session behavior, unchanged).
+ * This does: undefined means the session has claimed nothing and is therefore
+ * a NEW session — it never inherits the pointer's goal.
  *
  * The cwd is part of the binding because a goal slug only means anything
  * inside its own repo store — a goal claimed under one cwd must never
- * resolve against another's.
- *
- * `adopted` marks a claim the session took by acting on the pointer rather
- * than by the owner confirming an objective (see adoptPhase): it owns the goal
- * for every purpose here, but it is re-derived from the pointer on the next
- * user-initiated mutating call, so a single session that moves on to another
- * goal follows the pointer exactly as it did before claims existed. An
- * owner-confirmed claim is never re-derived. */
-let sessionGoal: { cwd: string; goal: string; adopted?: boolean } | undefined;
+ * resolve against another's. */
+let sessionGoal: { cwd: string; goal: string } | undefined;
 
 /** The goal this session has claimed under `cwd`, or undefined. */
 function ownedGoal(cwd: string): string | undefined {
 	return sessionGoal?.cwd === cwd ? sessionGoal.goal : undefined;
 }
 
-/** OWNING resolution: only the goal this session has claimed, and only while
- * that claim still resolves. Never falls back to the repo-wide pointer, so no
- * path built on it can write, advance or destroy a goal this session does not
- * own. Every mutating and every automatic path resolves through here.
+/** THE resolution: only the goal this session has claimed, and only while that
+ * claim still resolves. Never falls back to the repo-wide pointer, so nothing
+ * — not the prompt injection, not the tool surface, not a mutating or
+ * destructive path — can act on a goal this session does not own. A session
+ * that owns nothing is a NEW session: its phase is discovery.
+ *
+ * Ownership comes only from confirming an objective via plan_intent, or from
+ * restoring THIS session's own claim off its transcript on reload. Nothing is
+ * ever adopted from the shared pointer.
  *
  * A claim on a goal that no longer resolves (completed, abandoned or purged by
- * another session) yields null — the session owns nothing — but the claim
- * itself is deliberately NOT cleared: clearing it would make the session
- * indistinguishable from one that never claimed anything, and adoption would
- * then hand it another session's goal. */
+ * another session) yields null — the session owns nothing again. */
 function ownedPhase(cwd: string): { goal: string; phase: Phase } | null {
 	const claimed = ownedGoal(cwd);
 	return claimed ? currentPhase(cwd, claimed) : null;
-}
-
-/** DISPLAY resolution: the owned goal, otherwise the repo-wide pointer. The
- * fallback is legitimate here and only here — an unclaimed session is meant to
- * keep SEEING what other sessions on the same repo are planning. Read paths
- * only: tool surface, prompt injection, widget, status line, summaries and
- * message text. Anything that mutates or destroys state uses ownedPhase. */
-function displayPhase(cwd: string): { goal: string; phase: Phase } | null {
-	return ownedPhase(cwd) ?? currentPhase(cwd);
 }
 
 /** True when this extension instance runs inside a pi-subagents child that
@@ -440,7 +427,7 @@ function refreshWidget(ctx: ExtensionContext): void {
 	}
 	ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => {
 		const lines: string[] = [];
-		const own = displayPhase(ctx.cwd);
+		const own = ownedPhase(ctx.cwd);
 		const current = own?.phase ?? "discovery";
 		lines.push(theme.fg("accent", theme.bold("◈ PLAN MODE")) + theme.fg("muted", " · read-only"));
 		const usage = ctx.getContextUsage();
@@ -465,11 +452,11 @@ function planInjection(cwd: string): string | undefined {
 		// Subagent children under parent plan mode never run the plan workflow:
 		// drive them with a dedicated read-only exploration contract instead.
 		if (isSubagentChild) return `${GLOBAL_CONSTRAINTS}\n\n${SUBAGENT_CONSTRAINTS}`;
-		const current = displayPhase(cwd);
+		const current = ownedPhase(cwd);
 		const phase = current?.phase ?? "discovery";
 		return `${GLOBAL_CONSTRAINTS}\n\n${PHASE_PROMPTS[phase]}`;
 	}
-	const current = displayPhase(cwd);
+	const current = ownedPhase(cwd);
 	if (current?.phase === "execute") return `${GLOBAL_CONSTRAINTS}\n\n${PHASE_PROMPTS.execute}`;
 	return undefined;
 }
@@ -616,51 +603,31 @@ export default function planGuard(pi: ExtensionAPI): void {
 
 	/** Claim (or release) the goal this session acts on, persisting it so a
 	 * reload/resume restores the same binding. */
-	function setSessionGoal(cwd: string, goal: string | undefined, adopted = false): void {
-		sessionGoal = goal ? { cwd, goal, adopted } : undefined;
+	function setSessionGoal(cwd: string, goal: string | undefined): void {
+		sessionGoal = goal ? { cwd, goal } : undefined;
 		persistGuardState(toolsBeforePlanMode);
 	}
 
-	/** Owning resolution for USER-INITIATED mutating tool calls (plan_advance,
-	 * the owner gate). An owner-confirmed claim resolves exactly like ownedPhase
-	 * — including to null once it goes dead, so a session never silently takes
-	 * over the goal another session moved the pointer to. With no claim, or with
-	 * a previously adopted one, the pointer's goal is adopted here and now: a
-	 * single session driving the store keeps working exactly as before, and the
-	 * goal it acts on becomes explicit state instead of an implicit fallback.
-	 *
-	 * Only user-initiated tool calls reach this. Sweep, tombstone and every other
-	 * automatic path resolve through ownedPhase and adopt nothing. */
-	function adoptPhase(cwd: string): { goal: string; phase: Phase } | null {
-		if (ownedGoal(cwd) && sessionGoal?.adopted !== true) return ownedPhase(cwd);
-		const pointed = currentPhase(cwd);
-		if (pointed && pointed.goal !== ownedGoal(cwd)) setSessionGoal(cwd, pointed.goal, true);
-		return pointed ?? ownedPhase(cwd);
-	}
-
-	/** adoptPhase's rule for the four tools that name their goal as a PARAMETER
+	/** The ownership rule for the four tools that name their goal as a PARAMETER
 	 * (plan_save, plan_task_update, plan_verify, plan_complete): taken as given,
 	 * the parameter let any session write to, tick or complete another session's
-	 * plan just by naming it. An owner-confirmed claim on a live OTHER goal
-	 * refuses; anything else adopts the named goal, so a single session (and a
-	 * subagent child, which owns nothing and never persists a claim) keeps
-	 * working exactly as before.
+	 * plan just by naming it. They now act only on the goal THIS session owns —
+	 * nothing is adopted, so a session that has claimed nothing refuses instead
+	 * of silently taking over whatever goal was named.
 	 *
-	 * Adoption is conditional on the goal actually resolving, so a typo or a
-	 * first plan_save on a not-yet-created goal never leaves the session
-	 * claiming a goal that does not exist — the tool's own error stands. */
+	 * Subagent children are exempt: they own nothing by design and must keep
+	 * working under the parent's plan. */
 	function notOwnedRefusal(cwd: string, tool: string, goal: string): ReturnType<typeof refuse> | undefined {
 		if (isSubagentChild) return undefined;
 		const owned = ownedPhase(cwd);
 		if (owned?.goal === goal) return undefined;
-		if (owned && sessionGoal?.adopted !== true) {
+		if (owned) {
 			return refuse(`${tool} blocked — this session owns "${owned.goal}", not "${goal}"; complete or abandon "${owned.goal}" first.`, {
 				goal,
 				owned: owned.goal,
 			});
 		}
-		if (currentPhase(cwd, goal)) setSessionGoal(cwd, goal, true);
-		return undefined;
+		return refuse(`${tool} blocked — this session has no plan of its own, so "${goal}" is not its to touch. A plan starts by confirming an objective (plan_intent).`, { goal });
 	}
 
 	function set(ctx: ExtensionContext, next: boolean, note: string, type: "info" | "warning"): void {
@@ -876,31 +843,36 @@ export default function planGuard(pi: ExtensionAPI): void {
 			if (!ctx.hasUI) {
 				return refuse("Cannot exit plan mode: no interactive UI is available for user confirmation, so plan mode stays active.", { enabled });
 			}
-			const approved = approvedGoals(ctx.cwd);
-			const summaries = goalSummaries(ctx.cwd, displayPhase(ctx.cwd)?.goal);
+			// Authorization is bound to THIS session's goal. A repo-wide approved
+			// list released the guard for goals other sessions own — journaling a
+			// false "owner confirmed exit" and briefing the model to implement a
+			// plan this owner never approved. The LISTING below stays repo-wide on
+			// purpose; only the authorization narrows.
+			const owned = ownedGoal(ctx.cwd);
+			const approved = owned && isApprovedGoal(ctx.cwd, owned) ? owned : undefined;
+			const summaries = goalSummaries(ctx.cwd, owned);
 			const context = summaries.length > 0
 				? `\n\nActive plans:\n${summaries.map((line) => `• ${line}`).join("\n")}`
 				: "\n\nWARNING: no plan has been saved yet (nothing written via plan_save).";
-			const hasApproved = approved.length > 0;
-			const question = hasApproved
-				? `Exit plan mode and start implementing the approved plan(s) [${approved.join(", ")}]?`
+			const question = approved
+				? `Exit plan mode and start implementing the approved plan(s) [${approved}]?`
 				: "Exit plan mode?";
 			const confirmed = await ctx.ui.confirm("Plan mode", `${question}${context}`);
 			if (confirmed) {
 				set(ctx, false, "◈ Plan mode OFF — full access restored.", "info");
-				if (hasApproved) {
-					for (const goal of approved) appendJournal(ctx.cwd, goal, "owner confirmed exit — implementation authorized");
+				if (approved) {
+					appendJournal(ctx.cwd, approved, "owner confirmed exit — implementation authorized");
 					// Same fresh-turn pattern as queueImplementationBriefing (mid-run
 					// tool GRANTS never reach the model this same turn): a short result
 					// here, the real kickoff queued for the NEXT turn where the
 					// restored full tool surface is actually visible.
 					const staged = gitStagedFiles(ctx.cwd);
 					const briefing =
-						`(APPROVED by owner — plan mode released via plan_exit. The owner's confirmation IS the authorization: start implementing the approved plan(s) [${approved.join(", ")}] NOW. Do not ask again.)\n\n` +
+						`(APPROVED by owner — plan mode released via plan_exit. The owner's confirmation IS the authorization: start implementing the approved plan(s) [${approved}] NOW. Do not ask again.)\n\n` +
 						phaseMissionLine("execute") +
 						(staged.length > 0 ? `\n\n⚠ ${staged.length} pre-existing staged file(s) present — pi-subagents will reject every worker until they are committed or unstaged.` : "");
-					sendPlan(pi, ctx, briefing, approved.join(", "));
-					return ok("Plan mode exited — wind down this turn; the implementation briefing for the approved plan(s) arrives next turn.", { enabled, approved });
+					sendPlan(pi, ctx, briefing, approved);
+					return ok("Plan mode exited — wind down this turn; the implementation briefing for the approved plan(s) arrives next turn.", { enabled, approved: [approved] });
 				}
 				return ok("Plan mode exited.", { enabled });
 			}
@@ -980,14 +952,14 @@ export default function planGuard(pi: ExtensionAPI): void {
 			}
 
 			if (gateRequested && !isSubagentChild) {
-				const current = adoptPhase(ctx.cwd);
+				const current = ownedPhase(ctx.cwd);
 				if (params.releasePlanGuardOnAnswer === true && params.phaseGate !== true) {
 					if (!current || current.phase !== "review_final") {
 						return refuse("the guard is released only by the review_final gate (use phaseGate: true).");
 					}
 				}
 				if (!current) {
-					return refuse("Gate blocked: no active goal yet — establish the goal before requesting a phase gate.");
+					return refuse("Gate blocked: no active goal yet — this session has no plan of its own. A plan starts by confirming an objective (plan_intent).");
 				}
 				if (current.phase !== "review_hld" && current.phase !== "review_final") {
 					return refuse(`Gate blocked: "${current.phase}" has no owner gate — call plan_advance to self-advance instead.`, { phase: current.phase });
@@ -1037,9 +1009,9 @@ export default function planGuard(pi: ExtensionAPI): void {
 		],
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			const current = adoptPhase(ctx.cwd);
+			const current = ownedPhase(ctx.cwd);
 			if (!current) {
-				return refuse("plan_advance blocked — no active goal yet; establish the goal before requesting a phase advance.");
+				return refuse("plan_advance blocked — no active goal yet: this session has no plan of its own. A plan starts by confirming an objective (plan_intent).");
 			}
 			// Close the shadow-planning gap: advancing a still-planning goal
 			// (discovery…review_final) mutates the phase machine and, for review
@@ -1379,7 +1351,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 				// already off by the time real task work happens (Gate 2 released
 				// it), so this is the one place execute's own progress can still
 				// reach the working line — refreshed on every task-status call.
-				if (displayPhase(ctx.cwd)?.phase === "execute") {
+				if (ownedPhase(ctx.cwd)?.phase === "execute") {
 					const view = getPlanView(ctx.cwd, params.goal);
 					if (view) ctx.ui.setWorkingMessage(`◈ plan · execute — implementing (${view.doneCount}/${view.total} done)`);
 				}
@@ -1540,7 +1512,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 	pi.registerCommand("plan-status", {
 		description: "Dump plan-mode state (goals, phases, frontier) — no LLM turn",
 		handler: async (_args, ctx) => {
-			const lines = goalSummaries(ctx.cwd, displayPhase(ctx.cwd)?.goal);
+			const lines = goalSummaries(ctx.cwd, ownedGoal(ctx.cwd));
 			ctx.ui.notify(lines.length > 0 ? lines.join("\n") : "No active goals.", enabled ? "warning" : "info");
 		},
 	});
@@ -1582,7 +1554,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 				block: true,
 				reason: isSubagentChild
 					? `Your parent session is in plan mode — "${event.toolName}" is not available to read-only subagents (exploration only: read, read-only bash, web research, nested subagent spawn). Report findings to the parent; never touch the plan store or planning tools.`
-					: `Plan mode is active — "${event.toolName}" is not available in the current phase (${displayPhase(ctx.cwd)?.phase ?? "discovery"}). Repo changes wait until the user exits plan mode.`,
+					: `Plan mode is active — "${event.toolName}" is not available in the current phase (${ownedPhase(ctx.cwd)?.phase ?? "discovery"}). Repo changes wait until the user exits plan mode.`,
 			};
 		}
 		// Latch: any other allowed (permitted) tool call is investigation too.
@@ -1604,7 +1576,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 			aside.push("[plan mode: read-only guard active — do NOT write/edit; design only]");
 		}
 		if (!isSubagentChild && (toolName === "ask_smart_plan" || toolName.startsWith("plan_"))) {
-			const current = displayPhase(ctx.cwd);
+			const current = ownedPhase(ctx.cwd);
 			if (current) {
 				const snapshot = buildPhaseSnapshot(ctx, current);
 				aside.push(nextActionHint(current.phase, snapshot));
@@ -1643,8 +1615,10 @@ export default function planGuard(pi: ExtensionAPI): void {
 		// GAP FIX: an empty store (no goal ever named) must NOT bail here — that
 		// is exactly the field-failure scenario (a model that never enters the
 		// machine at all). Null resolves to phase "discovery", same as every
-		// other null-current call site.
-		const current = displayPhase(ctx.cwd);
+		// other null-current call site. Resolving through ownership is what arms
+		// the anti-prose floor for an unclaimed session: execute is the one phase
+		// exempt from it, and it must never be inherited from another session.
+		const current = ownedPhase(ctx.cwd);
 		const phase = current?.phase ?? "discovery";
 		const assistant = lastTurn.message;
 		if (assistant.role !== "assistant") return;
@@ -1703,7 +1677,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 	// full phase prompt out of band.
 	pi.on("session_compact", (_event, ctx) => {
 		if (!enabled || isSubagentChild) return;
-		const current = displayPhase(ctx.cwd);
+		const current = ownedPhase(ctx.cwd);
 		if (!current) return;
 		const snapshot = buildPhaseSnapshot(ctx, current);
 		const hint = nextActionHint(current.phase, snapshot);
@@ -1752,9 +1726,10 @@ export default function planGuard(pi: ExtensionAPI): void {
 		}
 		enabled = restored?.enabled ?? false;
 		// The goal binding rides the SAME transcript entry as the guard flag, so
-		// a reload/resume/fork resumes acting on the goal this session owned. A
-		// pre-upgrade transcript carries none, leaving sessionGoal undefined and
-		// the resolution on its historical active.txt fallback.
+		// a reload/resume/fork resumes acting on the goal this session owned —
+		// restoration, never adoption. A pre-upgrade transcript carries none,
+		// leaving sessionGoal undefined: that session owns nothing and is driven
+		// as discovery, exactly like any other session without a claim.
 		sessionGoal = restored?.goal ? { cwd: ctx.cwd, goal: restored.goal } : undefined;
 		// A restored session may have persisted a tool name that no longer exists
 		// (e.g. plan_approve, removed in 0.10.0) — intersect against the

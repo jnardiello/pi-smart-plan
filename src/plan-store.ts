@@ -1031,14 +1031,13 @@ export function persistApproved(cwd: string, goal: string): string {
 	return dest;
 }
 
-/** Names of ACTIVE goals already approved in the durable store (no re-confirm). */
-export function approvedGoals(cwd: string): string[] {
-	const approved = join(approvedRoot(), repoSlug(cwd));
-	const goals: string[] = [];
-	for (const name of listGoalDirs(storeRoot(cwd))) {
-		if (name !== "done" && existsSync(join(approved, name))) goals.push(name);
-	}
-	return goals;
+/** True when GOAL is still ACTIVE and already approved in the durable store.
+ * Deliberately takes the goal rather than returning every approved goal in the
+ * repo: exit authorization is per-session, and a repo-wide list would let one
+ * session release the guard on another session's plan. */
+export function isApprovedGoal(cwd: string, goal: string): boolean {
+	if (goal === "done" || !listGoalDirs(storeRoot(cwd)).includes(goal)) return false;
+	return existsSync(join(approvedRoot(), repoSlug(cwd), goal));
 }
 
 /** Executable DoD commands of a goal's plan (mechanical delivery gate). */
