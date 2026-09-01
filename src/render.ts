@@ -9,7 +9,7 @@
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { Phase } from "./plan-validate.ts";
-import { PHASE_PROMPTS } from "./prompts.ts";
+import { PHASE_CAPTIONS, PHASE_PROMPTS } from "./prompts.ts";
 import type { PlanView, PlanViewTask } from "./plan-store.ts";
 
 /** Structural theme contract these renderers depend on — the same {fg, bold}
@@ -44,6 +44,22 @@ function makeLineBuilders(theme: PanelTheme, width: number): { bar: string; line
 	return { bar, line, trunc };
 }
 
+/** Inline markdown for the HLD body, in the same hand-styled spirit as
+ * renderHldBody: `**b**`/`__b__` bold, `` `c` `` code and `*i*`/`_i_` italic
+ * lose their markers (code/italic stay unstyled — PanelTheme names no color
+ * for either). Only balanced, non-empty, non-space-hugging pairs match, so a
+ * lone `*` or `a * b * c` survives verbatim; `_` pairs additionally require
+ * non-word neighbours so `snake_case_name` is left alone. */
+function renderInlineMarkdown(text: string, bold: (value: string) => string): string {
+	const pattern = /`([^`\n]+)`|\*\*(\S|\S[^\n]*?\S)\*\*|(?<!\w)__(\S|\S[^\n]*?\S)__(?!\w)|\*(\S|\S[^\n]*?\S)\*|(?<!\w)_(\S|\S[^\n]*?\S)_(?!\w)/g;
+	return text.replace(pattern, (_match, code, starBold, underBold, starItalic, underItalic) => {
+		if (code !== undefined) return code;
+		if (starBold !== undefined) return bold(starBold);
+		if (underBold !== undefined) return bold(underBold);
+		return starItalic ?? underItalic;
+	});
+}
+
 /** HLD body fallback. pi-tui's `Markdown` component needs `getMarkdownTheme()`,
  * but that function reads pi's process-global theme singleton instead of the
  * `theme` instance handed to this (or any) entry renderer — wiring it in
@@ -61,15 +77,17 @@ function renderHldBody(hld: string, theme: PanelTheme, line: (content?: string) 
 		if (!text) continue;
 		const heading = text.match(/^#{1,6}\s+(.*)$/);
 		if (heading) {
-			lines.push(...line(theme.fg("mdHeading", theme.bold(heading[1]))));
+			// Headings bold the whole row, so inline bold must be a no-op here:
+			// a nested bold's reset would un-bold the rest of the heading.
+			lines.push(...line(theme.fg("mdHeading", theme.bold(renderInlineMarkdown(heading[1], (value) => value)))));
 			continue;
 		}
 		const bullet = text.match(/^[-*•]\s+(.*)$/);
 		if (bullet) {
-			lines.push(...line(`${theme.fg("mdListBullet", "•")} ${theme.fg("text", bullet[1])}`));
+			lines.push(...line(`${theme.fg("mdListBullet", "•")} ${theme.fg("text", renderInlineMarkdown(bullet[1], (value) => theme.bold(value)))}`));
 			continue;
 		}
-		lines.push(...line(theme.fg("text", text)));
+		lines.push(...line(theme.fg("text", renderInlineMarkdown(text, (value) => theme.bold(value)))));
 	}
 	return lines;
 }
@@ -212,13 +230,6 @@ export function phaseMissionLine(phase: Phase): string {
 	return match ? match[0] : `phase ${phase}`;
 }
 
-/** Strip the "LOCAL MISSION:" label so a mission line reads naturally inline
- * (the live working message, tool result one-liners) instead of restating
- * the prompt tag. */
-export function stripLocalMission(line: string): string {
-	return line.replace(/^LOCAL MISSION:\s*/, "");
-}
-
 /** plan_task_update's renderCall verb per status — "claimed"/"done" read more
  * naturally in a one-liner than the raw enum values (pending/blocked pass
  * through unchanged). */
@@ -309,11 +320,7 @@ export const toolRenderers: Record<string, { renderCall: (...args: any[]) => Tex
 			if (prelude) return prelude;
 			const details = result.details as { phase?: Phase; declined?: boolean; released?: boolean } | undefined;
 			if (details?.phase) {
-				// Budget leaves room for the "→ <phase> — " prefix and an optional
-				// " (postponed)"/" (guard released)" suffix so the collapsed line
-				// stays on one row at a typical 72-column width.
-				const mission = truncateToWidth(stripLocalMission(phaseMissionLine(details.phase)), 46);
-				let line = theme.fg("success", "→ ") + theme.fg("accent", theme.bold(details.phase)) + theme.fg("muted", ` — ${mission}`);
+				let line = theme.fg("success", "→ ") + theme.fg("accent", theme.bold(details.phase)) + theme.fg("muted", ` — ${PHASE_CAPTIONS[details.phase]}`);
 				if (details.declined) line += theme.fg("warning", " (postponed)");
 				else if (details.released) line += theme.fg("muted", " (guard released)");
 				return new Text(line, 0, 0);

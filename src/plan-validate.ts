@@ -229,9 +229,18 @@ export function validateTaskGraph(tasks: PlanTask[]): ValidationIssue[] {
 
 /** Human-readable error text for PlanStoreValidationError. */
 export function validationErrorMessage(issues: ValidationIssue[]): string {
+	// Gate the flat-record shape on the missing-done cause specifically: nested
+	// per-task metadata is the common self-inflicted shape the model can't
+	// guess its way out of, and tutorial noise on unrelated rejections would
+	// blur the actual diagnostics above.
+	const hasMissingDone = issues.some((issue) => issue.message.includes('missing "done:"'));
+	const flatRecordNote = hasMissingDone
+		? "\nExpected flat record — per-task fields (deps/owns/done) must be SIBLING lines directly under the header, NOT nested sub-bullets:\n- [ ] T1: short title\n  deps: []\n  owns: [src/]\n  done: echo ok"
+		: "";
 	return (
 		"plan rejected by DAG validation — fix and re-save:\n" +
-		issues.map((issue) => `- ${issue.task ? `${issue.task}: ` : ""}${issue.message}`).join("\n")
+		issues.map((issue) => `- ${issue.task ? `${issue.task}: ` : ""}${issue.message}`).join("\n") +
+		flatRecordNote
 	);
 }
 

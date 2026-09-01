@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAbandonGraceMs, hasPendingAbandon } from "./abandon.ts";
 import {
 	applyWavesSection,
 	buildWavesSection,
@@ -58,8 +59,10 @@ function repoSlug(cwd: string): string {
 }
 
 /** Root of this repo's store: <tmpdir>/pi-smart-plan-<uid>/<repo-slug>.
- * Per-user subdir keeps plans private even though the parent is world-writable. */
-function storeRoot(cwd: string): string {
+ * Per-user subdir keeps plans private even though the parent is world-writable.
+ * Exported as a pure helper for the live watcher (src/live-watch.ts), which
+ * stat-polls this directory; callers must not surface it to the model. */
+export function storeRoot(cwd: string): string {
 	const uid = typeof process.getuid === "function" ? process.getuid() : 0;
 	return join(tmpdir(), `pi-smart-plan-${uid}`, repoSlug(cwd));
 }
@@ -99,9 +102,43 @@ function readActivePointer(cwd: string): string {
 	return readOptional(activePointerPath(cwd)).trim();
 }
 
-/** Path of the abandon-grace tombstone at the repo-slug store root. */
-function tombstonePath(cwd: string): string {
+/** Path of a goal's abandon-grace tombstone, INSIDE the goal's own directory.
+ * Per goal, never per repo: two pi sessions on the same repo abandon their own
+ * goals independently, and a repo-wide slot would let one session's tombstone
+ * overwrite the other's — purging a plan whose grace window had not elapsed. */
+function tombstonePath(cwd: string, goal: string): string {
+	return join(activeGoalDir(cwd, goal), "abandoned.txt");
+}
+
+/** Pre-per-goal tombstone position (store root). Only ever read + cleaned up:
+ * a file here was written by a process from an older version, so its owner is
+ * gone by definition and purgeTombstone resolves it age-agnostically. */
+function legacyTombstonePath(cwd: string): string {
 	return join(storeRoot(cwd), "abandoned.txt");
+}
+
+/** Goals THIS process tombstoned, per cwd, in write order. A tombstone is
+ * "ours" only in the process that wrote it, which is what lets purgeTombstone
+ * tell an own tombstone whose owner already resolved it (grace timer fired, or
+ * the fresh-activation sweep that tombstones and purges in one breath) from a
+ * tombstone another RUNNING session is still counting down on. */
+const ownTombstones = new Map<string, string[]>();
+
+function noteOwnTombstone(cwd: string, goal: string): void {
+	const owned = ownTombstones.get(cwd) ?? [];
+	ownTombstones.set(cwd, [...owned.filter((g) => g !== goal), goal]);
+}
+
+function forgetOwnTombstone(cwd: string, goal: string): void {
+	const owned = (ownTombstones.get(cwd) ?? []).filter((g) => g !== goal);
+	if (owned.length) ownTombstones.set(cwd, owned);
+	else ownTombstones.delete(cwd);
+}
+
+/** Goals this process tombstoned for `cwd` that still have a tombstone on
+ * disk, oldest first. */
+function ownTombstonedGoals(cwd: string): string[] {
+	return (ownTombstones.get(cwd) ?? []).filter((goal) => existsSync(tombstonePath(cwd, goal)));
 }
 
 /** Goal slugs come from the model — reject anything but kebab-case before it
@@ -519,19 +556,25 @@ export function completeGoal(cwd: string, goal: string): boolean {
 }
 
 /**
- * Tombstone the currently-pointed active goal for the abandon-grace window:
- * writes abandoned.txt (`<goal>\n<epoch-ms>\n`) FIRST, then removes
- * active.txt — the pointer stops resolving immediately (currentPhase → null)
- * while the goal dir itself is left untouched for the grace period. Returns
- * the tombstoned goal, or null when active.txt is absent or names a goal
- * whose directory no longer exists (nothing to tombstone).
+ * Tombstone a goal for the abandon-grace window: writes the goal's own
+ * abandoned.txt (`<goal>\n<epoch-ms>\n`, inside <root>/<goal>/) FIRST, then
+ * removes active.txt — the pointer stops resolving immediately (currentPhase →
+ * null) while the goal dir itself is left untouched for the grace period.
+ * Returns the tombstoned goal, or null when there is nothing to tombstone (no
+ * goal resolved, or its directory no longer exists).
+ *
+ * `goal` names the session-owned goal to abandon; omitted, it falls back to
+ * whatever active.txt points at (single-session behavior). The pointer is
+ * cleared only when it actually names the tombstoned goal, so a session
+ * abandoning ITS goal never blanks a pointer another session just re-pinned.
  */
-export function tombstoneActiveGoal(cwd: string): string | null {
-	const goal = readActivePointer(cwd);
-	if (!goal || !existsSync(activeGoalDir(cwd, goal))) return null;
-	writeFileSync(tombstonePath(cwd), `${goal}\n${Date.now()}\n`, "utf8");
-	rmSync(activePointerPath(cwd), { force: true });
-	return goal;
+export function tombstoneActiveGoal(cwd: string, goal?: string): string | null {
+	const target = goal ?? readActivePointer(cwd);
+	if (!target || !existsSync(activeGoalDir(cwd, target))) return null;
+	writeFileSync(tombstonePath(cwd, target), `${target}\n${Date.now()}\n`, "utf8");
+	noteOwnTombstone(cwd, target);
+	if (readActivePointer(cwd) === target) rmSync(activePointerPath(cwd), { force: true });
+	return target;
 }
 
 /**
@@ -544,28 +587,44 @@ export function tombstoneActiveGoal(cwd: string): string | null {
  * written into active.txt; the tombstone is simply dropped and null
  * returned. Returns the goal the tombstone named (restored-or-kept), or
  * null when there was no tombstone or its slug failed validation.
+ *
+ * Only a tombstone THIS process wrote is restorable (or a leftover in the
+ * legacy root position): the caller reaches here after cancelling its own
+ * pending grace timer, so another session's abandoned goal must never be
+ * resurrected — and handed over — on this session's re-engagement.
  */
 export function restoreTombstonedGoal(cwd: string): string | null {
-	const tomb = readTombstone(cwd);
-	if (!tomb) return null;
-	if (!GOAL_PATTERN.test(tomb.goal) || tomb.goal === "done") {
-		rmSync(tombstonePath(cwd), { force: true });
+	const own = ownTombstonedGoals(cwd);
+	const goal = own[own.length - 1] ?? parseStamped(readOptional(legacyTombstonePath(cwd)))?.label;
+	if (!goal) return null;
+	const tombFile = own.length ? tombstonePath(cwd, goal) : legacyTombstonePath(cwd);
+	if (!GOAL_PATTERN.test(goal) || goal === "done") {
+		rmSync(tombFile, { force: true });
 		return null;
 	}
 	if (!existsSync(activePointerPath(cwd))) {
-		writeFileSync(activePointerPath(cwd), `${tomb.goal}\n`, "utf8");
+		writeFileSync(activePointerPath(cwd), `${goal}\n`, "utf8");
 	}
-	rmSync(tombstonePath(cwd), { force: true });
-	return tomb.goal;
+	rmSync(tombFile, { force: true });
+	forgetOwnTombstone(cwd, goal);
+	return goal;
 }
 
 /**
- * Resolve a pending tombstone by discarding the goal for good: removes the
- * goal directory (rm -rf), the tombstone, and the pointer if it still names
- * the same goal. Partial-state rule: if active.txt has since been re-pinned
- * to the SAME goal (e.g. a re-save during the grace window), the goal is
- * kept FOR THIS CALL — only the stale tombstone is removed, and null is
- * returned so the caller knows nothing was discarded here. That guarantee is
+ * Resolve every RESOLVABLE tombstone in the store by discarding its goal for
+ * good: removes the goal directory (rm -rf) and with it the tombstone.
+ * Tombstones are per goal, so this walks the goal dirs; a tombstone is
+ * resolvable when its owner is done with it — either this process wrote it and
+ * has no grace timer pending for this cwd any more (its timer already fired,
+ * or the fresh-activation sweep tombstoned and purged in one breath), or the
+ * grace window has elapsed with nobody resolving it (the owner died, or is
+ * another process whose timer is overdue). A tombstone that is not ours and
+ * whose grace has NOT elapsed belongs to another RUNNING session mid-grace on
+ * its own goal and is left strictly alone — that is what keeps abandoning goal
+ * X from ever touching goal Y. Partial-state rule: if active.txt has since been
+ * re-pinned to the SAME goal (e.g. a re-save during the grace window), the goal
+ * is kept FOR THIS CALL — only the stale tombstone is removed, and it is not
+ * reported as discarded. That guarantee is
  * local to the grace-timer fire path (scheduleAbandon's callback, where the
  * window's elapsed real time is the only thing that could have raced a
  * re-save): sweepStaleGoal's fresh-activation sweep (index.ts) calls this
@@ -579,33 +638,64 @@ export function restoreTombstonedGoal(cwd: string): string | null {
  * treated as corrupt and only the tombstone file itself is cleared — same
  * for a tombstone file that exists but is unparsable (see readTombstone):
  * the garbage file is removed rather than left to linger forever, and no
- * goal dir is ever touched in that case. Returns the purged goal, or null
- * when nothing was purged.
+ * goal dir is ever touched in that case. A leftover tombstone in the legacy
+ * root position is resolved age-agnostically: nothing writes there any more,
+ * so it can only come from a process that is already gone. Returns the first
+ * goal purged (callers notify per sweep, and resolving more than one goal in
+ * a single call takes two sessions dying in the same window), or null when
+ * nothing was purged.
  */
 export function purgeTombstone(cwd: string): string | null {
-	const tomb = readTombstone(cwd);
-	if (!tomb) {
-		if (existsSync(tombstonePath(cwd))) rmSync(tombstonePath(cwd), { force: true });
-		return null;
+	let purged: string | null = null;
+	const legacyFile = legacyTombstonePath(cwd);
+	if (existsSync(legacyFile)) {
+		const legacyGoal = parseStamped(readOptional(legacyFile))?.label ?? "";
+		rmSync(legacyFile, { force: true });
+		if (GOAL_PATTERN.test(legacyGoal) && legacyGoal !== "done" && readActivePointer(cwd) !== legacyGoal) {
+			rmSync(activeGoalDir(cwd, legacyGoal), { recursive: true, force: true });
+			purged = legacyGoal;
+		}
 	}
-	const { goal } = tomb;
-	if (readActivePointer(cwd) === goal) {
-		rmSync(tombstonePath(cwd), { force: true });
-		return null;
+	for (const goal of listGoalDirs(storeRoot(cwd))) {
+		if (goal === "done") continue;
+		const tombFile = tombstonePath(cwd, goal);
+		if (!existsSync(tombFile)) continue;
+		const tomb = readTombstone(cwd, goal);
+		// A corrupt tombstone, or the pointer back on the goal (partial state):
+		// drop the file and keep the goal. Neither case discards anything, so no
+		// age gate is needed for it to stay safe against another session's goal.
+		const keep = !tomb || readActivePointer(cwd) === goal;
+		if (!keep) {
+			const resolvable = ownTombstones.get(cwd)?.includes(goal) === true && !hasPendingAbandon(cwd);
+			if (!resolvable && Date.now() - tomb.at < getAbandonGraceMs()) continue;
+			if (GOAL_PATTERN.test(goal)) {
+				rmSync(activeGoalDir(cwd, goal), { recursive: true, force: true });
+				purged ??= goal;
+			}
+		}
+		rmSync(tombFile, { force: true });
+		forgetOwnTombstone(cwd, goal);
 	}
-	if (GOAL_PATTERN.test(goal) && goal !== "done") {
-		rmSync(activeGoalDir(cwd, goal), { recursive: true, force: true });
-	}
-	rmSync(tombstonePath(cwd), { force: true });
-	if (readActivePointer(cwd) === goal) rmSync(activePointerPath(cwd), { force: true });
-	return goal;
+	return purged;
 }
 
-/** Parsed content of a pending tombstone (abandoned.txt), or null when absent
- * or unparsable. */
-export function readTombstone(cwd: string): { goal: string; at: number } | null {
-	const parsed = parseStamped(readOptional(tombstonePath(cwd)));
-	return parsed ? { goal: parsed.label, at: parsed.at } : null;
+/** Parsed content of a goal's pending tombstone, or null when absent or
+ * unparsable. Without `goal`, reports the store's most recently written
+ * tombstone (legacy root position first) — a whole-store probe, not a slot. */
+export function readTombstone(cwd: string, goal?: string): { goal: string; at: number } | null {
+	if (goal) {
+		const parsed = parseStamped(readOptional(tombstonePath(cwd, goal)));
+		return parsed ? { goal, at: parsed.at } : null;
+	}
+	const legacy = parseStamped(readOptional(legacyTombstonePath(cwd)));
+	if (legacy) return { goal: legacy.label, at: legacy.at };
+	let newest: { goal: string; at: number } | null = null;
+	for (const name of listGoalDirs(storeRoot(cwd))) {
+		if (name === "done") continue;
+		const parsed = parseStamped(readOptional(tombstonePath(cwd, name)));
+		if (parsed && (!newest || parsed.at > newest.at)) newest = { goal: name, at: parsed.at };
+	}
+	return newest;
 }
 
 /**
@@ -621,40 +711,53 @@ function resolvePhase(cwd: string, goal: string): Phase {
 	return readMachinePhase(cwd, goal) ?? "discovery";
 }
 
-/** One summary line per active goal: phase, progress, ready frontier (widget/dialog). */
-export function goalSummaries(cwd: string): string[] {
+/** One summary line per active goal: phase, progress, ready frontier
+ * (widget/dialog). EVERY active goal is listed, including goals other pi
+ * sessions on the same repo are driving — `sessionGoal` only decides which
+ * line is marked with the ▸ cursor as the one THIS session acts on. */
+export function goalSummaries(cwd: string, sessionGoal?: string): string[] {
 	const root = storeRoot(cwd);
 	const lines: string[] = [];
 	for (const name of listGoalDirs(root)) {
 		if (name === "done") continue;
 		const content = readOptional(join(root, name, "plan.md"));
 		const phase = resolvePhase(cwd, name);
+		const mark = name === sessionGoal ? "▸ " : "  ";
 		const tasks = parseTasks(content);
 		if (tasks.length === 0) {
-			lines.push(`${name} [${phase}] (no tasks yet)`);
+			lines.push(`${mark}${name} [${phase}] (no tasks yet)`);
 			continue;
 		}
 		const done = tasks.filter((t) => t.done).length;
 		const ready = readyFrontier(tasks).map((t) => t.id).join(", ");
-		lines.push(`${name} [${phase}] ${done}/${tasks.length} done · ready: ${ready || "—"}`);
+		lines.push(`${mark}${name} [${phase}] ${done}/${tasks.length} done · ready: ${ready || "—"}`);
 	}
 	return lines;
 }
 
-/** Active goal driving per-turn prompt injection. Pointer-only: resolves
- * active.txt (last goal touched by a write) when it still names a live goal
- * (plan.md or phase.txt on disk); returns null otherwise — no pointer, or a
- * pointer naming a goal with neither file (e.g. purged, or the pointer was
- * just removed for a pending abandon tombstone). There is no fallback scan:
- * active.txt is the only resume path (0.10.0 was never published, so there
- * are no pre-pointer sessions to support), and inert orphan goal dirs are
- * still listed elsewhere (goalSummaries / plan_recall / plan_exit's dialog). */
-export function currentPhase(cwd: string): { goal: string; phase: Phase } | null {
-	const pointer = readActivePointer(cwd);
-	if (!pointer) return null;
-	const planPath = join(activeGoalDir(cwd, pointer), "plan.md");
-	if (!existsSync(planPath) && !existsSync(phaseTxtPath(cwd, pointer))) return null;
-	return { goal: pointer, phase: resolvePhase(cwd, pointer) };
+/** Goal driving per-turn prompt injection, the tool surface and the widget.
+ *
+ * `sessionGoal` is the goal the CALLING pi session confirmed via plan_intent;
+ * when set it wins outright, with no pointer fallback — that is what keeps two
+ * sessions on the same repo from acting on each other's goal, and what makes a
+ * session go quiet (null) once its own goal is completed or purged rather than
+ * silently inheriting whichever goal another session touched last.
+ *
+ * With no session goal the resolution is the historical pointer-only one:
+ * active.txt (last goal touched by a write), which keeps single-session and
+ * pre-upgrade transcripts behaving exactly as before. Either way the resolved
+ * goal must still name a live goal (plan.md or phase.txt on disk) and pass the
+ * slug pattern — a purged goal, a goal whose pointer was just removed for a
+ * pending abandon tombstone, or a corrupt slug all resolve to null instead of
+ * reaching a filesystem call. There is no fallback scan; inert orphan goal dirs
+ * are still listed elsewhere (goalSummaries / plan_recall / plan_exit's
+ * dialog). */
+export function currentPhase(cwd: string, sessionGoal?: string): { goal: string; phase: Phase } | null {
+	const target = sessionGoal ?? readActivePointer(cwd);
+	if (!target || !GOAL_PATTERN.test(target) || target === "done") return null;
+	const planPath = join(activeGoalDir(cwd, target), "plan.md");
+	if (!existsSync(planPath) && !existsSync(phaseTxtPath(cwd, target))) return null;
+	return { goal: target, phase: resolvePhase(cwd, target) };
 }
 
 /** Read a goal's plan.md, throwing the standard "no active plan" error when

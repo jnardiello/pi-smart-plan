@@ -25,8 +25,8 @@ import { isToolCallEventType, type ExtensionAPI, type ExtensionContext, type Tur
 import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { runAskForm, runAskFormPages, type AskQuestionInput } from "./src/ask-form.ts";
-import { GLOBAL_CONSTRAINTS, PHASE_PROMPTS, SUBAGENT_CONSTRAINTS, planBootstrapMessage } from "./src/prompts.ts";
-import { phaseMissionLine, renderIntentPanel, renderPlanPanel, stripLocalMission, toolRenderers } from "./src/render.ts";
+import { GLOBAL_CONSTRAINTS, PHASE_CAPTIONS, PHASE_PROMPTS, SUBAGENT_CONSTRAINTS, planBootstrapMessage } from "./src/prompts.ts";
+import { phaseMissionLine, renderIntentPanel, renderPlanPanel, toolRenderers } from "./src/render.ts";
 import { PHASES, type Phase } from "./src/plan-validate.ts";
 import { isReadOnlyCommand } from "./src/bash-guard.ts";
 import {
@@ -41,8 +41,9 @@ import {
 	discoveryPostIntentSteer,
 	type PhaseSnapshot,
 } from "./src/phase-machine.ts";
-import { savePlan, appendJournal, recall, approvedGoals, completeGoal, confirmIntent, currentPhase, getDoD, getPlanView, gitStagedFiles, goalExists, goalIsDone, goalSummaries, isPartiallyStaged, isPlanningPhase, journalEntriesSincePhaseStart, nextTasks, persistApproved, purgeTombstone, readIntent, readMachinePhase, readPlan, restoreTombstonedGoal, setMachinePhase, tombstoneActiveGoal, updateTaskStatus, validateGoalSlug, OBJECTIVE_MAX_LEN, PlanStoreValidationError, type PlanView } from "./src/plan-store.ts";
+import { savePlan, appendJournal, recall, approvedGoals, completeGoal, confirmIntent, currentPhase, getDoD, getPlanView, gitStagedFiles, goalExists, goalIsDone, goalSummaries, isPartiallyStaged, isPlanningPhase, journalEntriesSincePhaseStart, nextTasks, persistApproved, purgeTombstone, readIntent, readMachinePhase, readPlan, restoreTombstonedGoal, setMachinePhase, storeRoot, tombstoneActiveGoal, updateTaskStatus, validateGoalSlug, OBJECTIVE_MAX_LEN, PlanStoreValidationError, type PlanView } from "./src/plan-store.ts";
 import { cancelAbandon, getAbandonGraceMs, scheduleAbandon } from "./src/abandon.ts";
+import { startLiveWatch } from "./src/live-watch.ts";
 
 const STORE_KEY = "plan-guard";
 const STATUS_KEY = "plan-guard";
@@ -120,7 +121,7 @@ const CHILD_MODE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
  * needed here (the phase-machine module stays the single source of truth). */
 function phaseAllowedTools(ctx: { cwd: string }): ReadonlySet<string> {
 	if (isSubagentChild) return CHILD_MODE_ALLOWED_TOOLS;
-	const current = currentPhase(ctx.cwd);
+	const current = displayPhase(ctx.cwd);
 	const phase = current?.phase ?? "discovery";
 	return PHASE_ALLOWED_TOOLS[phase];
 }
@@ -172,11 +173,17 @@ function intentGuardViolation(cwd: string, goal: string): string | undefined {
  * post-discovery / already done). Run identically before the form opens and
  * again (F6) right before confirmIntent writes — both call sites stay, only
  * the duplicated check logic is shared here. Returns the refuse()-shaped
- * result, or undefined when the goal is confirmable. */
+ * result, or undefined when the goal is confirmable.
+ *
+ * The goal-switch lock is deliberately read off `sessionGoal` alone, never
+ * the shared active.txt pointer: "one active goal per session" means the
+ * session that already claimed a goal, so a SECOND pi session on the same
+ * repo can still start its own plan while the first one is mid-planning. */
 function intentRefusal(cwd: string, goal: string): ReturnType<typeof refuse> | undefined {
-	const current = currentPhase(cwd);
-	if (current && current.goal !== goal && isPlanningPhase(current.phase)) {
-		return refuse(`one active goal per session — complete or abandon "${current.goal}" first`);
+	const claimed = ownedGoal(cwd);
+	const owned = claimed ? currentPhase(cwd, claimed) : null;
+	if (owned && owned.goal !== goal && isPlanningPhase(owned.phase)) {
+		return refuse(`one active goal per session — complete or abandon "${owned.goal}" first`);
 	}
 	const violation = intentGuardViolation(cwd, goal);
 	if (violation) return refuse(violation);
@@ -201,6 +208,58 @@ function pickLabel(answer: unknown): string | undefined {
 }
 
 let enabled = false;
+
+/** The goal THIS session owns — set when this session confirms an objective
+ * via plan_intent, cleared when it completes, abandons or purges that goal.
+ * Module-level state is per-session by construction (one extension process
+ * per session), exactly like `enabled`; it is persisted into the session
+ * transcript alongside the guard flag so a reload/resume restores it.
+ *
+ * The store's active.txt pointer is repo-wide and shared by every session on
+ * the same repo, so it cannot answer "which goal does THIS session act on".
+ * This does: undefined means the session has not claimed a goal and falls
+ * back to the shared pointer (single-session behavior, unchanged).
+ *
+ * The cwd is part of the binding because a goal slug only means anything
+ * inside its own repo store — a goal claimed under one cwd must never
+ * resolve against another's.
+ *
+ * `adopted` marks a claim the session took by acting on the pointer rather
+ * than by the owner confirming an objective (see adoptPhase): it owns the goal
+ * for every purpose here, but it is re-derived from the pointer on the next
+ * user-initiated mutating call, so a single session that moves on to another
+ * goal follows the pointer exactly as it did before claims existed. An
+ * owner-confirmed claim is never re-derived. */
+let sessionGoal: { cwd: string; goal: string; adopted?: boolean } | undefined;
+
+/** The goal this session has claimed under `cwd`, or undefined. */
+function ownedGoal(cwd: string): string | undefined {
+	return sessionGoal?.cwd === cwd ? sessionGoal.goal : undefined;
+}
+
+/** OWNING resolution: only the goal this session has claimed, and only while
+ * that claim still resolves. Never falls back to the repo-wide pointer, so no
+ * path built on it can write, advance or destroy a goal this session does not
+ * own. Every mutating and every automatic path resolves through here.
+ *
+ * A claim on a goal that no longer resolves (completed, abandoned or purged by
+ * another session) yields null — the session owns nothing — but the claim
+ * itself is deliberately NOT cleared: clearing it would make the session
+ * indistinguishable from one that never claimed anything, and adoption would
+ * then hand it another session's goal. */
+function ownedPhase(cwd: string): { goal: string; phase: Phase } | null {
+	const claimed = ownedGoal(cwd);
+	return claimed ? currentPhase(cwd, claimed) : null;
+}
+
+/** DISPLAY resolution: the owned goal, otherwise the repo-wide pointer. The
+ * fallback is legitimate here and only here — an unclaimed session is meant to
+ * keep SEEING what other sessions on the same repo are planning. Read paths
+ * only: tool surface, prompt injection, widget, status line, summaries and
+ * message text. Anything that mutates or destroys state uses ownedPhase. */
+function displayPhase(cwd: string): { goal: string; phase: Phase } | null {
+	return ownedPhase(cwd) ?? currentPhase(cwd);
+}
 
 /** True when this extension instance runs inside a pi-subagents child that
  * inherited the parent's plan mode via PI_SMART_PLAN. Such children are
@@ -321,13 +380,13 @@ function buildStagedPreflight(staged: { code: string; path: string }[]): string 
 	return lines.join("\n");
 }
 
-/** Live working-message text for a phase — the same LOCAL MISSION line the
- * model itself is briefed with, minus its label, so the owner sees what's
- * happening without reading the raw prompt tag. Set at every transitionPhase
- * and on plan-mode activation; pi never resets setWorkingMessage on its own,
- * so every enable/disable path pairs a set with an explicit reset. */
+/** Live working-message text for a phase — the short owner-facing caption,
+ * not the model's LOCAL MISSION text (far too long for a status line). Set at
+ * every transitionPhase and on plan-mode activation; pi never resets
+ * setWorkingMessage on its own, so every enable/disable path pairs a set with
+ * an explicit reset. */
 function phaseWorkingMessage(phase: Phase): string {
-	return `◈ plan · ${phase} — ${stripLocalMission(phaseMissionLine(phase))}`;
+	return `◈ plan · ${phase} — ${PHASE_CAPTIONS[phase]}`;
 }
 
 /** Deliver the Gate-2 authorization + execute kickoff on a FRESH turn (same
@@ -381,12 +440,15 @@ function refreshWidget(ctx: ExtensionContext): void {
 	}
 	ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => {
 		const lines: string[] = [];
-		const current = currentPhase(ctx.cwd)?.phase ?? "discovery";
+		const own = displayPhase(ctx.cwd);
+		const current = own?.phase ?? "discovery";
 		lines.push(theme.fg("accent", theme.bold("◈ PLAN MODE")) + theme.fg("muted", " · read-only"));
 		const usage = ctx.getContextUsage();
 		const usageText = usage?.percent != null ? theme.fg("muted", ` · ctx ${Math.round(usage.percent)}%`) : "";
 		lines.push(`${buildHeatBar(current)}  ${theme.fg("accent", theme.bold(current))}${usageText}`);
-		const goals = goalSummaries(ctx.cwd);
+		// Every active goal in the repo stays listed — including goals other
+		// sessions are driving — with a ▸ cursor on the one this session acts on.
+		const goals = goalSummaries(ctx.cwd, own?.goal);
 		for (const goal of goals) lines.push(theme.fg("muted", `  ${goal}`));
 		if (current === "discovery" && goals.length === 0) {
 			lines.push(theme.fg("muted", "  → tell me what you want to design together"));
@@ -403,11 +465,11 @@ function planInjection(cwd: string): string | undefined {
 		// Subagent children under parent plan mode never run the plan workflow:
 		// drive them with a dedicated read-only exploration contract instead.
 		if (isSubagentChild) return `${GLOBAL_CONSTRAINTS}\n\n${SUBAGENT_CONSTRAINTS}`;
-		const current = currentPhase(cwd);
+		const current = displayPhase(cwd);
 		const phase = current?.phase ?? "discovery";
 		return `${GLOBAL_CONSTRAINTS}\n\n${PHASE_PROMPTS[phase]}`;
 	}
-	const current = currentPhase(cwd);
+	const current = displayPhase(cwd);
 	if (current?.phase === "execute") return `${GLOBAL_CONSTRAINTS}\n\n${PHASE_PROMPTS.execute}`;
 	return undefined;
 }
@@ -416,32 +478,43 @@ function planInjection(cwd: string): string | undefined {
  * timer) and session_start's `--plan` flag branch — never by a plain session
  * resume. Purges any tombstone left behind by a killed process (age-agnostic:
  * a tombstone surviving to a fresh activation always means a dead process or
- * a lapsed grace, never a live in-process timer). Then the H1 sweep: if
- * active.txt itself still points at a goal stuck mid-planning with no
- * tombstone (kill-while-planning, no grace ever armed), tombstone-and-purge
- * it immediately so a fresh activation always starts clean. Returns every
- * goal actually discarded by this sweep (leftover-tombstone purge and/or the
- * H1 tombstone-and-purge — usually at most one, but both CAN fire in the same
- * call) so the caller can notify the owner, same as every other discard
- * path. */
+ * a lapsed grace, never a live in-process timer). Then the H1 sweep: if the
+ * goal THIS session owns still names a goal stuck mid-planning with no
+ * tombstone (kill-while-planning, no grace ever armed), tombstone-and-purge it
+ * immediately so a fresh activation always starts clean. The sweep is
+ * automatic and destructive, so it resolves through ownedPhase alone: a
+ * session that has claimed nothing sweeps nothing, and can never discard a
+ * plan another session on the same repo is driving. Returns
+ * every goal actually discarded by this sweep (leftover-tombstone purge
+ * and/or the H1 tombstone-and-purge — usually at most one, but both CAN fire
+ * in the same call) so the caller can notify the owner, same as every other
+ * discard path. */
 function sweepStaleGoal(cwd: string): string[] {
 	const purged: string[] = [];
 	const leftover = purgeTombstone(cwd);
 	if (leftover) purged.push(leftover);
-	const pointed = currentPhase(cwd);
-	if (!pointed) return purged;
-	const machinePhase = readMachinePhase(cwd, pointed.goal) ?? "discovery";
+	const owned = ownedPhase(cwd);
+	if (!owned) return purged;
+	const machinePhase = readMachinePhase(cwd, owned.goal) ?? "discovery";
 	if (isPlanningPhase(machinePhase)) {
-		tombstoneActiveGoal(cwd);
+		tombstoneActiveGoal(cwd, owned.goal);
 		const swept = purgeTombstone(cwd);
 		if (swept) purged.push(swept);
 	}
+	// A discarded goal is no longer this session's to act on. Both callers
+	// persist the guard state right after, so the transcript stays in sync.
+	const claimed = ownedGoal(cwd);
+	if (claimed && purged.includes(claimed)) sessionGoal = undefined;
 	return purged;
 }
 
 export default function planGuard(pi: ExtensionAPI): void {
 	/** Active-tool snapshot taken on first engagement, restored on exit. */
 	let toolsBeforePlanMode: string[] | undefined;
+
+	/** Stops the store poller that keeps the widget live against other
+	 * sessions' writes; undefined while no poller is running. */
+	let stopLiveWatch: (() => void) | undefined;
 
 	/** Assemble the PhaseSnapshot the phase machine's deliverable checks need,
 	 * from the store (plan content + journal-since-phase-start) and session
@@ -533,6 +606,63 @@ export default function planGuard(pi: ExtensionAPI): void {
 		ctx.ui.setWorkingMessage(phaseWorkingMessage(to));
 	}
 
+	/** Persist guard flag + owned goal into the session transcript, the single
+	 * mechanism session_start reads back on reload/resume/fork. `tools` is a
+	 * parameter rather than a read of toolsBeforePlanMode because the
+	 * `--plan` activation path deliberately persists no tool snapshot. */
+	function persistGuardState(tools: string[] | undefined): void {
+		pi.appendEntry(STORE_KEY, { enabled, tools, goal: sessionGoal?.goal });
+	}
+
+	/** Claim (or release) the goal this session acts on, persisting it so a
+	 * reload/resume restores the same binding. */
+	function setSessionGoal(cwd: string, goal: string | undefined, adopted = false): void {
+		sessionGoal = goal ? { cwd, goal, adopted } : undefined;
+		persistGuardState(toolsBeforePlanMode);
+	}
+
+	/** Owning resolution for USER-INITIATED mutating tool calls (plan_advance,
+	 * the owner gate). An owner-confirmed claim resolves exactly like ownedPhase
+	 * — including to null once it goes dead, so a session never silently takes
+	 * over the goal another session moved the pointer to. With no claim, or with
+	 * a previously adopted one, the pointer's goal is adopted here and now: a
+	 * single session driving the store keeps working exactly as before, and the
+	 * goal it acts on becomes explicit state instead of an implicit fallback.
+	 *
+	 * Only user-initiated tool calls reach this. Sweep, tombstone and every other
+	 * automatic path resolve through ownedPhase and adopt nothing. */
+	function adoptPhase(cwd: string): { goal: string; phase: Phase } | null {
+		if (ownedGoal(cwd) && sessionGoal?.adopted !== true) return ownedPhase(cwd);
+		const pointed = currentPhase(cwd);
+		if (pointed && pointed.goal !== ownedGoal(cwd)) setSessionGoal(cwd, pointed.goal, true);
+		return pointed ?? ownedPhase(cwd);
+	}
+
+	/** adoptPhase's rule for the four tools that name their goal as a PARAMETER
+	 * (plan_save, plan_task_update, plan_verify, plan_complete): taken as given,
+	 * the parameter let any session write to, tick or complete another session's
+	 * plan just by naming it. An owner-confirmed claim on a live OTHER goal
+	 * refuses; anything else adopts the named goal, so a single session (and a
+	 * subagent child, which owns nothing and never persists a claim) keeps
+	 * working exactly as before.
+	 *
+	 * Adoption is conditional on the goal actually resolving, so a typo or a
+	 * first plan_save on a not-yet-created goal never leaves the session
+	 * claiming a goal that does not exist — the tool's own error stands. */
+	function notOwnedRefusal(cwd: string, tool: string, goal: string): ReturnType<typeof refuse> | undefined {
+		if (isSubagentChild) return undefined;
+		const owned = ownedPhase(cwd);
+		if (owned?.goal === goal) return undefined;
+		if (owned && sessionGoal?.adopted !== true) {
+			return refuse(`${tool} blocked — this session owns "${owned.goal}", not "${goal}"; complete or abandon "${owned.goal}" first.`, {
+				goal,
+				owned: owned.goal,
+			});
+		}
+		if (currentPhase(cwd, goal)) setSessionGoal(cwd, goal, true);
+		return undefined;
+	}
+
 	function set(ctx: ExtensionContext, next: boolean, note: string, type: "info" | "warning"): void {
 		if (!next) {
 			// Abandon-on-exit: toggling off mid-planning tombstones the active
@@ -540,12 +670,16 @@ export default function planGuard(pi: ExtensionAPI): void {
 			// restores it. Gate 2's release is excluded automatically: it calls
 			// transitionPhase(…, "execute") immediately before set(false), so
 			// isPlanningPhase is already false by the time this check runs.
-			const pointed = currentPhase(ctx.cwd);
-			if (pointed) {
-				const machinePhase = readMachinePhase(ctx.cwd, pointed.goal) ?? "discovery";
+			// Tombstone THIS session's goal by name — never whatever active.txt
+			// happens to point at, which may belong to another session on the same
+			// repo. With nothing claimed there is nothing to abandon.
+			const owned = ownedPhase(ctx.cwd);
+			if (owned) {
+				const machinePhase = readMachinePhase(ctx.cwd, owned.goal) ?? "discovery";
 				if (isPlanningPhase(machinePhase)) {
-					const goal = tombstoneActiveGoal(ctx.cwd);
+					const goal = tombstoneActiveGoal(ctx.cwd, owned.goal);
 					if (goal) {
+						sessionGoal = undefined;
 						scheduleAbandon(ctx.cwd, () => {
 							purgeTombstone(ctx.cwd);
 						});
@@ -556,7 +690,12 @@ export default function planGuard(pi: ExtensionAPI): void {
 			}
 		} else if (cancelAbandon(ctx.cwd)) {
 			const goal = restoreTombstonedGoal(ctx.cwd);
-			if (goal) ctx.ui.notify(`plan '${goal}' kept`, "info");
+			if (goal) {
+				// Re-engaging within the grace window hands the goal back to the
+				// session that tombstoned it.
+				sessionGoal = { cwd: ctx.cwd, goal };
+				ctx.ui.notify(`plan '${goal}' kept`, "info");
+			}
 		} else {
 			// No pending grace timer for THIS cwd: purge any leftover tombstone
 			// from a killed process, then the H1 sweep for a stale planning goal
@@ -583,7 +722,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 			// own between turns — restore its own default explicitly.
 			ctx.ui.setWorkingMessage();
 		}
-		pi.appendEntry(STORE_KEY, { enabled, tools: toolsBeforePlanMode }); // persist for reload/resume
+		persistGuardState(toolsBeforePlanMode);
 		syncStatus(ctx);
 		refreshWidget(ctx);
 		ctx.ui.notify(note, type);
@@ -738,7 +877,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 				return refuse("Cannot exit plan mode: no interactive UI is available for user confirmation, so plan mode stays active.", { enabled });
 			}
 			const approved = approvedGoals(ctx.cwd);
-			const summaries = goalSummaries(ctx.cwd);
+			const summaries = goalSummaries(ctx.cwd, displayPhase(ctx.cwd)?.goal);
 			const context = summaries.length > 0
 				? `\n\nActive plans:\n${summaries.map((line) => `• ${line}`).join("\n")}`
 				: "\n\nWARNING: no plan has been saved yet (nothing written via plan_save).";
@@ -778,7 +917,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 			"Show a custom form: tabs, a human briefing pane, and an inline note when no option fits. Question sets larger than 4 are auto-paged into sequential forms (4 per page, answers aggregated in order); if the owner cancels a later page the remaining questions are reported as unanswered and MUST be re-asked — never assumed.",
 		promptSnippet: "ask_smart_plan: ask the user questions before continuing",
 		promptGuidelines: [
-			"Use ask_smart_plan for structured user decisions. Always fill detail with a plain-language briefing (context, facts, consequences; no jargon, no assumed prior turns). Fill each option preview with what happens if that option is chosen. Never invent an answer. Every form automatically ends with a built-in \"None of the above\" option plus optional note — never add your own equivalent option.",
+			"Use ask_smart_plan for structured user decisions. Always fill detail with a plain-language briefing (context, facts, consequences; no jargon, no assumed prior turns). Fill each option preview with what happens if that option is chosen. Write detail and every option description/preview in the language the owner is writing in (infer it from the conversation; default to English when unclear). Never invent an answer. Every form automatically ends with a built-in \"None of the above\" option plus optional note — never add your own equivalent option.",
 			"Questions beyond 4 are presented as sequential pages on your side — unanswered questions must be re-asked, never assumed.",
 		],
 		parameters: Type.Object({
@@ -789,7 +928,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 					detail: Type.Optional(
 						Type.String({
 							description:
-								"Plain-language briefing for a human: context, facts, consequences. No jargon. No assumed prior context.",
+								"Plain-language briefing for a human: context, facts, consequences. No jargon. No assumed prior context. Write it, and every option description/preview, in the language the owner is writing in (infer it from the conversation; default to English when unclear).",
 						}),
 					),
 					multiSelect: Type.Optional(Type.Boolean()),
@@ -841,7 +980,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 			}
 
 			if (gateRequested && !isSubagentChild) {
-				const current = currentPhase(ctx.cwd);
+				const current = adoptPhase(ctx.cwd);
 				if (params.releasePlanGuardOnAnswer === true && params.phaseGate !== true) {
 					if (!current || current.phase !== "review_final") {
 						return refuse("the guard is released only by the review_final gate (use phaseGate: true).");
@@ -898,7 +1037,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 		],
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			const current = currentPhase(ctx.cwd);
+			const current = adoptPhase(ctx.cwd);
 			if (!current) {
 				return refuse("plan_advance blocked — no active goal yet; establish the goal before requesting a phase advance.");
 			}
@@ -973,6 +1112,8 @@ export default function planGuard(pi: ExtensionAPI): void {
 			if (!enabled && isPlanningPhase(readMachinePhase(ctx.cwd, params.goal) ?? "discovery")) {
 				return refuse("plan mode is off — activate it first (shift+tab or /plan)");
 			}
+			const notOwned = notOwnedRefusal(ctx.cwd, "plan_save", params.goal);
+			if (notOwned) return notOwned;
 			try {
 				savePlan(ctx.cwd, params.goal, params.content);
 				refreshWidget(ctx);
@@ -1115,6 +1256,11 @@ export default function planGuard(pi: ExtensionAPI): void {
 					} catch (error) {
 						return refuse(safeError("plan_intent", error));
 					}
+					// Confirming the objective is what binds a goal to THIS session:
+					// from here its tool surface, prompt injection and widget cursor
+					// follow this goal, not the repo-wide active.txt pointer another
+					// session may repoint at any moment.
+					setSessionGoal(ctx.cwd, params.goal);
 					// Anti-leak: the pre-intent investigation flag must not survive
 					// into a later goal confirmed in the same session.
 					investigationDone = false;
@@ -1223,6 +1369,8 @@ export default function planGuard(pi: ExtensionAPI): void {
 			status: Type.String({ description: "pending | in_progress | blocked | done" }),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const notOwned = notOwnedRefusal(ctx.cwd, "plan_task_update", params.goal);
+			if (notOwned) return notOwned;
 			try {
 				const text = updateTaskStatus(ctx.cwd, params.goal, params.taskId, params.status);
 				noteCwd(ctx);
@@ -1231,7 +1379,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 				// already off by the time real task work happens (Gate 2 released
 				// it), so this is the one place execute's own progress can still
 				// reach the working line — refreshed on every task-status call.
-				if (currentPhase(ctx.cwd)?.phase === "execute") {
+				if (displayPhase(ctx.cwd)?.phase === "execute") {
 					const view = getPlanView(ctx.cwd, params.goal);
 					if (view) ctx.ui.setWorkingMessage(`◈ plan · execute — implementing (${view.doneCount}/${view.total} done)`);
 				}
@@ -1255,6 +1403,8 @@ export default function planGuard(pi: ExtensionAPI): void {
 			timeoutMs: Type.Optional(Type.Number({ description: "Per-command timeout in ms (default 120000)" })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const notOwned = notOwnedRefusal(ctx.cwd, "plan_verify", params.goal);
+			if (notOwned) return notOwned;
 			try {
 				const commands = getDoD(ctx.cwd, params.goal);
 				if (commands.length === 0) {
@@ -1326,9 +1476,14 @@ export default function planGuard(pi: ExtensionAPI): void {
 			goal: Type.String(),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const notOwned = notOwnedRefusal(ctx.cwd, "plan_complete", params.goal);
+			if (notOwned) return notOwned;
 			try {
 				const completed = completeGoal(ctx.cwd, params.goal);
-				if (completed) sessionState.completed = true;
+				if (completed) {
+					sessionState.completed = true;
+					if (ownedGoal(ctx.cwd) === params.goal) setSessionGoal(ctx.cwd, undefined);
+				}
 				refreshWidget(ctx);
 				// Mandatory reset: plan_complete always restores pi's default
 				// working message — pi never clears a custom one on its own.
@@ -1385,7 +1540,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 	pi.registerCommand("plan-status", {
 		description: "Dump plan-mode state (goals, phases, frontier) — no LLM turn",
 		handler: async (_args, ctx) => {
-			const lines = goalSummaries(ctx.cwd);
+			const lines = goalSummaries(ctx.cwd, displayPhase(ctx.cwd)?.goal);
 			ctx.ui.notify(lines.length > 0 ? lines.join("\n") : "No active goals.", enabled ? "warning" : "info");
 		},
 	});
@@ -1427,7 +1582,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 				block: true,
 				reason: isSubagentChild
 					? `Your parent session is in plan mode — "${event.toolName}" is not available to read-only subagents (exploration only: read, read-only bash, web research, nested subagent spawn). Report findings to the parent; never touch the plan store or planning tools.`
-					: `Plan mode is active — "${event.toolName}" is not available in the current phase (${currentPhase(ctx.cwd)?.phase ?? "discovery"}). Repo changes wait until the user exits plan mode.`,
+					: `Plan mode is active — "${event.toolName}" is not available in the current phase (${displayPhase(ctx.cwd)?.phase ?? "discovery"}). Repo changes wait until the user exits plan mode.`,
 			};
 		}
 		// Latch: any other allowed (permitted) tool call is investigation too.
@@ -1449,7 +1604,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 			aside.push("[plan mode: read-only guard active — do NOT write/edit; design only]");
 		}
 		if (!isSubagentChild && (toolName === "ask_smart_plan" || toolName.startsWith("plan_"))) {
-			const current = currentPhase(ctx.cwd);
+			const current = displayPhase(ctx.cwd);
 			if (current) {
 				const snapshot = buildPhaseSnapshot(ctx, current);
 				aside.push(nextActionHint(current.phase, snapshot));
@@ -1489,7 +1644,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 		// is exactly the field-failure scenario (a model that never enters the
 		// machine at all). Null resolves to phase "discovery", same as every
 		// other null-current call site.
-		const current = currentPhase(ctx.cwd);
+		const current = displayPhase(ctx.cwd);
 		const phase = current?.phase ?? "discovery";
 		const assistant = lastTurn.message;
 		if (assistant.role !== "assistant") return;
@@ -1548,7 +1703,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 	// full phase prompt out of band.
 	pi.on("session_compact", (_event, ctx) => {
 		if (!enabled || isSubagentChild) return;
-		const current = currentPhase(ctx.cwd);
+		const current = displayPhase(ctx.cwd);
 		if (!current) return;
 		const snapshot = buildPhaseSnapshot(ctx, current);
 		const hint = nextActionHint(current.phase, snapshot);
@@ -1588,14 +1743,19 @@ export default function planGuard(pi: ExtensionAPI): void {
 			pi.appendEntry("plan-guard-child", { inherited: true, depth: childDepth });
 			return;
 		}
-		let restored: { enabled: boolean; tools?: string[] } | undefined;
+		let restored: { enabled: boolean; tools?: string[]; goal?: string } | undefined;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom" && entry.customType === STORE_KEY) {
-				const data = entry.data as { enabled?: boolean; tools?: string[] } | undefined;
-				restored = { enabled: data?.enabled ?? false, tools: data?.tools };
+				const data = entry.data as { enabled?: boolean; tools?: string[]; goal?: string } | undefined;
+				restored = { enabled: data?.enabled ?? false, tools: data?.tools, goal: data?.goal };
 			}
 		}
 		enabled = restored?.enabled ?? false;
+		// The goal binding rides the SAME transcript entry as the guard flag, so
+		// a reload/resume/fork resumes acting on the goal this session owned. A
+		// pre-upgrade transcript carries none, leaving sessionGoal undefined and
+		// the resolution on its historical active.txt fallback.
+		sessionGoal = restored?.goal ? { cwd: ctx.cwd, goal: restored.goal } : undefined;
 		// A restored session may have persisted a tool name that no longer exists
 		// (e.g. plan_approve, removed in 0.10.0) — intersect against the
 		// currently-registered catalogue before it ever reaches setActiveTools.
@@ -1618,12 +1778,25 @@ export default function planGuard(pi: ExtensionAPI): void {
 					ctx.ui.notify(`stale plan '${goal}' from a previous session was discarded`, "info");
 				}
 			}
-			pi.appendEntry(STORE_KEY, { enabled, tools: undefined });
+			persistGuardState(undefined);
 		}
 		if (enabled) restrictTools(ctx);
 		else restoreTools();
 		noteCwd(ctx);
 		syncStatus(ctx);
 		refreshWidget(ctx);
+		// The widget must also reflect what OTHER sessions on this repo do (a
+		// goal completed elsewhere, a plan started elsewhere). No host event can
+		// observe that — every on(...) event fires on this session's own
+		// activity — so poll the store instead. Stopping first makes a second
+		// session_start (resume/fork replaces the session in-process) replace the
+		// watcher rather than stack a second one.
+		stopLiveWatch?.();
+		stopLiveWatch = startLiveWatch(storeRoot(ctx.cwd), () => refreshWidget(ctx));
+	});
+
+	pi.on("session_shutdown", () => {
+		stopLiveWatch?.();
+		stopLiveWatch = undefined;
 	});
 }

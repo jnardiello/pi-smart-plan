@@ -74,6 +74,19 @@ LOCAL MISSION: the approved implementation delivered and verified — every task
 - CLOSING: this phase's structured tools are plan_next, plan_save, plan_verify and ask_smart_plan — use them to close owner-facing turns; unlike every planning phase, a prose close here is legal (no harness re-generation) but should stay rare — narrate briefly and keep working. The goal closes when plan_complete validates it.`,
 } as const;
 
+/** One-line captions per phase for the TUI status line. Each states in plain
+ * language what the phase produces (at most 10 words, no markdown). They are a
+ * human glance only — the LOCAL MISSION text in PHASE_PROMPTS stays the sole
+ * source of the operational constraints injected into the model. */
+export const PHASE_CAPTIONS = {
+	discovery: "Confirms your objective and drafts the high-level design.",
+	simplify: "Trims the design to essentials and logs each cut.",
+	review_hld: "You approve or reject the trimmed design.",
+	decompose: "Breaks the design into ordered, verifiable tasks.",
+	review_final: "Final yes-or-no check before work begins.",
+	execute: "Completes the approved plan and verifies every task.",
+} as const;
+
 /** Injected INSTEAD of the phase state machine when the extension runs inside
  * a pi-subagents child under a parent session in plan mode. The child is
  * read-only exploration only: it reports findings back to the integrating

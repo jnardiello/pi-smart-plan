@@ -19,6 +19,7 @@ import {
 	readTombstone,
 	confirmIntent,
 	readIntent,
+	goalSummaries,
 	recall,
 	getPlanView,
 	gitStagedFiles,
@@ -27,11 +28,13 @@ import {
 } from "../src/plan-store.ts";
 import { PHASES } from "../src/plan-validate.ts";
 import { setAbandonGraceMs, DEFAULT_ABANDON_GRACE_MS, hasPendingAbandon, cancelAbandon } from "../src/abandon.ts";
-import { statSync, readFileSync, writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { startLiveWatch, storeSnapshot } from "../src/live-watch.ts";
+import { statSync, readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { runAskForm, normalizeAskQuestions } from "../src/ask-form.ts";
+import { renderPlanPanel } from "../src/render.ts";
 import { Value } from "typebox/value";
 
 let failures = 0;
@@ -58,6 +61,10 @@ const { cwd: CWD6, store: expectedStore6 } = makeRepo("render");
 const { cwd: CWD7, store: expectedStore7 } = makeRepo("staged-unit");
 const { cwd: CWD8, store: expectedStore8 } = makeRepo("staged-gate2");
 const { cwd: CWD9, store: expectedStore9 } = makeRepo("owns-parallel");
+const { cwd: CWD10, store: expectedStore10 } = makeRepo("session-scope");
+const { cwd: CWD11, store: expectedStore11 } = makeRepo("cross-session");
+const { cwd: CWD12, store: expectedStore12 } = makeRepo("goal-param-owned");
+const { cwd: CWD13, store: expectedStore13 } = makeRepo("goal-param-adopt");
 
 // Owner-backed objective confirmation via the REAL confirmIntent — every
 // savePlan on a fresh goal now needs one first (plan_save is mechanically
@@ -232,6 +239,7 @@ check("every extension tool registered, plan_approve/plan_present REMOVED (gates
 	["plan_exit", "plan_next", "plan_task_update", "plan_advance", "plan_verify", "ask_smart_plan", "plan_save", "plan_intent", "journal_append", "plan_recall", "plan_complete"].every((t) => registered.tools.has(t)) &&
 	!registered.tools.has("plan_approve") && !registered.tools.has("plan_present"));
 check("every lifecycle handler registered", ["tool_call", "tool_result", "before_agent_start", "session_start", "turn_end", "agent_settled", "ui_prompt_start", "ui_prompt_end", "session_compact"].every((h) => registered.handlers.has(h)));
+check("session_shutdown handler registered (tears the live store watcher down)", registered.handlers.has("session_shutdown"));
 
 console.log("\n[state machine prompt structure — one compact needles battery]");
 check("PHASE_PROMPTS keyed exactly by the canonical PHASES order", JSON.stringify(Object.keys(PHASE_PROMPTS)) === JSON.stringify([...PHASES]));
@@ -469,6 +477,26 @@ check("panel: live-checklist footer", panelText.includes("1/3 done · ready now:
 updateTaskStatus(CWD, "demo", "T2", "done");
 const panelText2 = renderPanel({ data: { goal: "demo" } }, {}, fakeTheme).render(100).join("\n");
 check("live checklist updates after completion", (panelText2.match(/☑/g) || []).length === 2 && panelText2.includes("2/3 done · ready now: T3"));
+
+// HLD inline markdown: markers never reach the rendered panel, but stray /
+// unmatched ones survive verbatim (fakeTheme.bold is identity, so a stripped
+// `**` is indistinguishable from a styled one here — which is the point).
+const inlineView = {
+	goal: "inline-md", intent: "objective", scope: "in scope", nonGoals: "out", dod: ["echo ok"],
+	hld: [
+		"# Titolo con **testo** in grassetto",
+		"Prosa con **testo** e __altro__ e `codice` e *corsivo* e _sottolineato_.",
+		"- bullet con **grassetto** e `snippet`",
+		"Stray: a * b * c e snake_case_name",
+	].join("\n"),
+	tasks: [], doneCount: 0, total: 0, frontier: [],
+};
+const inlineText = renderPlanPanel(inlineView, fakeTheme, 100).join("\n");
+check("HLD inline markdown: no raw ** / __ / backticks in rendered output", !inlineText.includes("**") && !inlineText.includes("__") && !inlineText.includes("`"));
+check("HLD inline markdown: text survives in heading, prose and bullet", inlineText.includes("Titolo con testo in grassetto") && inlineText.includes("Prosa con testo e altro e codice e corsivo e sottolineato.") && inlineText.includes("bullet con grassetto e snippet"));
+check("HLD inline markdown: stray markers survive unmangled", inlineText.includes("a * b * c") && inlineText.includes("snake_case_name"));
+const unmatchedText = renderPlanPanel({ ...inlineView, hld: "un **aperto senza chiusura e un `backtick solo" }, fakeTheme, 100).join("\n");
+check("HLD inline markdown: unmatched openers pass through verbatim", unmatchedText.includes("un **aperto senza chiusura e un `backtick solo"));
 
 console.log("\n[P2b — plan message renderer: no-goal fallback stays in English]");
 const renderPlanMessage = registered.renderers.get("smart-plan");
@@ -1059,6 +1087,12 @@ const gate1NoteReconfirm = await registered.tools.get("plan_intent").execute("id
 check("Gate 1 Reject(note): objective survives the bounce, plan_intent re-confirm is allowed (not locked)",
 	gate1NoteIntentBefore !== undefined && gate1NoteReconfirm.isError === false && readIntent(CWD, GATE1_NOTE)?.statement === "Revised objective after Gate 1 reject.");
 
+// The re-confirm above bound GATE1_NOTE to this session. A session owns one
+// goal at a time, so it must finish (or abandon) that goal through the real
+// tool before the next scenario starts a different one — plan_intent would
+// refuse the switch outright otherwise.
+await registered.tools.get("plan_complete").execute("id", { goal: GATE1_NOTE }, undefined, undefined, makeCtx());
+
 const GATE1_POSTPONE = "gate1postpone";
 await simplifyWithCutLog(GATE1_POSTPONE);
 customResult = { declined: true };
@@ -1128,6 +1162,10 @@ console.log("\n[post-HLD prose-close regeneration — discovery readiness gates 
 // resets the latch.
 await ensureGuardOff();
 await ensureGuardOn();
+// Re-engaging within the grace window handed GATE2_STAY back to this session
+// (that is what "plan kept" means), so finish it through the real tool before
+// this battery starts driving its own goals.
+await registered.tools.get("plan_complete").execute("id", { goal: GATE2_STAY }, undefined, undefined, makeCtx());
 const PROSE_INCOMPLETE = "proseincomplete";
 setMachinePhase(CWD, PROSE_INCOMPLETE, "discovery"); // goal exists, phase.txt=discovery, NO plan saved → incomplete
 sent.length = 0;
@@ -1254,6 +1292,9 @@ await fireProseRun("after guard recycle");
 check("B2 after guard off/on: steer resets to attempt 1", sent.at(-1)?.msg?.includes("closed in prose") && !sent.at(-1)?.msg?.includes("Escalation"));
 
 console.log("\n[fix-wave — B3: no steer while a blocking UI prompt is open]");
+// The guard recycle above handed FIRE_GOAL back to this session; finish it
+// through the real tool before this battery starts its own goal.
+await registered.tools.get("plan_complete").execute("id", { goal: FIRE_GOAL }, undefined, undefined, makeCtx());
 const vorm = "vormgoal";
 await toSimplify(vorm);
 const uiStart = registered.handlers.get("ui_prompt_start");
@@ -1330,6 +1371,9 @@ await ensureGuardOn();
 // Postponed gate: a prose Q&A close stays legal — "do not re-open until the
 // owner signals" must not be contradicted by the harness's own finalize-retry
 // steer (which the pure finalizeVerdict unit tests also cover for gatePostponed).
+// Re-engaging the guard restored F1_RESTART to this session; finish it through
+// the real tool before this battery starts its own goal.
+await registered.tools.get("plan_complete").execute("id", { goal: F1_RESTART }, undefined, undefined, makeCtx());
 const F3_GOAL = "f3postpone";
 await simplifyWithCutLog(F3_GOAL);
 customResult = { declined: true };
@@ -1342,6 +1386,9 @@ await ensureGuardOff();
 
 console.log("\n[F6/F7a — Gate 1 form: harness question + contract summary render; model detail demarcated behind a labeled separator]");
 await ensureGuardOn();
+// Re-engaging the guard restored F3_GOAL to this session; finish it through the
+// real tool before this battery starts its own goal.
+await registered.tools.get("plan_complete").execute("id", { goal: F3_GOAL }, undefined, undefined, makeCtx());
 const F6_GOAL = "f6separator";
 await simplifyWithCutLog(F6_GOAL);
 customResult = { declined: true };
@@ -1380,6 +1427,9 @@ await ensureGuardOff();
 
 console.log("\n[F7b — queueImplementationBriefing BUSY branch: Gate 2 queues as followUp when the session isn't idle]");
 await ensureGuardOn();
+// Re-engaging the guard restored F6_GOAL to this session; finish it through the
+// real tool before this battery starts its own goal.
+await registered.tools.get("plan_complete").execute("id", { goal: F6_GOAL }, undefined, undefined, makeCtx());
 const F7B_GATE2 = "f7bgate2";
 sent.length = 0;
 idle = false;
@@ -1401,12 +1451,32 @@ await ensureGuardOff();
 // the default again immediately after, so nothing downstream is affected.
 // ===========================================================================
 const activePointerPath4 = () => join(expectedStore4, "active.txt");
-const tombstonePath4 = () => join(expectedStore4, "abandoned.txt");
+// Tombstones live INSIDE the goal they abandon (<root>/<goal>/abandoned.txt),
+// one per goal, so this resolves to whichever tombstone the store currently
+// holds — the batteries below only ever have one pending at a time. With none
+// pending it falls back to the pre-per-goal root position, which is also where
+// abandon(f) hand-writes its dead-process leftover.
+const tombstonePath4 = () => {
+	for (const name of readdirSync(expectedStore4, { withFileTypes: true })) {
+		if (!name.isDirectory()) continue;
+		const candidate = join(expectedStore4, name.name, "abandoned.txt");
+		if (existsSync(candidate)) return candidate;
+	}
+	return join(expectedStore4, "abandoned.txt");
+};
 const goalDirPath4 = (goal) => join(expectedStore4, goal);
 
 console.log("\n[abandon (a) — toggle-off mid-planning tombstones the goal + notifies]");
 await ensureGuardOn(makeCtx(CWD4)); // empty store — sweepStaleGoal's H1 check is a no-op (no pointer yet)
 seedIntent(CWD4, "abgoal");
+// Abandon-on-exit only ever tombstones the goal THIS session OWNS, so the
+// battery takes ownership through the real plan_intent path rather than the
+// seedIntent store shortcut (which writes intent.txt behind the session's back
+// and so is indistinguishable from another session's goal appearing).
+const abPrevCustom = customResult;
+customResult = { answers: { "Is this the objective?": "Confirm" } };
+await intentTool.execute("id", { goal: "abgoal", statement: "Abandon-battery objective." }, undefined, undefined, makeCtx(CWD4));
+customResult = abPrevCustom;
 savePlan(CWD4, "abgoal", canonicalHLD("abgoal")); // fresh goal, pinned to discovery, pointer=abgoal
 notifications.length = 0;
 await ensureGuardOff(makeCtx(CWD4));
@@ -1483,6 +1553,48 @@ check("abandon(g): purgeTombstone returns null (nothing discarded), goal kept (d
 	purgedPartial === null && readFileSync(join(goalDirPath4(PARTIALGOAL), "plan.md"), "utf8").includes("re-saved mid-grace"));
 check("abandon(g): only the stale tombstone is dropped, pointer stays intact",
 	!existsSync(tombstonePath4()) && currentPhase(CWD4)?.goal === PARTIALGOAL);
+
+console.log("\n[abandon (h) — two sessions, two goals: one session's grace fire only ever discards ITS OWN goal]");
+{
+	const { cwd: CWDH, store: storeH } = makeRepo("abandon-two-session");
+	// Session B is a SECOND pi process on the same repo: same store on disk, its
+	// own module state (its own tombstone bookkeeping and grace timer) — which is
+	// exactly what a fresh module instance models inside this one process.
+	const sessionB = await import("../src/plan-store.ts?session=b");
+	const goalDirH = (goal) => join(storeH, goal);
+	const tombH = (goal) => join(storeH, goal, "abandoned.txt");
+
+	seedIntent(CWDH, "goalx");
+	savePlan(CWDH, "goalx", canonicalHLD("goalx"));
+	seedIntent(CWDH, "goaly");
+	savePlan(CWDH, "goaly", canonicalHLD("goaly", { hld: "Design for goaly, session B's own plan." }));
+	setAbandonGraceMs(40); // local override for this battery only — restored at its end
+
+	check("abandon(h) setup: session A tombstones goalx inside goalx's OWN dir, goaly untouched",
+		tombstoneActiveGoal(CWDH, "goalx") === "goalx" && existsSync(tombH("goalx")) && !existsSync(tombH("goaly")));
+	await new Promise((resolve) => setTimeout(resolve, 60)); // A's grace window elapses
+	check("abandon(h) setup: session B then abandons goaly — A's tombstone is not overwritten, both are pending side by side",
+		sessionB.tombstoneActiveGoal(CWDH, "goaly") === "goaly" && existsSync(tombH("goalx")) && existsSync(tombH("goaly")));
+
+	const firedA = purgeTombstone(CWDH); // exactly what A's elapsed grace timer calls
+	check("abandon(h): A's grace fire discards ONLY goalx — A's own goal, resolved and reported",
+		firedA === "goalx" && !existsSync(goalDirH("goalx")));
+	check("abandon(h): goaly survives A's fire intact — dir, plan.md content and its own still-pending tombstone",
+		existsSync(goalDirH("goaly")) && existsSync(tombH("goaly")) &&
+		readFileSync(join(goalDirH("goaly"), "plan.md"), "utf8").includes("session B's own plan"));
+
+	console.log("\n[abandon (i) — killed-process cleanup survives: a goal whose owner died mid-grace is purged by a DIFFERENT session]");
+	// Session B never comes back: its tombstone stays on disk and nothing in this
+	// process ever owned it. Once the window it recorded has elapsed with nobody
+	// resolving it, the next session's sweep must still discard the goal.
+	await new Promise((resolve) => setTimeout(resolve, 60));
+	const sweptDead = purgeTombstone(CWDH);
+	check("abandon(i): another session purges the dead owner's goal once its grace has elapsed",
+		sweptDead === "goaly" && !existsSync(goalDirH("goaly")) && !existsSync(tombH("goaly")));
+	check("abandon(i): nothing leaks — no goal dirs, no pointer, no tombstone left anywhere in the store",
+		readdirSync(storeH).length === 0 && purgeTombstone(CWDH) === null);
+	setAbandonGraceMs(DEFAULT_ABANDON_GRACE_MS); // restore the suite-wide default immediately
+}
 
 // ===========================================================================
 // NEW battery — gitStagedFiles / isPartiallyStaged: pure function, real git
@@ -1839,6 +1951,206 @@ console.log("\n[V2d — ask_smart_plan / plan_intent options schema accepts bare
 	check("plan_intent.openQuestions schema accepts bare-string options (Value.Check)", Value.Check(intentSchema, intentStringOptions));
 }
 
+// ===========================================================================
+// NEW battery — session-scoped current goal + the live store watcher
+// (dedicated store: CWD10/expectedStore10, isolated so pointer/claim/snapshot
+// state is exact).
+// ===========================================================================
+console.log("\n[session-scoped goal — store resolution: an explicit goal wins, the pointer is the fallback]");
+seedIntent(CWD10, "alpha");
+savePlan(CWD10, "alpha", canonicalHLD("alpha"));
+seedIntent(CWD10, "beta");
+savePlan(CWD10, "beta", canonicalHLD("beta")); // active.txt now names beta
+check("no session goal → resolution falls back to the active.txt pointer (unchanged single-session behavior)",
+	currentPhase(CWD10)?.goal === "beta");
+check("session goal set → it wins outright over a pointer naming another goal",
+	currentPhase(CWD10, "alpha")?.goal === "alpha" && currentPhase(CWD10, "alpha")?.phase === "discovery");
+check("session goal naming a goal that no longer exists → null, never a silent fall-through to the pointer",
+	currentPhase(CWD10, "ghostgoal") === null);
+check("a corrupt session/pointer slug resolves to null instead of reaching a filesystem call",
+	currentPhase(CWD10, "../escape") === null && currentPhase(CWD10, "done") === null);
+check("goalSummaries lists every active goal, marking only the session's own with the ▸ cursor",
+	goalSummaries(CWD10, "alpha").some((l) => l.startsWith("▸ alpha [")) &&
+	goalSummaries(CWD10, "alpha").some((l) => l.startsWith("  beta [")) &&
+	goalSummaries(CWD10).every((l) => l.startsWith("  ")));
+
+console.log("\n[live watcher — fires only on a real store change]");
+check("a store root that does not exist yet snapshots as empty and never throws",
+	storeSnapshot(join(tmpdir(), "pi-smart-plan-no-such-root-xyz")) === "");
+const snapBefore = storeSnapshot(expectedStore10);
+check("re-sampling an unchanged store yields an identical snapshot", snapBefore !== "" && storeSnapshot(expectedStore10) === snapBefore);
+setMachinePhase(CWD10, "alpha", "simplify");
+check("another session's phase change is visible in the snapshot", storeSnapshot(expectedStore10) !== snapBefore);
+let watchFires = 0;
+const stopWatch = startLiveWatch(expectedStore10, () => { watchFires++; }, 10);
+await new Promise((r) => setTimeout(r, 60));
+check("no store change → the callback never fires (no repaint on a quiet store)", watchFires === 0);
+appendJournal(CWD10, "beta", "watcher probe"); // single snapshot-visible write (active.txt restamped)
+await new Promise((r) => setTimeout(r, 60));
+const firesAfterChange = watchFires;
+check("a real store change fires the callback exactly once", firesAfterChange === 1);
+await new Promise((r) => setTimeout(r, 60));
+check("a settled store stops firing again", watchFires === firesAfterChange);
+stopWatch();
+appendJournal(CWD10, "beta", "post-stop write");
+await new Promise((r) => setTimeout(r, 60));
+check("stop() halts polling — later changes fire nothing", watchFires === firesAfterChange);
+
+console.log("\n[session-scoped goal — one session: complete goal A, then legitimately start goal B]");
+await ensureGuardOn(makeCtx(CWD10));
+customResult = { answers: { "Is this the objective?": "Confirm" } };
+const sessA = await intentTool.execute("id", { goal: "sessa", statement: "Objective A." }, undefined, undefined, makeCtx(CWD10));
+const sessBBlocked = await intentTool.execute("id", { goal: "sessb", statement: "Objective B." }, undefined, undefined, makeCtx(CWD10));
+check("a session that owns goal A refuses a second goal (the lock is per-SESSION, and it does own one here)",
+	sessA.isError === false && sessBBlocked.isError === true &&
+	sessBBlocked.content[0].text === `one active goal per session — complete or abandon "sessa" first`);
+await registered.tools.get("plan_complete").execute("id", { goal: "sessa" }, undefined, undefined, makeCtx(CWD10));
+const sessBOk = await intentTool.execute("id", { goal: "sessb", statement: "Objective B." }, undefined, undefined, makeCtx(CWD10));
+check("completing goal A releases the session's claim → the SAME session can then start goal B end to end",
+	sessBOk.isError === false && readIntent(CWD10, "sessb")?.statement === "Objective B." && currentPhase(CWD10, "sessb")?.goal === "sessb");
+
+console.log("\n[session-scoped goal — a claimed goal that vanishes under the session never strands it]");
+// Exactly the cross-session race this battery exists for: another pi session on
+// the same repo completes THIS session's goal and starts its own.
+completeGoal(CWD10, "sessb");
+seedIntent(CWD10, "othersess");
+savePlan(CWD10, "othersess", canonicalHLD("othersess"));
+setMachinePhase(CWD10, "othersess", "decompose");
+const strandedInjection = await bas({ systemPrompt: "BASE" }, makeCtx(CWD10));
+check("a claim on a vanished goal is dropped → resolution falls back to the pointer instead of going dark forever",
+	strandedInjection.systemPrompt.includes("PHASE: decompose"));
+const afterVanish = await intentTool.execute("id", { goal: "sesse", statement: "Objective E." }, undefined, undefined, makeCtx(CWD10));
+check("a stale claim on a vanished goal never blocks the session from starting a new plan",
+	afterVanish.isError === false && readIntent(CWD10, "sesse")?.statement === "Objective E.");
+await ensureGuardOff(makeCtx(CWD10));
+
+// ===========================================================================
+// NEW battery — the DISPLAY/OWNING split: the active.txt fallback is legal for
+// reads, never for a path that mutates or destroys. Every check here is about
+// a session that owns NOTHING in this repo (CWD11) while another session's
+// goal sits in the store (dedicated store: CWD11/expectedStore11).
+// ===========================================================================
+console.log("\n[cross-session safety — the pointer fallback never reaches a mutating or destructive path]");
+seedIntent(CWD11, "aowner");
+savePlan(CWD11, "aowner", canonicalHLD("aowner")); // another session's goal, mid-planning at discovery, pointer=aowner
+check("cross-session setup: a foreign goal sits mid-planning with the pointer on it, this session owns nothing here",
+	currentPhase(CWD11)?.goal === "aowner" && readMachinePhase(CWD11, "aowner") === "discovery");
+
+await ensureGuardOn(makeCtx(CWD11)); // fresh activation → purgeTombstone + the H1 sweep both run
+check("(i) a session with NO claim entering plan mode sweeps NOTHING — the other session's in-progress plan survives",
+	existsSync(join(expectedStore11, "aowner")) && currentPhase(CWD11)?.goal === "aowner" &&
+	readMachinePhase(CWD11, "aowner") === "discovery" && !existsSync(join(expectedStore11, "abandoned.txt")));
+
+await ensureGuardOff(makeCtx(CWD11)); // abandon-on-exit: nothing owned → nothing to abandon
+check("(ii) a session with NO claim toggling the guard off tombstones NOTHING — pointer, tombstone and goal dir untouched",
+	!existsSync(join(expectedStore11, "abandoned.txt")) && hasPendingAbandon(CWD11) === false &&
+	currentPhase(CWD11)?.goal === "aowner" && existsSync(join(expectedStore11, "aowner")));
+
+// This session now owns its OWN goal, which another session then makes vanish.
+// A dead owner-confirmed claim resolves to null on the owning path (it must not
+// silently take over whatever the pointer moved to) while the display path
+// still falls back to the pointer — the two halves of the split, back to back.
+await ensureGuardOn(makeCtx(CWD11));
+const xsPrevCustom = customResult;
+customResult = { answers: { "Is this the objective?": "Confirm" } };
+const xsOwn = await intentTool.execute("id", { goal: "bown", statement: "This session's own objective." }, undefined, undefined, makeCtx(CWD11));
+customResult = xsPrevCustom;
+check("cross-session setup: the session confirms an objective of its own, then that goal vanishes under it", xsOwn.isError === false);
+rmSync(join(expectedStore11, "bown"), { recursive: true, force: true });
+setMachinePhase(CWD11, "aowner", "decompose");
+appendJournal(CWD11, "aowner", "the other session keeps driving its goal"); // pointer back on aowner
+const xsSees = await bas({ systemPrompt: "BASE" }, makeCtx(CWD11));
+check("(iii-display) the unclaimed session still SEES the other session's goal — injection follows the pointer",
+	xsSees.systemPrompt.includes("PHASE: decompose") &&
+	goalSummaries(CWD11).some((l) => l.includes("aowner")));
+setMachinePhase(CWD11, "aowner", "discovery"); // a phase whose advance needs no owner gate — so only ownership can block it
+const xsAdvance = await registered.tools.get("plan_advance").execute("id", {}, undefined, undefined, makeCtx(CWD11));
+check("(iii-mutate) …but it CANNOT advance that goal: isError, exact no-active-goal refusal, phase.txt untouched",
+	xsAdvance.isError === true && xsAdvance.content[0].text.includes("no active goal yet") &&
+	readMachinePhase(CWD11, "aowner") === "discovery");
+await ensureGuardOff(makeCtx(CWD11));
+check("(iii) exiting plan mode on a dead claim still tombstones nothing — the foreign goal survives the whole battery",
+	!existsSync(join(expectedStore11, "abandoned.txt")) && currentPhase(CWD11)?.goal === "aowner");
+
+// ===========================================================================
+// NEW battery — the four tools that take the goal as a PARAMETER (plan_save,
+// plan_task_update, plan_verify, plan_complete) used to act on it as given, so
+// naming another session's goal was enough to write to, tick or complete it.
+// They now resolve through the same ownership rule as plan_advance.
+// ===========================================================================
+console.log("\n[goal-parameter ownership — a session owning NOTHING adopts the named goal (single-session continuity)]");
+await ensureGuardOn(makeCtx(CWD13));
+seedIntent(CWD13, "adoptme");
+savePlan(CWD13, "adoptme", canonicalHLD("adoptme"));
+seedIntent(CWD13, "pointedelse");
+savePlan(CWD13, "pointedelse", canonicalHLD("pointedelse")); // pointer now names the OTHER goal
+check("adopt setup: this session owns nothing in this repo and the pointer names another goal",
+	currentPhase(CWD13)?.goal === "pointedelse");
+const adoptSave = await registered.tools.get("plan_save").execute("id", { goal: "adoptme", content: fullPlan("adoptme") }, undefined, undefined, makeCtx(CWD13));
+check("(ii) plan_save on a named goal succeeds with no claim — content written, no refusal",
+	adoptSave.isError === false && readFileSync(join(expectedStore13, "adoptme", "plan.md"), "utf8").includes("T2: second"));
+appendJournal(CWD13, "pointedelse", "the other session keeps driving its goal"); // pointer back off adoptme
+notifications.length = 0;
+await registered.commands.get("plan-status").handler("", makeCtx(CWD13));
+check("(ii) the named goal became this session's CLAIM — the cursor follows it, not the pointer",
+	notifications.at(-1)?.[0].includes("▸ adoptme") && notifications.at(-1)?.[0].includes("  pointedelse"));
+const adoptTask = await registered.tools.get("plan_task_update").execute("id", { goal: "adoptme", taskId: "T1", status: "in_progress" }, undefined, undefined, makeCtx(CWD13));
+const adoptVerify = await registered.tools.get("plan_verify").execute("id", { goal: "adoptme" }, undefined, undefined, makeCtx(CWD13));
+const adoptComplete = await registered.tools.get("plan_complete").execute("id", { goal: "adoptme" }, undefined, undefined, makeCtx(CWD13));
+check("(ii) the other three tools keep working on the session's own goal — task, DoD and completion all go through",
+	adoptTask.isError === false && adoptVerify.isError === false && adoptVerify.details.passed === true &&
+	adoptComplete.isError === false && adoptComplete.details.completed === true);
+
+console.log("\n[goal-parameter ownership — a session owning goal A is REFUSED on another session's goal B]");
+seedIntent(CWD12, "foreignb");
+savePlan(CWD12, "foreignb", fullPlan("foreignb")); // another session's goal, mid-planning
+const foreignPlanPath = join(expectedStore12, "foreignb", "plan.md");
+const foreignBefore = readFileSync(foreignPlanPath, "utf8");
+await ensureGuardOn(makeCtx(CWD12));
+const gpPrevCustom = customResult;
+customResult = { answers: { "Is this the objective?": "Confirm" } };
+const gpOwn = await intentTool.execute("id", { goal: "ownedaa", statement: "This session's own objective." }, undefined, undefined, makeCtx(CWD12));
+customResult = gpPrevCustom;
+check("refusal setup: this session confirms its OWN goal while the foreign one sits in the same store",
+	gpOwn.isError === false && currentPhase(CWD12, "ownedaa")?.goal === "ownedaa" && currentPhase(CWD12, "foreignb")?.goal === "foreignb");
+const xSave = await registered.tools.get("plan_save").execute("id", { goal: "foreignb", content: canonicalHLD("hijacked") }, undefined, undefined, makeCtx(CWD12));
+const xTask = await registered.tools.get("plan_task_update").execute("id", { goal: "foreignb", taskId: "T1", status: "done" }, undefined, undefined, makeCtx(CWD12));
+const xVerify = await registered.tools.get("plan_verify").execute("id", { goal: "foreignb" }, undefined, undefined, makeCtx(CWD12));
+const xComplete = await registered.tools.get("plan_complete").execute("id", { goal: "foreignb" }, undefined, undefined, makeCtx(CWD12));
+check("(i) all four goal-parameter tools refuse the foreign goal (isError on every one)",
+	xSave.isError === true && xTask.isError === true && xVerify.isError === true && xComplete.isError === true);
+check("(i) each refusal names its tool AND both goals, and points at the goal the session owns",
+	[["plan_save", xSave], ["plan_task_update", xTask], ["plan_verify", xVerify], ["plan_complete", xComplete]].every(([tool, r]) =>
+		r.content[0].text === `${tool} blocked — this session owns "ownedaa", not "foreignb"; complete or abandon "ownedaa" first.` &&
+		r.details.owned === "ownedaa" && r.details.goal === "foreignb"));
+check("(i) the foreign goal is untouched — plan.md byte-identical, still active, never moved to done/",
+	(existsSync(foreignPlanPath) ? readFileSync(foreignPlanPath, "utf8") : null) === foreignBefore &&
+	currentPhase(CWD12, "foreignb")?.goal === "foreignb" && !existsSync(join(expectedStore12, "done", "foreignb")));
+
+console.log("\n[goal-parameter ownership — a subagent child is not gated by it]");
+// A child under INHERITED plan mode never reaches these tools at all (the
+// tool_call guard blocks them outright), and a child is a fresh process with
+// no claim of its own — so the gate is bypassed for children rather than
+// letting the parent's claim leak in and refuse them.
+const gpSavedSmart = process.env.PI_SMART_PLAN;
+const gpSavedDepth = process.env.PI_SUBAGENT_DEPTH;
+const gpSavedTools = [...activeTools];
+process.env.PI_SMART_PLAN = "1";
+process.env.PI_SUBAGENT_DEPTH = "1";
+const gpChildCtx = makeCtx(CWD12, { sessionManager: { getBranch: () => [] } });
+await registered.handlers.get("session_start")(undefined, gpChildCtx);
+check("(iii) a child under inherited plan mode cannot reach the goal-parameter tools at all",
+	(await tc(toolEvent("plan_save"), gpChildCtx))?.block === true && (await tc(toolEvent("plan_task_update"), gpChildCtx))?.block === true &&
+	(await tc(toolEvent("plan_complete"), gpChildCtx))?.block === true);
+const childSave = await registered.tools.get("plan_save").execute("id", { goal: "foreignb", content: fullPlan("foreignb", { hld: "child-written marker." }) }, undefined, undefined, gpChildCtx);
+check("(iii) …and one that does call them is never refused by the parent's claim — no ownership gate in child mode",
+	childSave.isError === false && readFileSync(foreignPlanPath, "utf8").includes("child-written marker."));
+check("(iii) the child persists no claim of its own — only its own child-mode marker entry",
+	entries.at(-1)?.key === "plan-guard-child");
+if (gpSavedSmart === undefined) delete process.env.PI_SMART_PLAN; else process.env.PI_SMART_PLAN = gpSavedSmart;
+if (gpSavedDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH; else process.env.PI_SUBAGENT_DEPTH = gpSavedDepth;
+activeTools = gpSavedTools;
+
 rmSync(expectedStore, { recursive: true, force: true });
 rmSync(CWD, { recursive: true, force: true });
 rmSync(expectedStore2, { recursive: true, force: true });
@@ -1855,6 +2167,14 @@ rmSync(expectedStore7, { recursive: true, force: true });
 rmSync(CWD7, { recursive: true, force: true });
 rmSync(expectedStore8, { recursive: true, force: true });
 rmSync(CWD8, { recursive: true, force: true });
+rmSync(expectedStore10, { recursive: true, force: true });
+rmSync(CWD10, { recursive: true, force: true });
+rmSync(expectedStore11, { recursive: true, force: true });
+rmSync(CWD11, { recursive: true, force: true });
+rmSync(expectedStore12, { recursive: true, force: true });
+rmSync(CWD12, { recursive: true, force: true });
+rmSync(expectedStore13, { recursive: true, force: true });
+rmSync(CWD13, { recursive: true, force: true });
 rmSync(expectedStore9, { recursive: true, force: true });
 rmSync(CWD9, { recursive: true, force: true });
 console.log(failures === 0 ? "\nALL CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
