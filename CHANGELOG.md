@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.2
+
+- **Releases now publish themselves from GitHub Actions via npm trusted publishing (OIDC)**: a push to `master` publishes only when `package.json`'s version isn't yet on the registry, and otherwise finishes green without acting, so an ordinary commit never looks like a failure. The gate reads `npm view`'s OUTPUT rather than its exit code, because npm exits 0 with an empty body for a version that doesn't exist; a network failure produces the same empty body and falls through to `npm publish`, which the registry rejects as a duplicate — the way it can misfire is harmless. Authentication carries no stored credential (no `NODE_AUTH_TOKEN`, no repository secret, nothing to rotate), which is the point: classic tokens were revoked in December 2025 and bypass-2FA tokens lose direct publish in January 2027, while a trusted publisher has no expiry to maintain. The package payload is byte-identical to 0.10.1 — `files` is a whitelist and `.github/` was never part of it; this release exists to exercise the publishing path end to end.
+
 ## 0.10.1
 
 - **`plan_intent`'s confirmation form drops "Correct"**: only Confirm / Keep chatting remain. Keep chatting — and Esc, its exact equivalent — now explicitly REJECTS the objective (nothing created, no note dialog; corrections happen in the conversation itself), returning `isError:false` with a result telling the model the owner rejected it — keep chatting, re-elicit, and re-open `plan_intent` when it's right.
