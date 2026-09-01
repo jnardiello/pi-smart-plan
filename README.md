@@ -4,86 +4,29 @@ Plan mode with a mechanical write guard, plus a goal-scoped workflow that execut
 
 ## What it is
 
-`pi-smart-plan` gives pi a goal-scoped planning workflow:
+`pi-smart-plan` turns plan mode into a real state machine: while you design, the agent is mechanically read-only; the plan itself is structured data the extension validates rather than prose it eyeballs.
 
-- **Owner-only plan mode** couples a mechanical write guard to the plan lifecycle. It can be engaged exclusively by the user (`shift+tab`, `/plan`, `/plan-guard on`, or `pi --plan` at launch) — the model has no tool to activate it, and no unilateral way out: `plan_exit` always requires an affirmative user confirmation.
-- **True read-only** while planning — **default-deny**: only reading (`read`/`grep`/`find`/`ls`), bash restricted to read-only commands, web research, subagent spawning (children inherit the guard and are exploration-only) and the planning-store tools run while planning; everything else (write built-ins, chrome, unknown or future third-party tools) is blocked. The only writes go into the plans folder via the store tools (`plan_save`, `journal_append`, `plan_complete`).
-- **Goal-scoped workflow** writes a DAG-as-data plan into an ephemeral extension-owned store under the system temp dir, derives execution waves, runs up to 4 parallel subagents per wave with disjoint `owns` and one writer per checkout, then a single delivery commit. One active goal per session, zero footprint in the repo.
-- **Canonical-headings contract**: every `plan_save` must carry `## HLD`, `## Scope`, `## Non-goals`, `## Decisions`, `## DoD` (plus `## Tasks` once `decompose` starts) using those exact English heading names, with at least one executable `## DoD` line. Body text under those headings can be written in any language — only the headings are checked. A save that violates this is rejected immediately, listing exactly which headings are missing and which ones were actually found.
-- **Mechanical DAG validation**: `plan_save` rejects plans with duplicate task IDs, unknown deps, dependency cycles, overlapping `owns` within the same wave, or missing `done:` checks — and regenerates the derived waves section server-side. `plan_next` returns the ready frontier (tasks dispatchable now) computed from the graph, never eyeballed.
-- **A six-phase plan state machine with exactly two owner touchpoints (0.10.0)**: `discovery` (prose co-design, HLD saved with canonical headings) → `simplify` (automatic ablation pass, journaled cut log) → `review_hld` (**Gate 1** — owner approves or rejects the trimmed HLD) → `decompose` (automatic DAG build, mechanically validated) → `review_final` (**Gate 2** — owner's start-implementation yes/no) → `execute`. Every other transition is the model's own job: once a phase's deliverable is mechanically ready it self-advances via the formless `plan_advance` tool — it never stops to ask the owner how to proceed.
-- **Owner-confirmed objective, mechanically enforced (0.10.0)**: discovery opens with proactive, evidence-backed chat and closes its first checkpoint through `plan_intent` — a Confirm/Keep chatting form that reformulates the owner's objective. Only Confirm creates the confirmed objective; `plan_save` refuses any content for the goal until it exists, and the confirmed statement reappears as an `OBJECTIVE:` line in both owner gates.
-- **Progressive disclosure**: instead of one giant workflow prompt, each turn injects only the current phase's instructions plus global constraints — the model always sees the contract of the moment.
+A goal moves through six phases with exactly two owner decision points. Everything between them the agent drives itself, and the guard drops only on your word — normally the "start implementation" click.
 
-## Lifecycle: the six phases
+## Base concepts
 
-Plan mode runs as a small state machine. Every turn injects only the instructions of the current phase, so the agent always knows exactly what it should be doing. The widget's heat bar shows where you are; the phase itself lives in a machine-owned `phase.txt` file the model never reads or writes directly — it changes only via `plan_advance` (self-advance) or an owner's gate answer.
+**Owner-only mechanical guard.** Plan mode is engaged exclusively by you — `shift+tab`, `/plan`, `/plan-guard on`, or `pi --plan` at launch. The model has no tool to activate it and no unilateral way out: `plan_exit` always requires an affirmative user confirmation. Enforcement is mechanical (tools removed from the active set, re-blocked at call time as a backstop), not a promise in a prompt.
 
-```
-discovery → simplify → review_hld → decompose → review_final → execute
- (chat,      (auto        (Gate 1:      (auto DAG   (Gate 2:       (guard
-  save HLD)   trim +       present +     owns/deps/  summary +      released)
-              cut log)     approve)      done)       yes/no form)
-```
+**Machine-owned phase state.** The current phase lives in a `phase.txt` the model never reads or writes directly. It changes only through `plan_advance` (self-advance, allowed once the phase's deliverable mechanically validates) or your answer at one of the two gates. `phase.txt` stays authoritative even when the guard is toggled, which is why re-engaging the guard mid-`execute` keeps you in `execute` rather than regressing to planning.
 
-> **True in every phase**: default-deny tool policy (only reading, planning tools, web research and exploration-only subagents); writes only into the plans folder; activation is owner-only; the guard releases only through your Gate 2 answer on a fully visible plan. Discovery is prose-first — plain-language back-and-forth is the default, with `ask_smart_plan` forms offered whenever they converge faster; the two gates are harness-composed forms with fixed labels the model can't rephrase. **Exiting plan mode while a goal is still in any of these five phases discards it after a 10-second grace** — re-enabling plan mode within the window keeps it; `execute` (below) is exempt.
+**Owner-confirmed objective.** Discovery closes its first checkpoint through `plan_intent`: the agent restates your goal as a kebab-case slug plus a one-line statement and opens a **Confirm / Keep chatting** form. When decisions are still open the agent declares them in the same call, and the form resolves those forks first before closing on a **Confirm / Reword** page — so one call both settles the forks and confirms. Only a Confirm answer writes `intent.txt`. Until it exists, `plan_save` mechanically refuses to write any content for that goal — no plan ever exists without a confirmed objective next to it.
 
-### 1. `discovery` — prose co-design (produces the HLD)
+**Choices are forms.** While plan mode is active, a decision put to you arrives as a form, never as a paragraph of options. This is backed mechanically: a planning-phase turn that closes in prose while offering you alternatives is regenerated toward an `ask_smart_plan` form. The detector is deliberately conservative — see [Plan mode behavior](#plan-mode-behavior) for its exact scope and declared limits.
 
-- **Entered by**: activating plan mode (`shift+tab`, `/plan`, `/plan-guard on`, `--plan`).
-- **What happens**, in four moments:
-  1. **Free-form chat with proactive discovery** — the agent talks through the goal in plain prose and, rather than waiting to be asked, proactively launches read-only exploration subagents on the codebase and web research on whatever you're discussing, folding the findings back into the conversation to ground its questions and suggestions in evidence. At the end of every turn it self-assesses whether enough is known to state a goal.
-  2. **Objective confirmation** — as soon as no decision is left open, the agent restates the goal (kebab-case slug + one-line statement) and opens a `plan_intent` form: **Confirm / Keep chatting**. If a decision is still open at that point, the agent declares it via `plan_intent`'s `openQuestions` (a JSON vector of questions, same shape as `ask_smart_plan`) instead of confirming — the harness renders it as the same auto-paged form, BEFORE any confirmation card or form, and an empty (or omitted) vector is the agent's claim that nothing is open; a standing order applies at every turn of discovery to surface open decisions this way (or via `ask_smart_plan`), never in prose. Only Confirm creates the confirmed objective (`intent.txt`); Keep chatting — and Esc, its exact equivalent — explicitly rejects it (nothing created, no note dialog; corrections happen back in the conversation). Nothing else in discovery substitutes for confirmation, and `plan_save` mechanically rejects any content for the goal until it exists.
-  3. **Optional post-confirmation grilling** — once confirmed, the agent may open an unbounded round of questions (`ask_smart_plan` forms and/or prose) to fully clarify the goal, still backed by scouts and web research; key clarifications are journaled, and if the objective materially changes the agent re-runs `plan_intent` to re-confirm it.
-  4. **Refined brief, then HLD** — the agent presents the fully refined brief in prose, co-designs the HLD with you, and writes it in one `plan_save` using the canonical English headings; body text can be in any language.
-- **You'll see**: the widget on discovery, free-form conversation with proactive findings folded in, the objective-confirmation form, occasional forms during grilling, zero code changes.
-- **Expected from you**: state the goal, confirm the restated objective (or keep chatting to revise it), answer as you go.
-- **Exits when**: the saved HLD is complete — the agent calls `plan_advance` itself.
+**Default-deny while planning.** Only reading (`read`/`grep`/`find`/`ls`), an allowlisted read-only bash, web research, subagent spawning, and the planning-store tools run. Everything else — write built-ins, chrome, unknown or future third-party tools — is blocked. Spawned children inherit the guard via `PI_SMART_PLAN=1` and are exploration-only: no phase machine, no store tools. The only writes go into the plans folder.
 
-### 2. `simplify` — automatic ablation pass
+**DAG-as-data.** The plan's `## Tasks` section is a graph: `id` / `deps` / `owns` / `done` per task. `plan_save` rejects duplicate IDs, unknown deps, cycles, `owns` that overlap within a wave, and missing `done:` checks, then regenerates the derived waves section server-side. `plan_next` returns the ready frontier computed from the graph, never guessed.
 
-- **Entered by**: discovery's `plan_advance`.
-- **What happens**: fully automatic, no owner questions. The agent re-reads the HLD as its harshest reviewer — cuts nice-to-haves, collapses over-engineering, merges elegance-only ideas — and journals every cut (or a single entry explaining why nothing could be cut). If anything was trimmed it resaves the HLD; canonical headings are re-validated.
-- **You'll see**: a brief 1–3 line chat update on what was cut, then the widget moves on.
-- **Expected from you**: nothing.
-- **Exits when**: at least one journal entry for this phase exists — the agent calls `plan_advance` itself.
+**Ephemeral store, durable approved copy.** Plans, journals and phase state live outside the repo, in a per-user directory under the system temp dir — wiped on reboot by design, zero footprint in your working tree. Once a plan clears Gate 2 a durable copy is written under pi's agent directory; that copy is the only part that survives a reboot.
 
-### 3. `review_hld` — Gate 1
+**Session ownership.** Each pi session claims at most one goal, and ownership comes only from confirming an objective via `plan_intent` or from restoring the session's own claim on reload — never from adopting whatever the repo-wide pointer happens to reference. A session that owns no goal is a new session, driven as `discovery`. Concurrent plan-mode sessions in the same repo are supported: destructive paths act only on the goal the session owns.
 
-- **Entered by**: simplify's `plan_advance`.
-- **What happens**: calling `plan_advance` auto-opens Gate 1 in the same step — the harness renders the HLD + cut log panel, headed by an `OBJECTIVE:` line carrying the owner-confirmed statement, and the form together. The form is harness-composed — the agent can't invent its own wording: **Approve / Reject**.
-- **You'll see**: the plan panel and the fixed-label form appear together, opened automatically.
-- **Expected from you**: pick one of the two.
-- **Exits when**: **Approve** → `decompose`. **Reject** → back to `discovery` with your optional note journaled (the agent addresses it before the next `plan_save`). Esc/decline (this harness-composed form has no built-in "None of the above" — Approve/Reject are the only two picks) → postpones: stays in `review_hld` until a later `plan_advance` re-opens the gate.
-
-### 4. `decompose` — automatic DAG build
-
-- **Entered by**: Gate 1's Approve.
-- **What happens**: fully automatic. The agent turns the approved HLD into a `## Tasks` DAG (`id` / `deps` / `owns` / `done` per task) and saves it; `plan_save` validates mechanically — unique IDs, resolvable acyclic deps, disjoint `owns` within a wave, `done:` checks present — and regenerates the derived waves section server-side.
-- **You'll see**: the widget on decompose; precise errors in chat if the DAG is invalid.
-- **Expected from you**: nothing.
-- **Exits when**: the DAG passes validation — the agent calls `plan_advance` itself.
-
-### 5. `review_final` — Gate 2
-
-- **Entered by**: decompose's `plan_advance`.
-- **What happens**: the agent writes a concise summary of what ships in chat, then calls `plan_advance`, which auto-opens Gate 2 in the same step — the harness renders the full plan panel (`OBJECTIVE:` line, waves, deps, live checklist) and the form together, harness-composed: **Start implementation / Stay in planning**.
-- **Staged-files preflight**: before opening the form, the harness checks for files already staged in git (pi-subagents' worker acceptance otherwise rejects every write-worker while anything is staged). If any are found, the form's detail lists them and the option set grows to three: **Unstage & start implementation** (runs `git restore --staged` on exactly the detected paths — index only, worktree content untouched, re-verified empty afterward, journaled) / **Start anyway** (proceeds, journals that staged entries remain) / **Stay in planning**. With nothing staged, the form stays the plain two-option version above.
-- **You'll see**: the chat summary and the full plan panel appear together with the decision form (three options instead of two if the staged-files preflight fired), opened automatically.
-- **Expected from you**: pick one.
-- **Exits when**: **Start implementation** (or **Unstage & start implementation** / **Start anyway**) — the plan is persisted to the durable approved store, the phase flips to `execute`, the guard releases in the same click, and the authorization briefing is queued to land on a FRESH turn so the agent starts implementing with its full tool surface already active. **Stay in planning**, or Esc/decline (this harness-composed form has no built-in "None of the above") → stays in `review_final` until a later `plan_advance` re-opens the gate.
-
-### 6. `execute` — implementation
-
-- **Entered by**: Gate 2's "Start implementation" — the only thing that ever releases the guard.
-- **What happens**: the ready frontier comes from `plan_next`; up to 4 parallel workers per wave with disjoint `owns`; every task is verified in the root (its own `done` check plus the git-backed `owns` delta check) before being marked done; journal entries per event; the agent asks via a form when scope/DoD must change.
-- **You'll see**: per-task progress in the widget, worker activity, journal entries.
-- **Expected from you**: answers to re-entry questions, final review.
-- **Exits when**: all DoD commands pass via `plan_verify`, then `plan_complete`, then exactly ONE delivery commit (only if you asked for it).
-
-> **Re-engaging the guard mid-execute stays in execute.** `phase.txt` is authoritative over guard state: toggling `shift+tab` back on during implementation does not regress the session to planning — it stays in `execute` (read-only supervision only), and the widget and tool surface reflect that.
-
-## Install
+## Quickstart
 
 ```
 pi install npm:@jnardiello/pi-smart-plan
@@ -93,29 +36,7 @@ pi install git:github.com/jnardiello/pi-smart-plan
 
 Then run `/reload` to pick up the extension.
 
-## Usage
-
-- `/plan <goal>` — start the goal workflow (scoping, plan, approval, execution, delivery).
-- `/plan-guard status|on|off` — control the read-only guard outside a plan.
-- `plan_exit` tool — request to release the guard; always gated by a user confirmation dialog. There is **no** `plan_enter` tool: activation is owner-only.
-- `plan_advance` tool — the single self-advance tool for every phase. In `discovery`/`simplify`/`decompose` it moves to the next phase once that phase's deliverable is mechanically ready (the same validators `plan_save` uses), refusing with an error (phase untouched) when it isn't. Called out of `simplify`/`decompose` it lands in the next review phase and opens that phase's Gate form in the SAME call — panel and form together, nothing to call separately. Called again while already in `review_hld`/`review_final` it re-opens a gate the owner postponed.
-- `plan_save` — write (overwrite) the plan for a goal in the external store. Validates the canonical-headings contract (see above) and, once a `## Tasks` section exists, the task DAG — rejecting the save immediately with a precise list of what's wrong. Also mechanically rejected until the goal's objective has been confirmed via `plan_intent` (below) — no `plan.md` ever exists without a confirmed `intent.txt` next to it.
-- `plan_intent` tool — discovery's owner-backed objective checkpoint: the agent reformulates the goal as a kebab-case slug plus a one-line statement and opens a **Confirm / Keep chatting** form (no built-in "None of the above" — these are the only two picks). Only Confirm writes the confirmed objective (`intent.txt` — statement + timestamp) and unblocks `plan_save`; Keep chatting — and Esc, its exact equivalent — explicitly rejects it (nothing created, no note dialog; corrections happen in the conversation itself). An optional `openQuestions` array lets the agent declare still-open decisions instead of confirming: the harness renders them as the same auto-paged form `ask_smart_plan` uses, BEFORE any confirmation card or form, leaving the store untouched; an empty (or omitted) vector is the agent's claim that nothing is open, and the agent calls `plan_intent` again once it is. Re-runnable in discovery to re-confirm a refined statement (e.g. after a grilling round or a Gate 1 rejection); locked once discovery ends.
-- `journal_append` — append timestamped lines to the goal journal (append-only).
-- `plan_recall` — search the store for this repo's plans. Explicit-only: run it when the user asks about prior work on a topic. Returns content (plan + journal tail), never paths.
-- `plan_next` — mechanically computed ready frontier for a goal: pending tasks whose deps are all done. Use it during execution instead of eyeballing deps.
-- `plan_complete` — move a goal to the `done/` portion of the store after its DoD passes.
-- `plan_task_update` — set a task's status (`pending | in_progress | blocked | done`). Claiming snapshots dirty files; closing verifies the delta stayed inside the task's `owns` (git-backed) and that dependencies are closed. Checkbox flipped server-side.
-- `plan_verify` — run every DoD command of a goal's plan and report pass/fail. The mechanical delivery gate: no delivery claim without a green `plan_verify`.
-- `/plan-status` — zero-token dump of active goals, phases and ready frontier.
-- `shift+tab` — toggle read-only plan mode. Activation only notifies you (no LLM turn): describe what you want to design and the discovery-phase instructions take over. **This binding collides with pi's default `app.thinking.cycle` shortcut out of the box — see the note right below.**
-- `ask_smart_plan` tool — the everyday question form. In `review_hld`/`review_final` the Gate form itself opens automatically the moment `plan_advance` reaches (or re-enters) that phase — the extension supplies the fixed labels (Approve / Reject, or Start implementation / Stay in planning, growing a third **Unstage & start implementation** option in `review_final` when pre-existing staged files are detected) and the real plan contract in the briefing pane; the agent calls `ask_smart_plan` with `phaseGate: true` itself only to re-open a gate the owner postponed. Elsewhere it's an ordinary question form: one tab per open decision (never structural categories like "Scope" or "DoD" — the agent drafts that contract itself), a human briefing pane (`detail`) plus consequences of the highlighted option (`preview`). Options may be plain strings or `{label, description, preview}` objects. Long text scrolls with J/K or PgUp/PgDn. Every ordinary, model-composed form like this one ends with a built-in **"None of the above"** option — selecting it opens an OPTIONAL note (submit empty to accept as-is); in multi-select it is exclusive. The two harness-composed gates above and `plan_intent`'s Confirm/Keep chatting form skip it — their option sets are already complete and fixed — so Escape/decline is their sole postpone path; Escape also declines any ordinary form. Question sets over 4 are auto-paged into sequential forms. Goals with no real fork skip the form entirely. No third-party extension required.
-
-`/plan` injects the workflow into the session. This package is a pi extension, not a skill. Start with the guard already engaged via `pi --plan`.
-
-### IMPORTANT: shift+tab collides with pi's default thinking-cycle binding
-
-pi's built-in `app.thinking.cycle` also defaults to `shift+tab` — out of the box the two collide and the plan-mode toggle silently loses. Remap it in `~/.pi/agent/keybindings.json` to free the key:
+**Free the `shift+tab` key first.** pi's built-in `app.thinking.cycle` also defaults to `shift+tab` — out of the box the two collide and the plan-mode toggle silently loses. Remap it in `~/.pi/agent/keybindings.json`:
 
 ```json
 {
@@ -123,77 +44,174 @@ pi's built-in `app.thinking.cycle` also defaults to `shift+tab` — out of the b
 }
 ```
 
-(Any free chord works — pi has no two-key chord support, so pick a modifier combo your terminal doesn't intercept itself; enable the Kitty keyboard protocol if it does.)
+Any free chord works — pi has no two-key chord support, so pick a modifier combo your terminal doesn't intercept (enable the Kitty keyboard protocol if it does). `/plan <goal>` and the `--plan` launch flag are unaffected by the collision and always work if you'd rather not touch your keybindings.
 
-Without that remap, `shift+tab` is unreliable. `/plan <goal>` and the `--plan` launch flag are unaffected by this collision and always work — use them if you'd rather not touch your keybindings.
+A first session, end to end:
 
-## Artifacts layout
+1. Activate plan mode (`shift+tab`, `/plan <goal>`, or launch with `pi --plan`).
+2. Describe what you want to build; the agent explores the codebase and asks questions.
+3. Answer any open decisions the agent forms, then confirm the restated objective on the confirmation page.
+4. **Gate 1** — approve or reject the trimmed high-level design.
+5. **Gate 2** — pick "Start implementation" on the full plan.
+6. The guard releases in that same click and the agent implements, verifying each task as it closes.
 
-Plans, journals and phase state live in an EPHEMERAL extension-owned store under the system temp dir — per-user (`pi-smart-plan-<uid>`, dirs created `0700`) and wiped on reboot by design; the model never handles those paths, all I/O goes through the dedicated tools:
+## The six phases
+
+Every turn injects only the current phase's instructions, so the agent always sees the contract of the moment. The widget's heat bar shows where you are.
 
 ```
-<tmpdir>/pi-smart-plan-<uid>/<repo>/active.txt           # pointer: last goal touched by a write (drives per-turn phase injection) — the ONLY resume path
-<tmpdir>/pi-smart-plan-<uid>/<repo>/abandoned.txt        # tombstone for a goal mid-abandon-grace after exiting plan mode mid-planning
-<tmpdir>/pi-smart-plan-<uid>/<repo>/<goal>/intent.txt     # owner-confirmed objective (statement + timestamp), written by plan_intent's Confirm — plan_save refuses to write plan.md without it
-<tmpdir>/pi-smart-plan-<uid>/<repo>/<goal>/plan.md       # WHAT: HLD + Scope + Non-goals + Decisions + DoD + Tasks DAG — never carries a phase marker
-<tmpdir>/pi-smart-plan-<uid>/<repo>/<goal>/journal.md    # append-only WHY/HOW IT WENT (via journal_append)
-<tmpdir>/pi-smart-plan-<uid>/<repo>/<goal>/phase.txt     # machine-owned current phase — the model never reads or writes it directly
+discovery → simplify → review_hld → decompose → review_final → execute
+ (chat,      (auto        (Gate 1:      (auto DAG   (Gate 2:       (guard
+  save HLD)   trim +       present +     owns/deps/  summary +      released)
+              cut log)     approve)      done)       yes/no form)
+```
+
+> **True in every phase before `execute`:** default-deny tool policy, writes only into the plans folder, owner-only activation. Discovery is prose-first; the two gates are harness-composed forms with fixed labels the model cannot rephrase, and Esc/decline is their only postpone path (they carry no "None of the above"). **Exiting plan mode while a goal is still mid-planning tombstones it and discards it after a 10-second grace** — re-engaging plan mode within the window keeps it, with a "plan kept" notification. Goals in `execute` are exempt.
+
+### 1. `discovery` — prose co-design, produces the HLD
+
+- **Entered by**: activating plan mode.
+- **What happens**: free-form conversation in which the agent proactively launches read-only exploration subagents and web research, folding findings back in to ground its questions. Open decisions always reach you as forms, never buried in prose: the agent calls `plan_intent` carrying them, and the same call resolves those forks before closing on the objective confirmation — **Confirm / Reword** when questions rode along, plain **Confirm / Keep chatting** when none did. Reword and Esc write nothing and send the agent back to reformulate the objective from your answers. After confirmation it may run an unbounded grilling round, then co-designs the HLD and writes it with one `plan_save` using the canonical English headings (`## HLD`, `## Scope`, `## Non-goals`, `## Decisions`, `## DoD`, with at least one executable DoD line). Body text can be in any language — only the heading names are checked.
+- **You'll see**: conversation with evidence folded in, the objective-confirmation form, occasional question forms, zero code changes.
+- **Expected from you**: state the goal, confirm the restated objective (or keep chatting to revise it), answer as you go.
+- **Exits when**: the saved HLD is complete — the agent calls `plan_advance` itself.
+
+### 2. `simplify` — automatic ablation pass
+
+- **Entered by**: discovery's `plan_advance`.
+- **What happens**: fully automatic, no owner questions. The agent re-reads the HLD as its harshest reviewer, cuts nice-to-haves and over-engineering, journals every cut (or one line explaining why nothing could be cut), and resaves if anything was trimmed. Plans under 60 lines skip the ceremony: the phase auto-passes and the harness journals an `auto-pass` line itself, so it never vanishes from the record.
+- **You'll see**: a 1–3 line chat update on what was cut, or nothing at all on a small plan.
+- **Expected from you**: nothing.
+- **Exits when**: a cut log exists for this phase — or the plan is under the auto-pass threshold. The agent calls `plan_advance` itself.
+
+### 3. `review_hld` — Gate 1
+
+- **Entered by**: simplify's `plan_advance`, which opens the gate in the same call: the harness renders the plan panel (HLD, scope, non-goals, DoD), headed by an `OBJECTIVE:` line carrying your confirmed statement, together with the form.
+- **What happens**: a fixed two-option decision — **Approve / Reject**.
+- **You'll see**: panel and form appear together, opened automatically.
+- **Expected from you**: pick one.
+- **Exits when**: **Approve** → `decompose`. **Reject** → back to `discovery`, your optional note journaled and addressed before the next save. Esc/decline postpones: the phase holds until a later `plan_advance` re-opens the gate.
+
+### 4. `decompose` — automatic DAG build
+
+- **Entered by**: Gate 1's Approve.
+- **What happens**: fully automatic. The approved HLD becomes a `## Tasks` DAG, validated mechanically on save; waves are derived server-side.
+- **You'll see**: the widget on decompose, and precise errors in chat if the DAG is invalid.
+- **Expected from you**: nothing.
+- **Exits when**: the DAG passes validation — the agent calls `plan_advance` itself.
+
+### 5. `review_final` — Gate 2
+
+- **Entered by**: decompose's `plan_advance`, after the agent writes a short summary of what ships. The call opens the gate itself: full plan panel (objective, waves, deps, live checklist) plus the form, **Start implementation / Stay in planning**.
+- **Staged-files preflight**: before opening the form the harness checks for files already staged in git, since pi-subagents' worker acceptance rejects write-workers while anything is staged. If any are found the form lists them and grows a third option — **Unstage & start implementation** (runs `git restore --staged` on exactly those paths, index only, worktree content untouched, re-verified and journaled) / **Start anyway** (proceeds, journals that staged entries remain) / **Stay in planning**.
+- **You'll see**: summary, plan panel and form together.
+- **Expected from you**: pick one.
+- **Exits when**: **Start implementation** — the plan is copied to the durable approved store, the phase flips to `execute`, and the guard releases in the same click. The authorization then lands on the first real turn that follows, with the execute tool surface guaranteed active on that same turn — including when you type before the agent moves. An authorization that has gone stale (goal completed, phase no longer `execute`, guard re-engaged, claim moved) is never injected. **Stay in planning** or Esc/decline holds the phase until a later `plan_advance` re-opens the gate.
+
+### 6. `execute` — implementation
+
+- **Entered by**: Gate 2's release — the only transition into `execute`.
+- **What happens**: the ready frontier comes from `plan_next`; parallel workers take tasks with disjoint `owns`, one writer per checkout. Every task is verified in the root — its own `done` check plus a git-backed `owns` delta check — before being marked done. Events are journaled; scope or DoD changes are put to you as a form.
+- **You'll see**: per-task progress in the widget, worker activity, journal entries, and the full task checklist reprinted every time a task closes.
+- **Expected from you**: answers to re-entry questions, final review.
+- **Exits when**: all DoD commands pass via `plan_verify`, then `plan_complete`, then exactly one delivery commit — only if you asked for one.
+
+> **Re-engaging the guard mid-`execute` stays in `execute`.** Toggling `shift+tab` back on during implementation gives you read-only supervision; it never regresses the session to planning.
+
+## Tool & command reference
+
+| Tool | What it does |
+| --- | --- |
+| `ask_smart_plan` | The everyday question form: one tab per open decision, briefing pane plus per-option consequences, auto-paged past 4 questions. Ordinary forms end with a built-in "None of the above"; Escape declines. |
+| `plan_intent` | Discovery's objective checkpoint — Confirm creates `intent.txt` and unblocks `plan_save`; Keep chatting (and Esc) rejects it. `openQuestions` carries still-open decisions: the harness forms them first, then closes the same call on a Confirm/Reword page, so a resolved set confirms without a second call. |
+| `plan_save` | Writes (overwrites) a goal's plan. Validates the canonical headings and, once `## Tasks` exists, the DAG. Refuses until the objective is confirmed. |
+| `plan_advance` | The single self-advance tool. Moves to the next phase when the deliverable validates, and opens the gate form itself when it lands in a review phase. |
+| `plan_exit` | Requests guard release; always gated by a user confirmation dialog. There is no `plan_enter` — activation is owner-only. |
+| `plan_next` | The mechanically computed ready frontier: pending tasks whose deps are all done. |
+| `plan_verify` | Runs every DoD command and reports pass/fail — the mechanical delivery gate. |
+| `plan_task_update` | Sets a task's status (`pending`/`in_progress`/`blocked`/`done`); claiming snapshots dirty files, closing verifies the delta against `owns` and dependency order. Closing to `done` renders the whole task checklist; other states stay one-liners. |
+| `plan_complete` | Moves a goal into the store's `done/` area; call it once its DoD passes. |
+| `plan_recall` | Searches this repo's plans. Explicit-only: run it when asked about prior work. Returns content, never paths. |
+| `journal_append` | Appends timestamped lines to a goal's journal (append-only). Requires an existing goal. |
+
+| Command | What it does |
+| --- | --- |
+| `/plan <goal>` | Starts the goal workflow with the guard engaged. |
+| `/plan-guard status\|on\|off` | Controls the read-only guard outside a plan. |
+| `/plan-status` | Zero-token dump of active goals, phases and ready frontier. |
+| `pi --plan` | Launches with the guard already engaged. |
+| `shift+tab` | Toggles read-only plan mode. Activation only notifies you — no LLM turn. |
+
+This package is a pi extension, not a skill, and needs no third-party extension for its forms.
+
+## Artifacts layout & concurrency
+
+Plans, journals and phase state live in an ephemeral extension-owned store under the system temp dir — per-user (`pi-smart-plan-<uid>`, directories created `0700`). The model never handles these paths; all I/O goes through the tools.
+
+```
+<tmpdir>/pi-smart-plan-<uid>/<repo>/active.txt          # last goal touched by a write — a hint, not the resume path
+<tmpdir>/pi-smart-plan-<uid>/<repo>/<goal>/intent.txt    # owner-confirmed objective (statement + timestamp)
+<tmpdir>/pi-smart-plan-<uid>/<repo>/<goal>/plan.md       # WHAT: HLD + Scope + Non-goals + Decisions + DoD + Tasks DAG
+<tmpdir>/pi-smart-plan-<uid>/<repo>/<goal>/journal.md    # append-only WHY / how it went
+<tmpdir>/pi-smart-plan-<uid>/<repo>/<goal>/phase.txt     # machine-owned current phase
+<tmpdir>/pi-smart-plan-<uid>/<repo>/<goal>/claims.json   # per-task dirty-file baselines for the owns delta check
+<tmpdir>/pi-smart-plan-<uid>/<repo>/<goal>/abandoned.txt # per-goal tombstone during the abandon grace
 <tmpdir>/pi-smart-plan-<uid>/<repo>/done/<goal>/         # completed goals, moved here by plan_complete
+<agentDir>/smart-plan/approved/<repo>/<goal>/plan.md     # durable copy, written when Gate 2 authorizes
 ```
 
-`phase.txt` is the single source of truth for a goal's phase — it changes only through `plan_advance` or an owner's gate answer, never through plan content, and it stays authoritative even while the read-only guard is off or re-engaged (this is what keeps a goal re-guarded mid-`execute` staying in `execute`). Pre-0.10 goals without a `phase.txt` are migrated once, on the next write, inferring their phase from the existing plan content; pure reads never write to disk. Legacy phase names still on disk from earlier versions are mapped to their current equivalents on read without rewriting the file.
+**Resume and ownership.** A session resumes the goal it owns from the claim recorded in its own transcript — restoration, never adoption. A goal that has been completed refuses with a distinct message saying so and naming `plan_save` as the way to reopen it, rather than the message used for a goal the session never owned. `active.txt` is repo-wide and shared, so it cannot answer "which goal does *this* session act on" and is never used to infer ownership; a session whose claim no longer resolves simply owns nothing and is driven as `discovery`. `plan_save`, `plan_task_update`, `plan_verify` and `plan_complete` name their goal as a parameter but act only on the owned goal, and `plan_exit` authorizes release only for it.
 
-`intent.txt` is the owner-confirmed objective — created only by a Confirm answer on the `plan_intent` form, never by plan content or a self-advance. A goal directory can exist with `intent.txt` but no `plan.md` yet (discovery in progress); it can never have `plan.md` without `intent.txt`. Abandoning a goal purges `intent.txt` along with the rest of its directory, so reopening the same slug later requires reconfirming the objective from scratch.
+**Abandon grace.** Exiting plan mode mid-planning writes `<goal>/abandoned.txt` and arms a 10-second timer: re-engaging within the window restores the goal, letting it lapse purges the directory — `intent.txt` included, so reopening the same slug later means reconfirming the objective. The tombstone is per goal precisely so two sessions on the same repo can abandon independently. Any activity on a tombstoned goal counts as interest: journaling during the grace re-pins the pointer and the goal is kept. A fresh activation sweeps stale leftovers, but only ever the session's *own* goal — it can never discard a plan another session is driving.
 
-**Exiting plan mode while the pointed goal is still mid-planning** (anywhere before `execute`) tombstones it rather than deleting it outright: `active.txt` is renamed to `abandoned.txt`, which stops the pointer from resolving immediately, and a 10-second in-process grace timer arms. Re-engaging plan mode within the window cancels the timer, restores the pointer and notifies you the plan was kept; letting the timer lapse purges the goal directory and the tombstone for good. Goals in `execute` are exempt — Gate 2's release moves the phase to `execute` before the guard drops, and re-engaging the guard mid-`execute` for supervision never tombstones anything.
+**Concurrency.** Concurrent plan-mode sessions in the same repo are supported. Two residual limits: the widget polls the store about every 2 seconds, so another session's changes show up with that lag; and a claim on a goal another session completed or purged leaves that session in `discovery`.
 
-A fresh plan-mode activation (`shift+tab` / `/plan` / `/plan-guard on` / `--plan`, with no grace already pending) always starts clean: any tombstone left behind by a killed process is purged unconditionally, and if `active.txt` itself still points at a goal stuck mid-planning with no tombstone at all — killed before a grace was ever armed — that goal is discarded too. `active.txt` is the only resume path: the old newest-mtime fallback is gone, so a purged or orphaned goal directory is inert (it's still listed by `plan_recall`/`goalSummaries`/`plan_exit`'s dialog, but nothing resumes it). Durable approved copies are never touched by any of this.
+**Migration.** A goal directory without `phase.txt` is pinned to `discovery` on the next write — the phase is never inferred from plan content.
 
-> **Caveat:** two concurrent pi sessions planning in the same repo share this store — the fresh-activation sweep in one session can discard the other session's still-in-planning goal. Out of scope for now; avoid running two concurrent plan-mode sessions against the same repo.
+> **Ephemerality:** the working store does not survive a reboot, and macOS may clean untouched `/tmp` files after roughly three days. The durable approved copy is the only persistent part; cross-session history of in-progress goals is intentionally out of scope.
 
-Once a plan clears Gate 2 (`review_final`'s "Start implementation"), a durable copy is written outside the ephemeral store too, under pi's agent directory: `smart-plan/approved/<repo>/<goal>/plan.md` — it survives reboots, unlike the working copy above.
+`<tmpdir>` respects `TMPDIR`. `<repo>` derives from the working directory, `<goal>` is the kebab-case slug. Re-opening a completed goal happens automatically on the next `plan_save`. Never read the store with `read` or `bash` — use `plan_recall`. Repos that already use an in-repo `backlog/` directory are not migrated; that directory and its history stay untouched.
 
-`<tmpdir>` respects `TMPDIR` (`/tmp` on macOS/Linux); `<repo>` is derived from the working directory, `<goal>` is the kebab-case slug. `plan_recall` lists exactly the active + done goals. Re-opening a completed goal happens automatically on the next `plan_save`, which moves it back to active. Never read the store with `read`/`bash` — use `plan_recall`.
+## Operational sheet for agents
 
-> **Ephemerality:** the working store (plan/journal/phase.txt) does not survive a reboot (and macOS may clean untouched /tmp files after ~3 days). The durable approved copy under pi's agent dir is the only part that persists. Cross-session history of in-progress goals is intentionally out of scope.
+If you are an agent onboarding your human onto this extension, this is your contract.
 
-> **Legacy note:** repos that already use an in-repo `backlog/` directory are not migrated; that directory and its history stay untouched.
+| Phase | Your duties | Human touchpoint | Typical mistakes |
+| --- | --- | --- | --- |
+| `discovery` | Explore proactively with read-only scouts and web research; surface every open decision through a form; confirm the objective via `plan_intent` before any `plan_save`; then co-design and save the HLD. | Objective confirmation, plus any questions you raise — Confirm / Reword when open decisions rode along, Confirm / Keep chatting otherwise. | Confirming the objective in prose; enumerating options in chat instead of a form — the harness now regenerates such a turn; holding questions back for a second `plan_intent` call when they could have ridden in `openQuestions`; calling `plan_save` before `intent.txt` exists. |
+| `simplify` | Cut hard, journal every cut, resave if anything changed — unless the plan is under the auto-pass threshold, which needs nothing from you. | None. | Asking the owner what to cut; inventing token cuts on a small plan the threshold already waives. |
+| `review_hld` | Call `plan_advance` — it opens Gate 1 itself. Then wait. | Approve / Reject. | Composing your own approval wording; re-opening a gate the owner deliberately postponed. |
+| `decompose` | Build the `## Tasks` DAG and fix validation errors until the save passes. | None. | Treating validation failures as advice; hand-deriving waves the server regenerates. |
+| `review_final` | Summarize what ships, then `plan_advance` to open Gate 2. | Start implementation / Stay in planning (plus the unstage option when files are staged). | Asking for approval in prose; assuming the guard drops before the owner's click. |
+| `execute` | Dispatch off `plan_next`, keep `owns` disjoint, run each task's `done` check in the root before closing it, journal events, `plan_verify` before claiming delivery. | Re-entry questions, final review, explicit request for the delivery commit. | Eyeballing dependencies instead of using `plan_next`; closing a task without running its check; committing without being asked. |
+
+Three rules hold in every phase: never read the store with `read` or `bash` — `plan_recall` is the only sanctioned path; never stop to ask "how should I proceed?" when the phase's deliverable is ready, because `plan_advance` is that answer; and never hand the owner alternatives in prose while planning, which the harness regenerates toward a form. Tool results always carry an informational next-action hint; its imperative form only appears once a second consecutive turn has passed with the deliverable already ready, so an agent that advances promptly never sees it. Note also that "up to 4 parallel workers" is prompt-level guidance in the execute instructions, not a mechanical limiter.
 
 ## Plan mode behavior
 
-While the guard is active:
+While the guard is active, `edit`/`write` and interactive chrome tools leave the active tool set, bash runs only allowlisted read-only commands (`ls`, `rg`, `cat`, `git status/diff/log`, …) while interpreters, script runners and package managers — including `npm test`/`npm run`, since scripts can write — are blocked. The allowlist lives in `src/bash-guard.ts`.
 
-- `edit`/`write` and interactive chrome tools are removed from the active tool set (and re-blocked at call time as a backstop). `subagent`/`subagent_wait` ARE allowed but are exploration-only: spawned children inherit the guard via `PI_SMART_PLAN=1` in their env and self-restrict to reading, read-only bash, web research and nested subagent spawn — no phase machine, no planning-store tools.
-- bash runs only allowlisted read-only commands (`ls`, `rg`, `cat`, `git status/diff/log`, …). Anything unknown — interpreters, script runners, package managers, `npm test`/`npm run` (scripts can write) — is blocked; harmless noise redirects (`2>&1`, `>/dev/null`) are still accepted. The allowlist lives in `src/bash-guard.ts`.
-- A TUI widget shows the phase pipeline (gray → orange heat bar), context-usage percentage, each goal's progress and ready frontier while planning/executing.
-- Every registered tool's call and result render through themed TUI renderers (`src/render.ts`) instead of raw tool names: a compact `▪ <verb phrase>` call line and a themed, few-line result (colored ✓/✗ per-command rows for `plan_verify`, first lines plus an expand hint for `plan_recall`, errors in the error color). The plan panel itself, once tasks exist, draws a style-B todo-DAG: one vertical trunk linking `● WAVE n` headers to `├─`/`└─` task branches, `☑`/`☐` done/ready/pending glyphs, an in-wave `∥` parallel marker, `← T1,T2` deps, and a live `N/M done · ready now: …` footer that re-reads the store on every redraw (narrow terminals drop the `∥`/dep annotations). The working-message line is live too — `◈ plan · <phase> — <mission>` on every phase transition, enriched to `◈ plan · execute — implementing (n/m done)` as tasks close, and explicitly restored to pi's default when the guard turns off or a goal completes.
-- Closing a task mechanically verifies changed files against its `owns` and enforces dependency order — violations reject the close and land in the journal.
-- Only `review_hld` and `review_final` open an owner-facing gate — the harness opens it automatically the instant `plan_advance` reaches (or re-enters) that phase; the agent never invents its own approval wording or opens the form itself. Only `review_final`'s "Start implementation" releases the guard, in the same click — no second dialog — and queues the authorization briefing for a fresh turn. Every other transition is a self-advance the agent drives itself.
-- Exiting outside the gate flow requires a user-confirmed `plan_exit` dialog — which shows the active plans (or warns when none was saved) so the decision is informed — or `/plan-guard off`, or toggling `shift+tab` again.
-- **Exiting mid-planning discards the plan after a 10-second grace, not immediately**: toggling off (`shift+tab`, `/plan-guard off`, `plan_exit`) while the active goal is still anywhere before `execute` tombstones it and warns you in chat that it will be discarded; re-enabling plan mode within the grace restores it (with a "plan kept" notify). Goals already in `execute` are exempt — Gate 2's release and any later guard re-engagement for supervision never discard anything. A fresh plan-mode activation always starts clean, purging any leftover tombstone or stale mid-planning pointer first — see [Artifacts layout](#artifacts-layout).
+A TUI widget shows the phase pipeline as a heat bar, context usage, per-goal progress and the ready frontier, refreshing as the store changes. Tool calls and results render through themed renderers rather than raw tool names, and the plan panel draws the task DAG as a todo tree with wave headers, done/ready glyphs, dependency annotations and a live counter.
 
-### Outside plan mode
+Closing a task to `done` prints that same task DAG as a progress checklist — wave headers, `☑`/`☐` glyphs, dependency annotations and an `N/M done · ready now: …` footer — with the task you just finished already ticked. `in_progress` and `blocked` stay single lines. In a parallel wave this means N closes print N panels: deliberate, since collapsing them would cost exactly the sense of progress the checklist exists to give.
 
-The guard doesn't gate every tool the same way — some of them are deliberately usable whether or not it's on:
+**Choices are forms, mechanically.** With plan mode active, a planning-phase turn that closes in prose while offering you alternatives is regenerated toward an `ask_smart_plan` form. The scope is deliberately narrow: only while the guard is on, and only in planning phases — `execute` is exempt, and guard-off sessions are not covered at all, a declared product limit rather than an oversight. It never fires when the turn already opened `ask_smart_plan` or `plan_intent`. The detector requires both an enumeration (or an either-or construction) *and* an actual request for your choice, so recaps of settled decisions, file listings, diagnostic questions and politeness formulas leave it alone; some genuine offers slip through by design, because missing one costs less than force-regenerating a legitimate answer. This is the single place where the extension inspects the *text* of a turn — every other floor rule judges structure alone, namely whether the turn closed with a tool or with prose.
 
-- `ask_smart_plan`'s ordinary (non-gate) question forms, `plan_recall`, and `journal_append` work in any session, guard on or off — a feature, not an oversight, so the model can ask a quick question, look up prior work, or log a decision/finding without making the owner engage plan mode first. `journal_append` still requires an EXISTING goal: one never confirmed via `plan_intent` refuses with `no plan named "<goal>" — goals are created by confirming an objective via plan_intent`, so a stray call can never silently create a phantom goal. Accepted edge: journaling during the 10-second abandon grace (below) re-pins `active.txt` to the goal, which the grace timer reads as "kept" rather than discarded — any activity on a still-tombstoned goal counts as interest, the same as re-enabling plan mode within the window.
-- The execute-phase tools (`plan_verify`, `plan_task_update`, `plan_next`, and `plan_save` on a goal already in `execute`) stay fully operational with the guard off once a goal has cleared Gate 2 — that's the designed flow: Gate 2 releases the guard specifically so implementation can proceed unrestricted.
-- Planning-state mutations are the one thing that still requires plan mode active. `plan_intent`, and `plan_save`/`plan_advance` when the target goal is still in a planning phase (`discovery`…`review_final`), all refuse with `"plan mode is off — activate it first (shift+tab or /plan)"` if called with the guard off — writing or advancing a still-planning goal without the guard's read-only protection and phase prompts is exactly what plan mode exists to prevent.
+Some tools deliberately work with the guard off: ordinary `ask_smart_plan` forms, `plan_recall` and `journal_append` run in any session so the model can ask, look up prior work, or log a finding without making you engage plan mode. The execute-phase tools stay operational once a goal has cleared Gate 2 — that is the designed flow. Planning-state mutations are the exception: `plan_intent`, and `plan_save`/`plan_advance` on a goal still in a planning phase, refuse with `plan mode is off — activate it first (shift+tab or /plan)` when the guard is down.
 
-### Combining with pi-permission-system
+If you use `@gotgenes/pi-permission-system`, this extension's enforcement is independent (tool removal plus allowlist), so nothing breaks either way.
 
-If you use `@gotgenes/pi-permission-system`, this extension's enforcement is independent (tool removal + allowlist), so nothing breaks either way. For extra depth you can manually keep restrictive rules in its config during planning; automatic policy flipping is not possible without an upstream API.
+## Commit policy
 
-## Commit policy (default)
-
-Exactly one agent commit per goal — the final delivery commit (code + repo changes only, since plan/journal live outside the repo). There is **no approval commit**. Never push, never publish. Users who want different behavior should say so explicitly.
+Exactly one agent commit per goal — the final delivery commit, code and repo changes only, since plan and journal live outside the repo. There is no approval commit. Never push, never publish. Users who want different behavior should say so explicitly.
 
 ## Permissions
 
-If you use `@gotgenes/pi-permission-system` (default `*` = ask), allow the extension tools or every call pauses on a y/n prompt:
+If you use `@gotgenes/pi-permission-system` (default `*` = ask), allow the extension tools or every call pauses on a y/n prompt. The extension cannot flip that policy for you.
 
 ```json
 "ask_smart_plan": "allow",
+"plan_intent": "allow",
 "plan_exit": "allow",
 "plan_advance": "allow",
 "plan_next": "allow",
@@ -204,8 +222,6 @@ If you use `@gotgenes/pi-permission-system` (default `*` = ask), allow the exten
 "plan_recall": "allow",
 "plan_complete": "allow"
 ```
-
-The extension cannot flip that policy for you.
 
 ## Requirements
 

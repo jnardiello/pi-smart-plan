@@ -97,6 +97,35 @@ function snapshotPlan(snapshot: PhaseSnapshot): string {
 }
 
 // ---------------------------------------------------------------------------
+// simplify auto-pass — proportional ablation
+// ---------------------------------------------------------------------------
+
+/** Plans at or below this many non-empty lines skip simplify's cut-log
+ * requirement. An ablation pass on a plan this small produces invented cuts
+ * rather than real ones (observed: a single-file doc goal). */
+export const SIMPLIFY_AUTOPASS_LINES = 60;
+
+/** Non-empty line count of the snapshot's plan — the auto-pass measure. */
+export function planLineCount(snapshot: PhaseSnapshot): number {
+	return snapshotPlan(snapshot)
+		.split("\n")
+		.filter((line) => line.trim().length > 0).length;
+}
+
+/** Pure: does simplify's cut log get waived for this plan? Readiness stays
+ * zero-I/O; the caller (index.ts) writes simplifyAutoPassNote to the journal
+ * at the transition so the phase never vanishes from the record. */
+export function simplifyAutoPasses(snapshot: PhaseSnapshot): boolean {
+	const lines = planLineCount(snapshot);
+	return lines > 0 && lines <= SIMPLIFY_AUTOPASS_LINES;
+}
+
+/** The journal line the harness writes for itself on an auto-passed simplify. */
+export function simplifyAutoPassNote(lines: number): string {
+	return `auto-pass: plan below threshold (${lines} lines) — simplify waived, no ablation required`;
+}
+
+// ---------------------------------------------------------------------------
 // phaseDeliverableReady — exit preconditions per phase, deduced from the
 // PHASE_PROMPTS contracts in src/prompts.ts. All five planning phases exit
 // through the same formless plan_advance tool once ready — review_hld/
@@ -138,7 +167,7 @@ export function phaseDeliverableReady(phase: Phase, snapshot: PhaseSnapshot): { 
 			// shape check for both; only simplify additionally requires the log.
 			const content = snapshotPlan(snapshot);
 			for (const issue of validatePhaseShape(phase, content)) missing.push(issue.message);
-			if (phase === "simplify" && (snapshot.journalEntriesForPhase ?? 0) === 0) {
+			if (phase === "simplify" && (snapshot.journalEntriesForPhase ?? 0) === 0 && !simplifyAutoPasses(snapshot)) {
 				missing.push("no simplification cut-log journaled this phase — journal each cut, or one line why nothing to cut");
 			}
 			break;
@@ -218,8 +247,11 @@ const INTENT_TOOLS: readonly string[] = ["plan_intent"];
  * inside plan_advance) — there is no separate presentation tool to grant. */
 const ADVANCE_TOOLS: readonly string[] = ["plan_advance"];
 
-/** Execution workflow tools: execute only. */
-const EXECUTE_TOOLS: readonly string[] = ["plan_verify", "plan_task_update", "plan_next"];
+/** Execution workflow tools: execute only. Exported because the Gate-2
+ * handoff re-grants exactly these on the turn it briefs (index.ts): the grant
+ * issued mid-gate is invisible until a turn actually starts, so the surface
+ * has to be re-asserted where the briefing lands. */
+export const EXECUTE_TOOLS: readonly string[] = ["plan_verify", "plan_task_update", "plan_next"];
 
 // INVARIANT: all five planning phases — discovery, simplify, review_hld,
 // decompose, review_final — share exactly ONE tool surface (BASE + ALWAYS +
@@ -313,7 +345,7 @@ export function discoveryPreIntentSteer(attempt: number): string {
 		"plan_intent or ask_smart_plan, never a plain-prose plan and never an offer to implement. If any decision with alternatives is " +
 		"still open, put it to the owner as an ask_smart_plan form NOW, before plan_intent — never enumerate options in prose. Call " +
 		"plan_intent only once nothing is open: propose a kebab-case goal slug and confirm the objective — or call plan_intent " +
-		"declaring any open decisions in openQuestions, the harness forms them before any confirmation.";
+		"declaring any open decisions in openQuestions: the harness forms them first, then closes that same call on the objective confirmation.";
 	return withEscalation(base, attempt, "close with ask_smart_plan (open decisions) or plan_intent (nothing open)");
 }
 
@@ -353,6 +385,78 @@ export function discoveryPostIntentSteer(attempt: number): string {
  * complete) steer for attempt≥2 escalation. Mirrors DISCOVERY_PRE_INTENT_KEY's
  * role for the earlier gap. */
 export const DISCOVERY_POST_INTENT_KEY = "discovery:post-intent-prose-close";
+
+// ---------------------------------------------------------------------------
+// Content floor behind the "choices are ALWAYS ask_smart_plan forms" prompt
+// rule — the only check in this module that reads what a turn SAID rather
+// than how it closed.
+// ---------------------------------------------------------------------------
+
+const OPTION_LABEL_LINE = /^\s*(?:[-*•]\s*)?(?:\*\*)?\s*(?:opzione|option)\s+[0-9A-Za-z]\b/i;
+const LIST_ITEM_LINE = /^\s*(?:[-*•]\s+|\d+[.)]\s+)/;
+const EITHER_OR_MARKERS: readonly RegExp[] = [/\boppure\b/i, /\bin alternativa\b/i, /\balternativamente\b/i, /\balternatively\b/i, /\beither\b[\s\S]{0,120}?\bor\b/i];
+/** Courtesy sign-offs that read as choice words but offer nothing: "fatto come
+ * preferisci" closes a turn, it does not open one. Stripped before the markers
+ * run, so "se preferisci" and "quale preferisci" still count. This also drops
+ * the rare genuine "Come preferisci?", which the false-negative bias accepts.
+ * English courtesy forms ("as you prefer") match no marker to begin with. */
+const COURTESY_PHRASES = /\bcome\s+preferisci\b/gi;
+/** Deliberately narrow: every marker is second-person and asks the reader to
+ * PICK. Third-person reports ("l'owner preferisce"), diagnostic questions
+ * ("quale sia la causa?", "which of them fires first?"), narrative imperatives
+ * ("scegli Confirm") and hedges ("your call if that matters") are all choice
+ * words in shapes that offer nothing, and each one cost a false positive. */
+const CHOICE_REQUEST_MARKERS: readonly RegExp[] = [
+	/\bpreferisci\b/i,
+	/\bdimmi quale\b/i,
+	/\bfammi sapere quale\b/i,
+	/\bscegli (?:tu|una|uno|quale)\b/i,
+	/\bdecidi tu\b/i,
+	/\bwhich\b[^?\n]{0,60}\b(?:would|do)\s+you\b/i,
+	/\bdo you prefer\b/i,
+];
+
+/** True when the turn offered the owner a pick instead of a form. Biased to
+ * false negatives on purpose: regenerating a legitimate answer costs the owner
+ * more than a missed catch, in a conversation that is prose-first by design.
+ * A hit therefore ALWAYS needs both halves of an actual offer — an
+ * enumeration or either-or shape AND a direct second-person request to choose.
+ * Labelled options alone are not enough: "- Opzione A: … / - Opzione B: …"
+ * reads identically whether it offers a fork or recaps a settled one, so the
+ * enumeration only ever counts as the first half. */
+export function proposesAlternatives(text: string): boolean {
+	if (!text) return false;
+	const lines = text.split("\n");
+	const enumerated =
+		lines.filter((line) => LIST_ITEM_LINE.test(line)).length >= 2 ||
+		lines.filter((line) => OPTION_LABEL_LINE.test(line)).length >= 2;
+	if (!enumerated && !EITHER_OR_MARKERS.some((re) => re.test(text))) return false;
+	const asking = text.replace(COURTESY_PHRASES, " ");
+	return CHOICE_REQUEST_MARKERS.some((re) => re.test(asking));
+}
+
+/** Tools whose presence means the turn already put the choice to the owner as
+ * a form — the compliant close, never steered by the content floor. */
+const CHOICE_FLOOR_CLOSING: ReadonlySet<string> = new Set(["ask_smart_plan", "plan_intent"]);
+
+export function isChoiceFloorClosing(toolNamesCalledInLastAssistantTurn: string[]): boolean {
+	return toolNamesCalledInLastAssistantTurn.some((name) => CHOICE_FLOOR_CLOSING.has(name));
+}
+
+/** Distinct verdict key for the content floor, so the caller routes attempt≥2
+ * escalation to choiceFloorSteer instead of the phase's structural steer
+ * (which would name plan_advance for a violation that is about the form). */
+export function choiceFloorKey(phase: Phase): string {
+	return `${phase}:prose-choices`;
+}
+
+export function choiceFloorSteer(attempt: number): string {
+	const base =
+		"Your turn put alternatives to the owner in prose — this answer was discarded and regenerated by the harness. " +
+		"Every decision with alternatives goes to the owner as an ask_smart_plan form (its JSON questions vector, one tab per " +
+		"open decision), never enumerated in prose. Re-ask that same decision as a form now.";
+	return withEscalation(base, attempt, "put every choice to the owner via ask_smart_plan");
+}
 
 export const FINALIZE_RULES: Record<Phase, FinalizeRule | null> = {
 	discovery: {
@@ -456,24 +560,57 @@ export function finalizeVerdict(
 // "open a form" — discovery only exits via plan_advance once ready).
 // ---------------------------------------------------------------------------
 
-const ADVANCE_READY_HINT = "Next action: the deliverable is complete — call plan_advance NOW, do not keep chatting.";
+const ADVANCE_READY_HINT = "Next action: the deliverable is complete — call plan_advance.";
+// F2: the imperative variant is withheld until the model has actually sat on a
+// ready deliverable for a second consecutive turn (see noteReadyHintTurn) — a
+// nudge that fires on every save is background noise, not a guardrail.
+const ADVANCE_READY_HINT_URGED = "Next action: the deliverable is complete — call plan_advance NOW, do not keep chatting.";
 const REVIEW_READY_HINT = "Next action: call plan_advance — the owner's gate form opens.";
 const EXECUTE_READY_HINT = "Next action: goal complete — lead with outcome, changed files, verification, residual doubts.";
 const DISCOVERY_INTENT_HINT =
-	"Next action: restate the owner's objective and confirm it via plan_intent — or, if something is still open, declare it in plan_intent's openQuestions instead of confirming.";
+	"Next action: restate the owner's objective and confirm it via plan_intent — carrying any still-open decisions in its openQuestions, which the harness resolves first before closing the same call on the confirmation.";
 const DISCOVERY_NOT_READY_HINT =
 	"Next action: converge on the HLD with the owner, then write ## HLD, ## Scope, ## Non-goals, ## Decisions and ## DoD " +
 	"(with at least one executable command) into the plan and save it via plan_save.";
+
+/** F2: per goal+phase tally of consecutive turns closing on a READY deliverable
+ * the model did not advance out of. `turn` is the caller's monotonic turn
+ * counter; several hints inside one turn collapse into a single tally step. */
+export type ReadyHintState = { key: string; count: number; turn: number };
+
+/** Fold one ready-hint emission into the tally and report whether the
+ * imperative nudge is now warranted. Pure: the caller (index.ts) owns the
+ * mutable state and resets it on phase transition and guard off/on, so a
+ * different goal+phase always restarts calm. */
+export function noteReadyHintTurn(
+	state: ReadyHintState | undefined,
+	key: string,
+	turn: number,
+	ready: boolean,
+): { state: ReadyHintState | undefined; urge: boolean } {
+	// A not-ready turn is drafting, not sitting on a finished deliverable: it
+	// breaks the streak outright instead of freezing it, so legitimate rework can
+	// never bank credit toward the imperative nudge and hand it to the first
+	// genuinely ready turn.
+	if (!ready) return { state: undefined, urge: false };
+	const next: ReadyHintState =
+		state?.key !== key
+			? { key, count: 1, turn }
+			: state.turn === turn
+				? state
+				: { key, count: state.count + 1, turn };
+	return { state: next, urge: next.count >= 2 };
+}
 
 /** Phases that self-advance via the formless plan_advance tool once ready. */
 const ADVANCE_PHASES: ReadonlySet<Phase> = new Set<Phase>(["discovery", "simplify", "decompose"]);
 /** Phases that exit only through their owner-facing gate form once ready. */
 const REVIEW_PHASES: ReadonlySet<Phase> = new Set<Phase>(["review_hld", "review_final"]);
 
-export function nextActionHint(phase: Phase, snapshot: PhaseSnapshot): string {
+export function nextActionHint(phase: Phase, snapshot: PhaseSnapshot, urge = false): string {
 	const verdict = phaseDeliverableReady(phase, snapshot);
 	if (verdict.ready) {
-		if (ADVANCE_PHASES.has(phase)) return ADVANCE_READY_HINT;
+		if (ADVANCE_PHASES.has(phase)) return urge ? ADVANCE_READY_HINT_URGED : ADVANCE_READY_HINT;
 		if (REVIEW_PHASES.has(phase)) return REVIEW_READY_HINT;
 		return EXECUTE_READY_HINT; // execute
 	}

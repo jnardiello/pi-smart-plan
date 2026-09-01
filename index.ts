@@ -31,11 +31,21 @@ import { PHASES, type Phase } from "./src/plan-validate.ts";
 import { isReadOnlyCommand } from "./src/bash-guard.ts";
 import {
 	PHASE_ALLOWED_TOOLS,
+	EXECUTE_TOOLS,
 	FINALIZE_RULES,
 	finalizeVerdict,
 	nextActionHint,
+	noteReadyHintTurn,
+	type ReadyHintState,
 	phaseDeliverableReady,
+	planLineCount,
+	simplifyAutoPasses,
+	simplifyAutoPassNote,
 	DISCOVERY_PRE_INTENT_KEY,
+	choiceFloorKey,
+	choiceFloorSteer,
+	isChoiceFloorClosing,
+	proposesAlternatives,
 	discoveryPreIntentSteer,
 	DISCOVERY_POST_INTENT_KEY,
 	discoveryPostIntentSteer,
@@ -57,12 +67,24 @@ const BASH_BLOCK_REASON =
  * re-elicit before re-opening plan_intent. */
 const INTENT_KEEP_CHATTING_TEXT = "the owner rejected this objective — keep chatting, re-elicit, and re-open plan_intent when it's right";
 
+/** plan_intent's success text — shared by the ordinary Confirm form and the
+ * openQuestions flow's final Confirm page (both write the same intent.txt). */
+const INTENT_CONFIRMED_TEXT = "objective confirmed — proceed: optional grilling round, then HLD co-design and plan_save";
+
+/** The openQuestions flow's rejection — the owner picked "Reword" (or Esc, its
+ * exact equivalent) on the closing page: the ANSWERS are kept and returned (they
+ * cost the owner a form), the STATEMENT is not, so the model reformulates it
+ * from those answers and re-opens plan_intent. */
+const INTENT_REWORD_TEXT = "the owner kept these answers but rejected this statement — reformulate the objective FROM the answers above and call plan_intent again with the rewritten statement (openQuestions empty)";
+
 /** plan_intent's openQuestions — a trimmed ask_smart_plan question shape
  * (question, header?, options[] as a bare string or {label, description})
  * used as the confirmation-step safety net: if the model reaches plan_intent
  * with open decisions still in hand, declaring them here elicits the same
  * paged form ask_smart_plan renders (models fill fields they can see),
- * resolved BEFORE any OBJECTIVE card or Confirm/Keep-chatting form. */
+ * resolved BEFORE the objective is put up for confirmation — the same call
+ * then closes on a Confirm/Reword page (F3), so resolving the decisions and
+ * confirming the objective cost the owner one form run, not two. */
 const OPEN_QUESTION_SCHEMA = Type.Object({
 	question: Type.String(),
 	header: Type.Optional(Type.String()),
@@ -254,6 +276,21 @@ function ownedPhase(cwd: string): { goal: string; phase: Phase } | null {
  * of the phase state machine and no planning UI/status. */
 let isSubagentChild = false;
 
+/** The goal this session is authorized to be implementing right now, or
+ * undefined. THE single predicate behind the Gate-2 handoff: both the
+ * authorization text and the execute-surface re-grant resolve through it, so
+ * they can never disagree on a turn — the model is never authorized without
+ * the tools, nor handed the tools on the strength of a claim the
+ * authorization does not share. Claim-based on purpose (ownedPhase, not the
+ * repo-wide store phase): another session's goal sitting in execute
+ * authorizes nothing here. Guard back ON means read-only supervision, which
+ * is not an implementation turn either. */
+function liveExecuteGoal(cwd: string): string | undefined {
+	if (enabled || isSubagentChild) return undefined;
+	const owned = ownedPhase(cwd);
+	return owned?.phase === "execute" ? owned.goal : undefined;
+}
+
 /** A steer message is pending regeneration: skip the next prose-close verdict
  * if the run is our own regeneration (prevents steering our own steers). */
 let regenInFlight = false;
@@ -287,18 +324,28 @@ let gateFormOpen = false;
  * restart/guard-cycle tradeoff. */
 let gatePostponed = false;
 
-/** True once ANY tool has run (a permitted tool_call) during the current
- * pre-intent investigation, parent runs only. Latched unconditionally by the
- * tool_call handler on every allowed call (bash-allowed and allowlist-pass
- * paths alike) — cross-run persistence is required: the field failure this
- * floors is scout-in-run-1, prose-close-in-run-2. Fed into buildPhaseSnapshot
- * so finalizeVerdict's discovery branch can regenerate a tool-less prose
- * close instead of letting a model that never enters the machine go
- * unpoliced. Session-local by design: reset on guard off/on (restoreTools)
- * and on plan_intent's Confirm (anti-leak across a later goal in the same
- * session) — see PhaseSnapshot.investigationDone's doc for the accepted
- * restart/guard-cycle tradeoff. */
+/** True once ANY tool has run (a permitted tool_call) IN THE CURRENT TURN,
+ * parent runs only. Latched by the tool_call handler on every allowed call
+ * (bash-allowed and allowlist-pass paths alike) and cleared at the start of
+ * every owner turn (before_agent_start). F6: it used to persist across runs,
+ * which meant a single scout armed the pre-intent floor for every later prose
+ * close in the same session — owner conversation got regenerated into forms
+ * long after the investigation that justified it. Per-turn scoping keeps the
+ * floor exactly where it was designed to bite (a turn that investigates and
+ * then closes in prose without entering the machine) and gives it up where it
+ * was misfiring. Our own regeneration turns keep the latch (they are the same
+ * owner turn retried, not a new one). Also reset on guard off/on
+ * (restoreTools) and on plan_intent's Confirm. */
 let investigationDone = false;
+
+/** Monotonic count of owner turns started while the guard is on — the clock
+ * noteReadyHintTurn tallies against. Parent-only, process-local. */
+let turnSeq = 0;
+
+/** F2: consecutive-turn tally behind the imperative advance nudge. Reset on
+ * any real transitionPhase and on guard off/on, so a fresh phase always opens
+ * with the calm hint. */
+let eligibleTurns: ReadyHintState | undefined;
 
 /** Deliver a plan request as a custom message: content goes to the LLM, the
  * TUI shows only the single-line renderer. Idle → trigger a turn immediately;
@@ -376,16 +423,32 @@ function phaseWorkingMessage(phase: Phase): string {
 	return `◈ plan · ${phase} — ${PHASE_CAPTIONS[phase]}`;
 }
 
-/** Deliver the Gate-2 authorization + execute kickoff on a FRESH turn (same
- * idle/busy pattern as sendPlan): pi's setActiveTools only takes effect on
- * the model's NEXT turn, so the tool surface set(ctx, false, …) just
- * restored is invisible mid-run — queuing the briefing instead of returning
- * it inline lets the model actually see the full surface it needs. */
-function queueImplementationBriefing(pi: ExtensionAPI, ctx: ExtensionContext, goal: string): void {
-	const content =
+/** Gate-2 authorization armed at the click, consumed by before_agent_start on
+ * whichever turn actually starts next. Holding it here instead of sending the
+ * text immediately is what makes the handoff atomic: an owner message that
+ * pre-empts the harness-triggered turn carries the same briefing and the same
+ * re-granted surface, and a goal that moved on in between gets no briefing at
+ * all. cwd-scoped like every other claim — a pending handoff never fires
+ * against a different repo. */
+let pendingBriefing: { cwd: string; goal: string } | undefined;
+
+/** The authorization text itself — owner's answer IS the authorization. */
+function authorizationBriefing(): string {
+	return (
 		"(APPROVED by owner — plan mode released. The owner's answer IS the authorization: start implementing NOW. Do not ask for confirmation again.)\n\n" +
-		phaseMissionLine("execute");
-	sendPlan(pi, ctx, content, goal);
+		phaseMissionLine("execute")
+	);
+}
+
+/** Arm the Gate-2 handoff and trigger/announce the turn that will carry it.
+ * pi's setActiveTools only takes effect from the next turn, so the execute
+ * surface set(ctx, false, …) just restored is invisible mid-run — the message
+ * sent here exists to start that turn, and deliberately carries NO
+ * authorization text, so it stays harmless if the goal is completed or moved
+ * off execute before the turn runs. */
+function armHandoffAndStartTurn(pi: ExtensionAPI, ctx: ExtensionContext, goal: string): void {
+	pendingBriefing = { cwd: ctx.cwd, goal };
+	sendPlan(pi, ctx, `(Gate 2 authorized — plan mode released for '${goal}'; the execute contract lands with the next turn.)`, goal);
 }
 
 /** Heat ramp for the phase bar: starts neutral gray, warms up to vivid
@@ -572,6 +635,37 @@ export default function planGuard(pi: ExtensionAPI): void {
 		sessionState.dodPassed = false;
 		sessionState.completed = false;
 		investigationDone = false;
+		eligibleTurns = undefined;
+	}
+
+	/** Re-assert the execute tools on the turn being started. Gate 2 grants them
+	 * mid-run, where a GRANT is invisible — without this, a turn that starts
+	 * before the harness's own kickoff (an owner message pre-empting it) runs an
+	 * authorized model against a surface with no plan_next/plan_task_update/
+	 * plan_verify. Idempotent and additive: only names the catalogue actually
+	 * registers, only when missing. */
+	function ensureExecuteSurface(): void {
+		const active = pi.getActiveTools();
+		const present = new Set(active);
+		const registeredNames = new Set(pi.getAllTools().map((tool) => tool.name));
+		const missing = EXECUTE_TOOLS.filter((name) => registeredNames.has(name) && !present.has(name));
+		if (missing.length > 0) pi.setActiveTools([...active, ...missing]);
+	}
+
+	/** Consume a Gate-2 handoff on the turn that is actually starting. Returns
+	 * the authorization text, or undefined when nothing is armed or the world
+	 * moved on between the click and this turn — a stale "start implementing
+	 * NOW" landing on an already-completed goal, on a re-guarded session or on
+	 * a session that now owns something else is exactly the failure this
+	 * replaces. Cleared whether or not it is delivered: a handoff is spent by
+	 * the first turn it reaches, never re-armed silently — an authorization
+	 * that could lie dormant and fire against a later state is strictly more
+	 * dangerous than one the owner has to re-issue at the gate. */
+	function consumeBriefing(ctx: ExtensionContext): string | undefined {
+		const pending = pendingBriefing;
+		if (!pending || isSubagentChild || pending.cwd !== ctx.cwd) return undefined;
+		pendingBriefing = undefined;
+		return liveExecuteGoal(ctx.cwd) === pending.goal ? authorizationBriefing() : undefined;
 	}
 
 	/** Shared phase-transition sequence — the ONLY way the machine advances:
@@ -588,6 +682,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 		retryCount = 0;
 		regenInFlight = false;
 		gatePostponed = false;
+		eligibleTurns = undefined;
 		refreshWidget(ctx);
 		restrictTools(ctx);
 		ctx.ui.setWorkingMessage(phaseWorkingMessage(to));
@@ -608,6 +703,37 @@ export default function planGuard(pi: ExtensionAPI): void {
 		persistGuardState(toolsBeforePlanMode);
 	}
 
+	/** The write side of plan_intent's Confirm, shared verbatim by its two
+	 * confirm paths (the ordinary Confirm/Keep-chatting form and the
+	 * openQuestions flow's closing Confirm/Reword page) so neither can drift
+	 * from the other. Returns a refusal result when the objective must NOT be
+	 * written, undefined once it is confirmed.
+	 *
+	 * F6 (TOCTOU): every guard in plan_intent ran BEFORE the form await — a
+	 * parallel tool call could have switched/repointed the session goal or
+	 * advanced/completed THIS goal while the owner was answering. The re-check
+	 * here runs right before the write, so a violation refuses with no write,
+	 * never a stale-checked confirm. */
+	function commitConfirmedIntent(ctx: ExtensionContext, goal: string, statement: string): ReturnType<typeof refuse> | undefined {
+		const refusalNow = intentRefusal(ctx.cwd, goal);
+		if (refusalNow) return refusalNow;
+		try {
+			confirmIntent(ctx.cwd, goal, statement);
+		} catch (error) {
+			return refuse(safeError("plan_intent", error));
+		}
+		// Confirming the objective is what binds a goal to THIS session: from here
+		// its tool surface, prompt injection and widget cursor follow this goal,
+		// not the repo-wide active.txt pointer another session may repoint at any
+		// moment.
+		setSessionGoal(ctx.cwd, goal);
+		// Anti-leak: the pre-intent investigation flag must not survive into a
+		// later goal confirmed in the same session.
+		investigationDone = false;
+		refreshWidget(ctx);
+		return undefined;
+	}
+
 	/** The ownership rule for the four tools that name their goal as a PARAMETER
 	 * (plan_save, plan_task_update, plan_verify, plan_complete): taken as given,
 	 * the parameter let any session write to, tick or complete another session's
@@ -626,6 +752,12 @@ export default function planGuard(pi: ExtensionAPI): void {
 				goal,
 				owned: owned.goal,
 			});
+		}
+		// A completed goal reads as "never yours" under the plain refusal, which
+		// misdescribes the common case: this session drove it and plan_complete
+		// released the claim. Name the real state and the way back in.
+		if (goalIsDone(cwd, goal)) {
+			return refuse(`${tool} blocked — "${goal}" is completed and its claim released; re-opening a completed goal happens automatically on the next plan_save.`, { goal, completed: true });
 		}
 		return refuse(`${tool} blocked — this session has no plan of its own, so "${goal}" is not its to touch. A plan starts by confirming an objective (plan_intent).`, { goal });
 	}
@@ -804,7 +936,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 				persistApproved(ctx.cwd, goal);
 				transitionPhase(ctx, goal, "execute", "Gate 2 AUTHORIZED — guard released");
 				set(ctx, false, "Plan approved — plan mode OFF, full access restored.", "info");
-				queueImplementationBriefing(pi, ctx, goal);
+				armHandoffAndStartTurn(pi, ctx, goal);
 				blocks.push("(GATE 2 AUTHORIZED — plan mode released. Wind down this turn; the implementation briefing arrives on the next turn.)");
 				return ok(blocks.join("\n"), { answers: result.answers, released: true, phase: "execute" });
 			}
@@ -862,7 +994,7 @@ export default function planGuard(pi: ExtensionAPI): void {
 				set(ctx, false, "◈ Plan mode OFF — full access restored.", "info");
 				if (approved) {
 					appendJournal(ctx.cwd, approved, "owner confirmed exit — implementation authorized");
-					// Same fresh-turn pattern as queueImplementationBriefing (mid-run
+					// Same fresh-turn pattern as armHandoffAndStartTurn (mid-run
 					// tool GRANTS never reach the model this same turn): a short result
 					// here, the real kickoff queued for the NEXT turn where the
 					// restored full tool surface is actually visible.
@@ -1041,6 +1173,17 @@ export default function planGuard(pi: ExtensionAPI): void {
 			}
 			const blocked = deliverableBlocked(ctx, current, `plan_advance blocked — "${current.phase}" deliverable incomplete`, { phase: current.phase, target });
 			if (blocked) return blocked;
+			// F5: simplify auto-pass. phaseDeliverableReady waives the cut log for a
+			// plan under the threshold, but the phase must still leave a trace — the
+			// harness journals it here (the transition site) rather than inside the
+			// predicate, which stays pure/zero-I/O. Written BEFORE transitionPhase so
+			// it lands in the simplify segment it describes.
+			if (current.phase === "simplify") {
+				const snapshot = buildPhaseSnapshot(ctx, current);
+				if ((snapshot.journalEntriesForPhase ?? 0) === 0 && simplifyAutoPasses(snapshot)) {
+					appendJournal(ctx.cwd, current.goal, simplifyAutoPassNote(planLineCount(snapshot)));
+				}
+			}
 			// Target is a review phase: the owner gate needs the interactive TUI —
 			// refuse BEFORE transitioning so a goal is never stranded in an
 			// ungateable phase.
@@ -1068,7 +1211,8 @@ export default function planGuard(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "plan_save",
 		label: "Save plan",
-		description: "Write (overwrite) plan.md for a goal in the external plan store.",
+		description:
+			"Write (overwrite) plan.md for a goal in the external plan store. Once a ## Tasks section exists, every task is a FLAT record — per-task fields are SIBLING lines directly under the header, never nested sub-bullets:\n- [ ] T1: short title\n  deps: []\n  owns: [src/]\n  done: echo ok",
 		promptSnippet: "plan_save: persist the approved plan for a goal",
 		promptGuidelines: ["Use plan_save to write the plan; the store lives outside the repo — never reference its paths."],
 		parameters: Type.Object({
@@ -1102,22 +1246,25 @@ export default function planGuard(pi: ExtensionAPI): void {
 		name: "plan_intent",
 		label: "Confirm objective",
 		description:
-			"Owner-backed mechanical gate: reformulate the owner's objective for a goal and open a Confirm/Keep chatting form. Only a Confirm answer creates the confirmed objective (intent.txt) — plan_save refuses any content for the goal until this has run. Re-run in discovery to re-confirm a refined statement (e.g. after a grilling round or a Gate 1 rejection).",
+			"Owner-backed mechanical gate: reformulate the owner's objective for a goal and open a Confirm/Keep chatting form — or, when openQuestions carries still-open decisions, form those first and close the same call on a Confirm/Reword page. Only a Confirm answer creates the confirmed objective (intent.txt) — plan_save refuses any content for the goal until this has run. Re-run in discovery to re-confirm a refined statement (e.g. after a grilling round or a Gate 1 rejection).",
 		promptSnippet: "plan_intent: confirm the owner's objective before starting the HLD (owner-backed gate — required once per goal before plan_save)",
 		promptGuidelines: [
 			"Call plan_intent as soon as you can state the objective, and BEFORE any HLD work — plan_save is rejected until it returns confirmed.",
 			"Keep chatting (or Esc) REJECTS the objective — nothing is created; re-elicit with the owner and call plan_intent again with the revised statement. Only Confirm creates it.",
+			"With openQuestions, the same call resolves the decisions and then closes on a Confirm/Reword page — so state the best objective you can even while questions are open; Reword (or a cancel) is what costs a second call.",
 			"Never reference store paths.",
 		],
 		parameters: Type.Object({
 			goal: Type.String(),
-			statement: Type.String(),
+			statement: Type.String({
+				description: `The objective as ONE line: the WHAT the owner wants plus its essential constraints, never the HOW (implementation choices belong in the HLD). Hard cap ${OBJECTIVE_MAX_LEN} characters — a longer statement is refused before the form opens.`,
+			}),
 			openQuestions: Type.Optional(
 				Type.Array(OPEN_QUESTION_SCHEMA, {
 					minItems: 1,
 					maxItems: 12,
 					description:
-						"Declare any still-open decisions here instead of confirming — the harness forms them (auto-paged) BEFORE any card/confirm form; the store stays untouched. Call plan_intent again with openQuestions empty (or omitted) once resolved.",
+						"Declare any still-open decisions here instead of confirming — the harness forms them (auto-paged) FIRST, then closes the same form on a Confirm/Reword page, so a resolved set confirms the objective in this same call. Only Reword (or a cancel) costs a second call.",
 				}),
 			),
 		}),
@@ -1147,20 +1294,17 @@ export default function planGuard(pi: ExtensionAPI): void {
 			if (!sanitizedPreview) {
 				return refuse("plan_intent needs a non-empty objective statement");
 			}
-			// openQuestions branch: a pre-confirmation safety net, NOT a variant of
-			// Confirm — the statement may still be provisional while questions are
-			// open, so the length cap below applies ONLY to the confirm branch
-			// (hasOpenQuestions === false). Every other guard (slug/statement,
-			// lock/goal-switch, intentGuardViolation, gateFormOpen latch below)
-			// applies unconditionally to BOTH branches.
+			// openQuestions branch: open decisions are resolved FIRST, then the same
+			// paged form closes on a Confirm/Reword page — so this branch can confirm
+			// too, and every guard applies identically to both.
 			const openQuestions = params.openQuestions ?? [];
 			const hasOpenQuestions = openQuestions.length > 0;
-			// Cap check moved HERE, pre-form: the owner must never sit through the
-			// Confirm/Keep-chatting form only to have confirmIntent reject an
-			// over-cap statement afterwards. Refuse before any entry is appended or
-			// any form opens — confirmIntent's own check (below, on Confirm) stays as
-			// a belt for callers that somehow bypass this one.
-			if (!hasOpenQuestions && sanitizedPreview.length > OBJECTIVE_MAX_LEN) {
+			// Cap check runs HERE, pre-form and unconditionally: the owner must never
+			// sit through a form (least of all a paged question set) only to have
+			// confirmIntent reject an over-cap statement on the closing page. Refuse
+			// before any entry is appended or any form opens — confirmIntent's own
+			// check stays as a belt for callers that somehow bypass this one.
+			if (sanitizedPreview.length > OBJECTIVE_MAX_LEN) {
 				return refuse("objective too long — distill it: WHAT the owner wants and the essential constraints, not HOW (implementation choices belong to the HLD)");
 			}
 			// F2: guard the TARGET goal directly (readMachinePhase/goalIsDone,
@@ -1179,24 +1323,57 @@ export default function planGuard(pi: ExtensionAPI): void {
 				// SAFETY NET: openQuestions lets the model reach plan_intent with open
 				// decisions still in hand — declaring them here elicits the SAME paged
 				// form ask_smart_plan renders (models fill fields they can see),
-				// resolved BEFORE any card/confirm form. The store stays untouched: no
-				// OBJECTIVE PROPOSAL entry, no Confirm/Keep-chatting form. The
-				// result text tells the model to resolve the answers and re-call
-				// plan_intent with openQuestions empty (or omitted) to confirm.
+				// resolved BEFORE any card/confirm form. Answered in full, the same
+				// form closes on a Confirm/Reword page (below); only a cancel leaves
+				// the store untouched — no OBJECTIVE PROPOSAL entry, no confirm form.
 				if (hasOpenQuestions) {
 					const collected = await runAskFormPages(ctx, openQuestions);
 					const blocks = collectedBlocks(collected);
-					if (collected.declined && collected.unanswered.length > 0) {
-						blocks.push(`UNANSWERED — the owner cancelled before answering these questions (do NOT assume them): ${collected.unanswered.map((q) => q.question).join(" | ")}`);
-						blocks.push("ANSWER RULE: unanswered questions must be re-asked, never assumed.");
+					// Cancelled mid-questions: no closing page follows a cancel. The
+					// answer set is incomplete, so the statement is never put up for
+					// Confirm on this call — the store stays untouched, exactly as
+					// before F3.
+					if (collected.declined) {
+						if (collected.unanswered.length > 0) {
+							blocks.push(`UNANSWERED — the owner cancelled before answering these questions (do NOT assume them): ${collected.unanswered.map((q) => q.question).join(" | ")}`);
+							blocks.push("ANSWER RULE: unanswered questions must be re-asked, never assumed.");
+						}
+						blocks.push("Put the unresolved questions back to the owner — call plan_intent again carrying them in openQuestions, or ask them via ask_smart_plan. Do NOT confirm the objective while any fork is still unresolved.");
+						return ok(blocks.join("\n"), {
+							goal: params.goal,
+							answers: collected.answers,
+							declined: true,
+							unanswered: collected.unanswered.map((q) => q.question),
+						});
 					}
-					blocks.push("Resolve these answers with the owner, then call plan_intent again with openQuestions empty (or omitted) to confirm.");
-					return ok(blocks.join("\n"), {
-						goal: params.goal,
-						answers: collected.answers,
-						declined: collected.declined,
-						unanswered: collected.unanswered.map((q) => q.question),
-					});
+					// F3: every question answered → the SAME paged form closes on a
+					// final Confirm/Reword page, so a resolved set of open decisions
+					// confirms the objective in THIS call instead of costing the owner
+					// a second plan_intent round trip. The proposal card is appended
+					// first, exactly as in the ordinary flow: it is the single source
+					// for the statement text, so the closing page's side panel carries
+					// the just-given answers instead of repeating it.
+					pi.appendEntry(INTENT_ENTRY_KEY, { goal: params.goal, statement: sanitizedPreview });
+					const closing: AskQuestionInput = {
+						question: "Is this the objective?",
+						detail: `Answers just given:\n${blocks.join("\n")}`,
+						options: [{ label: "Confirm" }, { label: "Reword" }],
+					};
+					// Harness-composed, like the ordinary confirm form and the two
+					// gates: fixed labels, no built-in "None of the above".
+					const closingResult = await runAskForm(ctx, [closing], { includeNoneOption: false });
+					const closingLabel = "declined" in closingResult ? undefined : pickLabel(closingResult.answers[closing.question]);
+					if (closingLabel === "Confirm") {
+						const refusalNow = commitConfirmedIntent(ctx, params.goal, params.statement);
+						if (refusalNow) return refusalNow;
+						blocks.push(INTENT_CONFIRMED_TEXT);
+						return ok(blocks.join("\n"), { goal: params.goal, answers: collected.answers, confirmed: true });
+					}
+					// Only "Reword" remains — and Esc, its exact equivalent (the page
+					// has no other option): nothing is written, the answers are
+					// returned so the model can rewrite the statement from them.
+					blocks.push(INTENT_REWORD_TEXT);
+					return ok(blocks.join("\n"), { goal: params.goal, answers: collected.answers, reworded: true });
 				}
 				// The proposal in the transcript — this durable card is the single
 				// source for the statement text; the form's side panel does not
@@ -1216,28 +1393,9 @@ export default function planGuard(pi: ExtensionAPI): void {
 				const answer = result.answers[question.question];
 				const label = pickLabel(answer);
 				if (label === "Confirm") {
-					// F6 (TOCTOU): the guards above ran before the form await — a
-					// parallel tool call could have switched/repointed the session
-					// goal or advanced/completed THIS goal while the owner was
-					// answering. Re-run both checks now, right before the write; any
-					// violation refuses with no write, never a stale-checked confirm.
-					const refusalNow = intentRefusal(ctx.cwd, params.goal);
+					const refusalNow = commitConfirmedIntent(ctx, params.goal, params.statement);
 					if (refusalNow) return refusalNow;
-					try {
-						confirmIntent(ctx.cwd, params.goal, params.statement);
-					} catch (error) {
-						return refuse(safeError("plan_intent", error));
-					}
-					// Confirming the objective is what binds a goal to THIS session:
-					// from here its tool surface, prompt injection and widget cursor
-					// follow this goal, not the repo-wide active.txt pointer another
-					// session may repoint at any moment.
-					setSessionGoal(ctx.cwd, params.goal);
-					// Anti-leak: the pre-intent investigation flag must not survive
-					// into a later goal confirmed in the same session.
-					investigationDone = false;
-					refreshWidget(ctx);
-					return ok("objective confirmed — proceed: optional grilling round, then HLD co-design and plan_save", { goal: params.goal, confirmed: true });
+					return ok(INTENT_CONFIRMED_TEXT, { goal: params.goal, confirmed: true });
 				}
 				// Only "Keep chatting" remains — the form has no other option (Esc/
 				// decline above is this same explicit-rejection path's equivalent).
@@ -1347,15 +1505,21 @@ export default function planGuard(pi: ExtensionAPI): void {
 				const text = updateTaskStatus(ctx.cwd, params.goal, params.taskId, params.status);
 				noteCwd(ctx);
 				refreshWidget(ctx);
+				// Read AFTER updateTaskStatus: the checkbox is flipped server-side,
+				// so this view already carries the very close being reported.
+				const view = getPlanView(ctx.cwd, params.goal);
 				// Live progress on the working message, execute only: the guard is
 				// already off by the time real task work happens (Gate 2 released
 				// it), so this is the one place execute's own progress can still
 				// reach the working line — refreshed on every task-status call.
-				if (ownedPhase(ctx.cwd)?.phase === "execute") {
-					const view = getPlanView(ctx.cwd, params.goal);
-					if (view) ctx.ui.setWorkingMessage(`◈ plan · execute — implementing (${view.doneCount}/${view.total} done)`);
+				if (view && ownedPhase(ctx.cwd)?.phase === "execute") {
+					ctx.ui.setWorkingMessage(`◈ plan · execute — implementing (${view.doneCount}/${view.total} done)`);
 				}
-				return ok(text, { goal: params.goal, taskId: params.taskId, status: params.status });
+				const details: Record<string, unknown> = { goal: params.goal, taskId: params.taskId, status: params.status };
+				// Only a close prints the whole checklist — the sense of progress is
+				// worth the rows there; every other status stays a one-liner.
+				if (params.status === "done" && view) details.checklist = { tasks: view.tasks, doneCount: view.doneCount, total: view.total, frontier: view.frontier };
+				return ok(text, details);
 			} catch (error) {
 				return refuse(safeError("plan_task_update", error));
 			}
@@ -1579,7 +1743,14 @@ export default function planGuard(pi: ExtensionAPI): void {
 			const current = ownedPhase(ctx.cwd);
 			if (current) {
 				const snapshot = buildPhaseSnapshot(ctx, current);
-				aside.push(nextActionHint(current.phase, snapshot));
+				// F2: the phase guidance always ships; only its imperative form is
+				// earned, by a second consecutive turn spent on a ready deliverable.
+				// Readiness gates the tally itself — drafting turns must not bank
+				// credit that lands on the first turn the deliverable is actually done.
+				const ready = phaseDeliverableReady(current.phase, snapshot).ready;
+				const tally = noteReadyHintTurn(eligibleTurns, `${current.goal}:${current.phase}`, turnSeq, ready);
+				eligibleTurns = tally.state;
+				aside.push(nextActionHint(current.phase, snapshot, tally.urge));
 			}
 		}
 		if (aside.length === 0) return undefined;
@@ -1627,7 +1798,16 @@ export default function planGuard(pi: ExtensionAPI): void {
 		const endedWithText = last?.type === "text";
 
 		const snapshot = buildPhaseSnapshot(ctx, current);
-		const verdict = finalizeVerdict(phase, toolNames, endedWithText, snapshot);
+		const structural = finalizeVerdict(phase, toolNames, endedWithText, snapshot);
+		// Content floor, additive to the structural rules above: those judge only
+		// HOW the turn closed, so a planning turn that enumerated alternatives in
+		// prose passes them cleanly. Scoped to planning phases (execute stays
+		// exempt) and skipped when the turn already opened a form.
+		const proseText = assistant.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
+		const verdict =
+			structural.ok && isPlanningPhase(phase) && endedWithText && !isChoiceFloorClosing(toolNames) && proposesAlternatives(proseText)
+				? { ok: false as const, steer: choiceFloorSteer(1), key: choiceFloorKey(phase), missing: [] as string[] }
+				: structural;
 		if (verdict.ok) {
 			retryCount = 0;
 			return;
@@ -1654,7 +1834,9 @@ export default function planGuard(pi: ExtensionAPI): void {
 				? discoveryPreIntentSteer(retryCount)
 				: verdict.key === DISCOVERY_POST_INTENT_KEY
 					? discoveryPostIntentSteer(retryCount)
-					: rule!.steer(retryCount, verdict.missing);
+					: verdict.key === choiceFloorKey(phase)
+						? choiceFloorSteer(retryCount)
+						: rule!.steer(retryCount, verdict.missing);
 		if (ctx.isIdle()) {
 			pi.sendUserMessage(steer, {});
 		} else {
@@ -1692,11 +1874,23 @@ export default function planGuard(pi: ExtensionAPI): void {
 		// retry budget for the phase. Our own regenerate steers also pass through
 		// this hook — regenInFlight is still set for them, so they are skipped and
 		// keep their escalating attempt number.
-		if (!isSubagentChild && !regenInFlight) retryCount = 0;
+		// F6: the investigation latch is per turn — a tool that ran in an EARLIER
+		// turn no longer forces this one to close through a form. Regeneration
+		// turns are the same owner turn retried, so they keep both the budget and
+		// the latch.
+		if (!isSubagentChild) turnSeq += 1;
+		if (!isSubagentChild && !regenInFlight) {
+			retryCount = 0;
+			investigationDone = false;
+		}
 		noteCwd(ctx);
-		const injection = planInjection(ctx.cwd);
-		if (!injection) return undefined;
-		return { systemPrompt: `${event.systemPrompt}\n\n${injection}` };
+		// Briefing and surface are decided on the SAME turn, in this order: the
+		// model is never authorized to implement without the tools to do it.
+		const handoff = consumeBriefing(ctx);
+		if (liveExecuteGoal(ctx.cwd) !== undefined) ensureExecuteSurface();
+		const appended = [planInjection(ctx.cwd), handoff].filter((part): part is string => part !== undefined);
+		if (appended.length === 0) return undefined;
+		return { systemPrompt: [event.systemPrompt, ...appended].join("\n\n") };
 	});
 
 	// Restore guard state on startup/reload/new/resume/fork, re-applying the

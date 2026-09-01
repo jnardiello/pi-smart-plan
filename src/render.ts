@@ -110,6 +110,10 @@ function renderTaskLine(task: PlanViewTask, isLast: boolean, indexInWave: number
 	return `${branch} ${glyph} ${title}${trailer}`;
 }
 
+/** The slice of a PlanView the todo-DAG actually reads. A task-close
+ * checklist carries exactly this and leaves OBJECTIVE/SCOPE/HLD behind. */
+export type TaskDagView = Pick<PlanView, "tasks" | "doneCount" | "total" | "frontier">;
+
 /** Style-B todo-DAG: one vertical trunk (`│`) linking wave headers, `├─`/
  * `└─` branches per task within a wave, done/ready/pending glyphs, the
  * in-wave parallel marker `∥`, cross-wave deps `← T1,T2`, closed by a
@@ -117,7 +121,7 @@ function renderTaskLine(task: PlanViewTask, isLast: boolean, indexInWave: number
  * (already 1-based from computeLayers) in first-seen order, which tolerates
  * the store not having tasks pre-sorted by wave. Returns [] when there are
  * no tasks yet (HLD-only draft) — the DAG only renders once tasks exist. */
-function renderTaskDag(view: PlanView, theme: PanelTheme, builders: { line: (content?: string) => string[]; trunc: (content: string) => string[] }, narrow: boolean): string[] {
+function renderTaskDag(view: TaskDagView, theme: PanelTheme, builders: { line: (content?: string) => string[]; trunc: (content: string) => string[] }, narrow: boolean): string[] {
 	if (view.tasks.length === 0) return [];
 	const { line, trunc } = builders;
 	const waveOrder: number[] = [];
@@ -151,6 +155,15 @@ function renderTaskDag(view: PlanView, theme: PanelTheme, builders: { line: (con
 	const ready = view.frontier.length > 0 ? view.frontier.join(" ") : "none";
 	lines.push(...trunc(theme.fg("muted", `${view.doneCount}/${view.total} done · ready now: ${ready}`)));
 	return lines;
+}
+
+/** The todo-DAG on its own, for callers that render outside a panel. Tool
+ * results get no width hint (unlike entry renderers), so the builders are
+ * identity here: no border, no truncation to a guessed width — pi-tui wraps
+ * the rows against the real viewport instead. */
+export function renderTaskChecklist(view: TaskDagView, theme: PanelTheme): string[] {
+	const passthrough = (content = ""): string[] => [content];
+	return renderTaskDag(view, theme, { line: passthrough, trunc: passthrough }, false);
 }
 
 /** Themed implementation-plan panel: header, a labeled OBJECTIVE / SCOPE /
@@ -413,11 +426,21 @@ export const toolRenderers: Record<string, { renderCall: (...args: any[]) => Tex
 			const verb = TASK_STATUS_VERB[args.status] ?? args.status;
 			return new Text(`${toolCallLabel(theme, `${args.taskId} →`)} ${theme.fg("accent", verb)}`, 0, 0);
 		},
-		renderResult(result: { content: Array<{ type: string; text?: string }> }, { isPartial }: ResultOpts, theme: PanelTheme, context: RenderContext) {
+		renderResult(result: { content: Array<{ type: string; text?: string }>; details?: unknown }, { isPartial }: ResultOpts, theme: PanelTheme, context: RenderContext) {
 			const prelude = stdResult(theme, isPartial, "updating");
 			if (prelude) return prelude;
 			const text = firstLine(resultText(result));
-			return new Text(theme.fg(context.isError ? "error" : "success", text), 0, 0);
+			const headline = theme.fg(context.isError ? "error" : "success", text);
+			// The checklist rides along only on a `done` close (see index.ts), so
+			// every other status keeps the bare headline. A goal with no tasks
+			// yields no rows and falls back to it too.
+			// The payload is re-rendered verbatim when a transcript is restored, so it
+			// may predate this field or be malformed: anything that would make the DAG
+			// throw degrades to the headline instead.
+			const raw = (result.details as { checklist?: Partial<TaskDagView> } | undefined)?.checklist;
+			const checklist = Array.isArray(raw?.tasks) && Array.isArray(raw?.frontier) ? (raw as TaskDagView) : undefined;
+			const rows = checklist ? renderTaskChecklist(checklist, theme) : [];
+			return new Text(rows.length > 0 ? [headline, ...rows].join("\n") : headline, 0, 0);
 		},
 	},
 

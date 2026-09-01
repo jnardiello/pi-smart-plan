@@ -9,10 +9,19 @@ import {
 	phaseDeliverableReady,
 	finalizeVerdict,
 	nextActionHint,
+	noteReadyHintTurn,
 	DISCOVERY_PRE_INTENT_KEY,
 	discoveryPreIntentSteer,
 	DISCOVERY_POST_INTENT_KEY,
 	discoveryPostIntentSteer,
+	proposesAlternatives,
+	isChoiceFloorClosing,
+	choiceFloorKey,
+	choiceFloorSteer,
+	SIMPLIFY_AUTOPASS_LINES,
+	planLineCount,
+	simplifyAutoPasses,
+	simplifyAutoPassNote,
 } from "../src/phase-machine.ts";
 import { validatePhaseShape, shapeErrorMessage } from "../src/plan-validate.ts";
 import { isPlanningPhase } from "../src/plan-store.ts";
@@ -56,6 +65,10 @@ No implementation happens in this phase.
 ## DoD
 - echo ok
 `;
+
+// Same shape, above SIMPLIFY_AUTOPASS_LINES — a plan big enough that simplify
+// still demands a real cut log (F5's auto-pass must NOT fire here).
+const BIG_HLD = COMPLETE_HLD.replace("## Decisions", `## Decisions\n${Array.from({ length: 70 }, (_, i) => `- decision ${i}: weighed and recorded`).join("\n")}`);
 
 // Same shape, plus a valid 2-task DAG (T2 deps on T1, disjoint owns, both
 // carry a done: check) — satisfies decompose/review_final's task requirement.
@@ -184,7 +197,28 @@ console.log("\n[phaseDeliverableReady — one ready + one not-ready per phase, c
 check("discovery not-ready: no goal stated (names plan_intent)", phaseDeliverableReady("discovery", {}).missing.some((m) => m.includes("no goal stated yet") && m.includes("plan_intent")));
 check("discovery ready: goal + intent confirmed + complete HLD", phaseDeliverableReady("discovery", { goal: "demo", intentConfirmed: true, planContent: COMPLETE_HLD }).ready === true);
 check("simplify ready: valid HLD + journaled cut", phaseDeliverableReady("simplify", { planContent: COMPLETE_HLD, journalEntriesForPhase: 1 }).ready === true);
-check("simplify not-ready: no journal entry this phase", phaseDeliverableReady("simplify", { planContent: COMPLETE_HLD }).missing.some((m) => m.includes("cut-log journaled")));
+check(
+	"simplify not-ready: no journal entry this phase (plan ABOVE the auto-pass threshold)",
+	phaseDeliverableReady("simplify", { planContent: BIG_HLD }).missing.some((m) => m.includes("cut-log journaled")),
+);
+
+// F5 — simplify auto-pass: an ablation pass on a tiny plan produces invented
+// cuts, so the cut log is waived below the threshold (the harness journals it).
+console.log("\n[F5 — simplify auto-pass below the size threshold]");
+check(`SIMPLIFY_AUTOPASS_LINES is ${SIMPLIFY_AUTOPASS_LINES}; COMPLETE_HLD sits under it, BIG_HLD over it`, planLineCount({ planContent: COMPLETE_HLD }) <= SIMPLIFY_AUTOPASS_LINES && planLineCount({ planContent: BIG_HLD }) > SIMPLIFY_AUTOPASS_LINES);
+check("planLineCount ignores blank lines", planLineCount({ planContent: "a\n\n\n  \nb" }) === 2);
+check("small plan auto-passes, big plan does not", simplifyAutoPasses({ planContent: COMPLETE_HLD }) === true && simplifyAutoPasses({ planContent: BIG_HLD }) === false);
+check("an EMPTY plan never auto-passes (it fails the shape check instead)", simplifyAutoPasses({ planContent: "" }) === false && simplifyAutoPasses({}) === false);
+check(
+	"small plan + zero journal entries → simplify READY (cut log waived)",
+	phaseDeliverableReady("simplify", { planContent: COMPLETE_HLD }).ready === true,
+);
+check(
+	"auto-pass waives ONLY the cut log — a shape-invalid small plan is still not ready",
+	phaseDeliverableReady("simplify", { planContent: "# Plan: x\n\n## HLD\nonly this\n" }).ready === false,
+);
+check("simplifyAutoPassNote carries the auto-pass marker and the measured size", simplifyAutoPassNote(12).includes("auto-pass") && simplifyAutoPassNote(12).includes("12 lines"));
+check("review_hld is unaffected by the auto-pass (it never required a cut log)", phaseDeliverableReady("review_hld", { planContent: BIG_HLD }).ready === true);
 // review_hld/review_final: readiness is content shape only — Gate 1/2 are
 // harness-owned forms opened by plan_advance (index.ts), not tracked here.
 check("review_hld ready: valid HLD content alone", phaseDeliverableReady("review_hld", { planContent: COMPLETE_HLD }).ready === true);
@@ -338,6 +372,146 @@ check("discovery no-goal / no-intent (absent or intentConfirmed:false) → ident
 	}) && nextActionHint("discovery", { goal: "demo", intentConfirmed: false }) === nextActionHint("discovery", {}));
 check("discovery intent confirmed but incomplete → canonical-sections hint, not the intent hint",
 	(() => { const h = nextActionHint("discovery", { goal: "demo", intentConfirmed: true }); return ["## HLD", "## Scope", "## Non-goals", "## Decisions", "## DoD"].every((s) => h.includes(s)) && !h.includes("plan_intent"); })());
+
+console.log("\n[F2 — conditional nudge: the imperative NOW-hint is earned, not automatic]");
+{
+	const READY_HLD = { goal: "demo", intentConfirmed: true, planContent: COMPLETE_HLD, journalEntriesForPhase: 1 };
+	const URGE = "NOW, do not keep chatting";
+	check("ready + first eligible turn → calm hint: names plan_advance, NO imperative",
+		["discovery", "simplify", "decompose"].every((p) => {
+			const snapshot = p === "decompose" ? { goal: "demo", intentConfirmed: true, planContent: COMPLETE_WITH_TASKS } : READY_HLD;
+			const h = nextActionHint(p, snapshot, false);
+			return h.includes("plan_advance") && !h.includes(URGE);
+		}));
+	check("ready + urge → the imperative variant, still a 'Next action:' line",
+		(() => { const h = nextActionHint("simplify", READY_HLD, true); return h.startsWith("Next action:") && h.includes(URGE); })());
+	check("a NOT-ready deliverable never urges — guidance is unconditional, only the imperative is gated",
+		nextActionHint("decompose", READY_HLD, true) === nextActionHint("decompose", READY_HLD, false));
+
+	// (1) first eligible turn stays calm, (2) the second consecutive one urges.
+	const t1 = noteReadyHintTurn(undefined, "demo:simplify", 1, true);
+	check("(1) first eligible turn on a goal+phase → count 1, no urge", t1.urge === false && t1.state.count === 1);
+	const t1b = noteReadyHintTurn(t1.state, "demo:simplify", 1, true);
+	check("several hints inside the SAME turn collapse into one tally step (no urge from a chatty turn)",
+		t1b.urge === false && t1b.state.count === 1 && t1b.state === t1.state);
+	const t2 = noteReadyHintTurn(t1b.state, "demo:simplify", 2, true);
+	check("(2) second consecutive eligible turn → urge", t2.urge === true && t2.state.count === 2);
+	check("and it keeps urging while the model sits on it", noteReadyHintTurn(t2.state, "demo:simplify", 3, true).urge === true);
+
+	// (3) the expected call ran → the phase moved → the tally restarts calm.
+	// index.ts also drops the state outright in transitionPhase; keying by
+	// goal+phase makes that belt-and-braces, not the only line of defence.
+	const advanced = noteReadyHintTurn(t2.state, "demo:decompose", 3, true);
+	check("(3) advancing the phase resets the tally — the new phase opens calm", advanced.urge === false && advanced.state.count === 1);
+	check("a different goal in the same phase is tallied separately",
+		noteReadyHintTurn(t2.state, "other:simplify", 4, true).urge === false);
+	// (6) guard off/on: index.ts clears the state, which restarts the tally.
+	check("(6) a cleared state (guard off/on, restoreTools) restarts calm",
+		noteReadyHintTurn(undefined, "demo:simplify", 9, true).urge === false);
+
+	// (7) NOT-READY turns are drafting, not sitting: they must never bank credit.
+	// Pre-fix, the tally ran on every planning-tool result regardless of readiness,
+	// so two legitimate drafting turns handed the imperative nudge to the very
+	// first turn the deliverable was actually done.
+	const d1 = noteReadyHintTurn(undefined, "demo:discovery", 1, false);
+	const d2 = noteReadyHintTurn(d1.state, "demo:discovery", 2, false);
+	check("(7) a not-ready turn neither urges nor banks credit (tally cleared)",
+		d1.urge === false && d1.state === undefined && d2.urge === false && d2.state === undefined);
+	const d3 = noteReadyHintTurn(d2.state, "demo:discovery", 3, true);
+	check("(7) two not-ready turns then the FIRST genuinely ready one → still calm, count restarts at 1",
+		d3.urge === false && d3.state.count === 1);
+	const d4 = noteReadyHintTurn(d3.state, "demo:discovery", 4, true);
+	check("(7) mutation check: the gate narrows the tally, it does NOT disable it — a second consecutive READY turn still urges",
+		d4.urge === true && d4.state.count === 2);
+
+	// (8) a not-ready turn mid-streak breaks it: readiness must be consecutive.
+	const broken = noteReadyHintTurn(t2.state, "demo:simplify", 5, false);
+	const resumed = noteReadyHintTurn(broken.state, "demo:simplify", 6, true);
+	check("(8) a not-ready turn mid-streak resets an already-urging tally — the next ready turn opens calm again",
+		broken.urge === false && broken.state === undefined && resumed.urge === false && resumed.state.count === 1);
+}
+
+console.log("\n[F6 — per-turn investigation latch: the pre-intent floor reads the CURRENT turn only]");
+{
+	// index.ts clears investigationDone at every owner turn start, so the flag
+	// finalizeVerdict sees means "a tool ran in THIS turn". Both readings are
+	// pinned here; the reset wiring itself is integration-level (see report).
+	const preIntent = { goal: "demo", intentConfirmed: false, planContent: "" };
+	check("(4) tool ran in the current turn + prose close → steered (pre-intent floor armed)",
+		finalizeVerdict("discovery", [], true, { ...preIntent, investigationDone: true }).ok === false);
+	check("(5) tool ran only in an EARLIER turn (latch cleared) + pure prose close → no steer",
+		finalizeVerdict("discovery", [], true, { ...preIntent, investigationDone: false }).ok === true);
+}
+
+console.log("\n[proposesAlternatives — content floor: fires on offered choices, silent on everything else]");
+{
+	// POSITIVES — the shapes the rule exists to catch.
+	check("either-or in prose + a direct request to pick → detected (the field failure this floor was built for)",
+		proposesAlternatives(
+			"Lo mitigherei mostrando il pannello completo solo sulle chiusure, non su in_progress — oppure, se preferisci, " +
+				"collassando a una riga per wave. Dimmi quale delle due mitigazioni preferisci e apriamo un piano.",
+		) === true);
+	check("labelled options + a second-person request → detected (the labels are only ever half the evidence)",
+		proposesAlternatives("Ecco come procedere:\n- Opzione A: riusare il renderer esistente\n- Opzione B: scriverne uno nuovo\nQuale preferisci?") === true);
+	check("two numbered proposals + 'quale preferisci' → detected",
+		proposesAlternatives("1. Mostrare il pannello solo su done\n2. Collassare le chiusure ravvicinate\nQuale preferisci?") === true);
+	check("English either/or + 'which one' → detected",
+		proposesAlternatives("We can either reuse the existing renderer or write a fresh one. Which one would you rather ship?") === true);
+
+	// NEGATIVES — the heart of the task: the detector must stay silent.
+	check("plain discursive prose → silent",
+		proposesAlternatives("Ho letto il floor esistente: giudica solo la struttura del turno e non ispeziona mai il contenuto.") === false);
+	check("bulleted SUMMARY of work done (no choice offered) → silent",
+		proposesAlternatives("Fatto:\n- aggiunto il rilevatore puro\n- cablato agent_settled\n- coperto con test") === false);
+	check("list of changed files closing with a generic 'fammi sapere' → silent (generic confirmation is not a choice)",
+		proposesAlternatives("File cambiati:\n- src/phase-machine.ts\n- index.ts\n- test/smoke.mjs\nFammi sapere se va bene.") === false);
+	check("'or'/'oppure' used non-alternatively, no request to pick → silent",
+		proposesAlternatives("Il file o la cartella esistono già, quindi la scrittura è idempotente.") === false);
+	check("short acknowledgement → silent", proposesAlternatives("Ok, fatto.") === false);
+	check("empty text → silent", proposesAlternatives("") === false);
+	check("a single labelled option (not a fork) → silent",
+		proposesAlternatives("Ho seguito l'Opzione A concordata nel form.") === false);
+	check("enumeration WITHOUT any request to choose → silent (enumeration alone never fires)",
+		proposesAlternatives("Il piano ha tre task:\n- T1 renderer\n- T2 floor\n- T3 README") === false);
+
+	// FIELD COUNTEREXAMPLES — every one of these fired before the detector was
+	// tightened. They are the regression floor: a false positive regenerates a
+	// legitimate answer, which is strictly worse than a missed catch.
+	check("CE1 recap of options ALREADY DECIDED → silent (labels alone no longer fire)",
+		proposesAlternatives("Decisioni:\n- Opzione A: riusare il renderer (confermata)\n- Opzione B: scartata\nProcedo con A.") === false);
+	check("CE2 third-person 'preferisce' + a file list → silent (a report about the owner is not a request to the owner)",
+		proposesAlternatives("L'owner preferisce l'approccio incrementale.\n\nFile:\n- src/phase-machine.ts\n- index.ts") === false);
+	check("CE3 diagnostic 'quale sia la causa?' after a list → silent",
+		proposesAlternatives("Due file:\n- a.ts\n- b.ts\nNon so quale sia la causa?") === false);
+	check("CE4 diagnostic 'Which of them fires first?' after a list → silent (no second person, no offer)",
+		proposesAlternatives("Two hooks:\n- turn_end\n- agent_settled\nWhich of them fires first?") === false);
+	check("CE5 investigative either-or about reality → silent",
+		proposesAlternatives("Il path è un file oppure una directory. Quale dei due stiamo vedendo?") === false);
+	check("CE6 'scegli Confirm' as a narrative instruction step → silent",
+		proposesAlternatives("Passi:\n- apri il piano\n- scegli Confirm") === false);
+	check("CE7 'alternatively' + hedged 'your call' while proceeding → silent",
+		proposesAlternatives("Alternatively, if the store is empty, discovery is the default. Your call if that matters; I'm proceeding.") === false);
+	check("CE8 courtesy 'come preferisci' sign-off + a file list → silent",
+		proposesAlternatives("Fatto come preferisci.\n\nFile toccati:\n- src/render.ts\n- index.ts") === false);
+	check("CE8b English courtesy sign-off + a file list → silent (matches no marker to begin with)",
+		proposesAlternatives("Done as you prefer.\n\nFiles:\n- src/render.ts\n- index.ts") === false);
+	check("CE8 does not blunt the real offer: 'oppure, se preferisci' still fires",
+		proposesAlternatives("Lo mitigherei mostrando il pannello solo alle chiusure — oppure, se preferisci, collassando a una riga per wave. Come procediamo?") === true);
+	check("CE8 strips only the courtesy occurrence: a second, real 'se preferisci' still fires",
+		proposesAlternatives("Fatto come preferisci.\n- a.ts\n- b.ts\nPosso invertirlo, se preferisci.") === true);
+}
+{
+	// Wiring contract consumed by index.ts.
+	check("isChoiceFloorClosing: a turn that opened a form is never steered",
+		isChoiceFloorClosing(["ask_smart_plan"]) === true && isChoiceFloorClosing(["plan_intent"]) === true);
+	check("isChoiceFloorClosing: plan_save/journal_append are NOT form closes",
+		isChoiceFloorClosing(["plan_save", "journal_append"]) === false && isChoiceFloorClosing([]) === false);
+	check("choiceFloorKey is per-phase and distinct from the structural prose-close key",
+		choiceFloorKey("discovery") === "discovery:prose-choices" && choiceFloorKey("discovery") !== "discovery:prose-close");
+	check("choiceFloorSteer names ask_smart_plan at attempt 1 and escalates at attempt 2",
+		choiceFloorSteer(1).includes("ask_smart_plan") && !choiceFloorSteer(1).includes("Escalation") &&
+		choiceFloorSteer(2).includes("Escalation (attempt 2)") && choiceFloorSteer(2) !== choiceFloorSteer(1));
+}
 
 console.log("\n[src/abandon.ts — pure in-process abandon-grace timer, cwd-keyed, compact battery]");
 const CWD_A = "/tmp/abandon-unit-repo-a";

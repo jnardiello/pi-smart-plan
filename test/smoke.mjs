@@ -12,6 +12,7 @@ import {
 	setMachinePhase,
 	phaseTxtPath,
 	completeGoal,
+	OBJECTIVE_MAX_LEN,
 	journalEntriesSincePhaseStart,
 	tombstoneActiveGoal,
 	purgeTombstone,
@@ -68,6 +69,7 @@ const { cwd: CWD12, store: expectedStore12 } = makeRepo("goal-param-owned");
 const { cwd: CWD13, store: expectedStore13 } = makeRepo("goal-param-adopt");
 const { cwd: CWD14, store: expectedStore14 } = makeRepo("no-claim-vs-execute");
 const { cwd: CWD15, store: expectedStore15 } = makeRepo("exit-authorization");
+const { cwd: CWD16, store: expectedStore16 } = makeRepo("t4-schemas-autopass");
 
 // Owner-backed objective confirmation via the REAL confirmIntent — every
 // savePlan on a fresh goal now needs one first (plan_save is mechanically
@@ -827,23 +829,96 @@ const openQuestions6 = Array.from({ length: 6 }, (_, i) => ({
 	question: `OQ${i + 1}`,
 	options: i % 2 === 0 ? [`Yes${i + 1}`, `No${i + 1}`] : [{ label: `Yes${i + 1}` }, { label: `No${i + 1}`, description: "explains the no" }],
 }));
-const openQPageQueue = [{ answers: { OQ1: "Yes1", OQ2: "Yes2", OQ3: "Yes3", OQ4: "Yes4" } }, { answers: { OQ5: "Yes5", OQ6: "Yes6" } }];
+// F3: the question pages are now followed by a closing Confirm/Reword page in
+// the SAME call, so a full run opens 2 question pages + 1 closing page. This
+// battery drives "Reword" on that closing page — the store must stay untouched,
+// exactly as the whole openQuestions branch did before F3. (The old assertion
+// on "call plan_intent again with openQuestions empty" is rewritten below: that
+// instruction is now the CANCEL path's text, not the answered path's.)
+const openQPageQueue = [{ answers: { OQ1: "Yes1", OQ2: "Yes2", OQ3: "Yes3", OQ4: "Yes4" } }, { answers: { OQ5: "Yes5", OQ6: "Yes6" } }, { answers: { "Is this the objective?": "Reword" } }];
 const openQCtx = makeCtx(CWD5);
 openQCtx.ui.custom = async () => { formOpenCount++; return openQPageQueue.shift() ?? { declined: true }; };
 formOpenCount = 0;
-const entriesBeforeOpenQ = entries.length;
 const piOpenQ = await intentTool.execute(
 	"id",
 	{ goal: OPENQ_GOAL, statement: "Provisional objective while questions are open.", openQuestions: openQuestions6 },
 	undefined, undefined, openQCtx,
 );
-check("openQuestions non-empty (bare-string + object options, 6 → auto-paged): two sequential forms (4+2), answers aggregated in original order, isError false",
-	formOpenCount === 2 && piOpenQ.isError === false &&
+check("openQuestions non-empty (bare-string + object options, 6 → auto-paged): two sequential form pages (4+2) plus the closing page, answers aggregated in original order, isError false",
+	formOpenCount === 3 && piOpenQ.isError === false &&
 	JSON.stringify(piOpenQ.details?.answers) === JSON.stringify({ OQ1: "Yes1", OQ2: "Yes2", OQ3: "Yes3", OQ4: "Yes4", OQ5: "Yes5", OQ6: "Yes6" }));
-check("openQuestions non-empty: no OBJECTIVE PROPOSAL card appended, store untouched (no intent.txt, no goal dir), result tells the model to re-call with openQuestions empty to confirm",
-	entries.length === entriesBeforeOpenQ &&
+check("openQuestions + Reword: store untouched (no intent.txt, no goal dir), answers still returned, result tells the model to rewrite the statement FROM them",
+	piOpenQ.details?.reworded === true &&
 	readIntent(CWD5, OPENQ_GOAL) === null && !existsSync(join(expectedStore5, OPENQ_GOAL)) &&
-	piOpenQ.content[0].text.includes("call plan_intent again with openQuestions empty"));
+	piOpenQ.content[0].text.includes("Q: OQ1\nA: Yes1") &&
+	piOpenQ.content[0].text.includes("reformulate the objective FROM the answers above"));
+
+console.log("\n[plan_intent — F3 openQuestions + Confirm on the closing page: intent.txt written in the SAME call]");
+{
+	const F3_GOAL = "intent-f3-confirm-goal";
+	const f3Questions = [{ question: "F3Q1", options: ["A", "B"] }, { question: "F3Q2", options: ["C", "D"] }];
+	const f3Queue = [{ answers: { F3Q1: "A", F3Q2: "D" } }, { answers: { "Is this the objective?": "Confirm" } }];
+	const f3Ctx = makeCtx(CWD5);
+	let f3Closing = null;
+	f3Ctx.ui.custom = async (builder) => {
+		formOpenCount++;
+		// Capture the closing page's rendered form to assert its fixed labels.
+		if (f3Queue.length === 1) {
+			await new Promise((resolve) => { f3Closing = builder({ requestRender() {} }, fakeTheme, {}, () => {}); resolve(); });
+		}
+		return f3Queue.shift() ?? { declined: true };
+	};
+	formOpenCount = 0;
+	const entriesBeforeF3 = entries.length;
+	const piF3 = await intentTool.execute("id", { goal: F3_GOAL, statement: "Confirmed in the same call.", openQuestions: f3Questions }, undefined, undefined, f3Ctx);
+	check("F3 Confirm: intent.txt written in the SAME call, confirmed flag set, answers returned alongside the confirmation text",
+		piF3.isError === false && piF3.details?.confirmed === true &&
+		readIntent(CWD5, F3_GOAL)?.statement === "Confirmed in the same call." &&
+		piF3.content[0].text.includes("Q: F3Q1\nA: A") && piF3.content[0].text.includes("objective confirmed"));
+	check("F3 Confirm: one question page + one closing page, OBJECTIVE PROPOSAL card appended before the closing page",
+		formOpenCount === 2 &&
+		entries.slice(entriesBeforeF3).some((e) => e.key === "plan-intent-proposal" && e.data.goal === F3_GOAL));
+	const f3ClosingText = f3Closing ? f3Closing.render(100).join("\n") : "";
+	check("F3 closing page: exactly the two fixed labels (Confirm / Reword), no built-in None of the above, answers shown in the briefing pane",
+		f3ClosingText.includes("1. Confirm") && f3ClosingText.includes("2. Reword") &&
+		!f3ClosingText.includes("None of the above") && f3ClosingText.includes("Answers just given"));
+	// Confirming CLAIMED this goal for the session (that is what Confirm does).
+	// Complete it so the claim stops resolving and the batteries below can open
+	// their own goals — same release the INTENT_GOAL batteries above rely on.
+	completeGoal(CWD5, F3_GOAL);
+}
+
+console.log("\n[plan_intent — F3 Esc on the closing page equals Reword; cancel mid-questions never reaches it]");
+{
+	const F3_ESC_GOAL = "intent-f3-esc-goal";
+	const escQuestions = [{ question: "EQ1", options: ["A", "B"] }];
+	const escQueue = [{ answers: { EQ1: "A" } }, { declined: true }];
+	const escCtx = makeCtx(CWD5);
+	escCtx.ui.custom = async () => { formOpenCount++; return escQueue.shift() ?? { declined: true }; };
+	formOpenCount = 0;
+	const piEsc = await intentTool.execute("id", { goal: F3_ESC_GOAL, statement: "Never written.", openQuestions: escQuestions }, undefined, undefined, escCtx);
+	check("F3 Esc on the closing page = Reword: nothing written, same reword text, answers kept",
+		piEsc.isError === false && piEsc.details?.reworded === true &&
+		readIntent(CWD5, F3_ESC_GOAL) === null && !existsSync(join(expectedStore5, F3_ESC_GOAL)) &&
+		piEsc.content[0].text.includes("reformulate the objective FROM the answers above") && piEsc.content[0].text.includes("Q: EQ1\nA: A"));
+
+	// Cancelling DURING the questions must not put a half-answered set up for
+	// confirmation: the closing page never opens, and the result steers the model
+	// to RE-ASK what is still open — never to confirm around it.
+	const F3_CANCEL_GOAL = "intent-f3-cancel-goal";
+	const cancelCtx = makeCtx(CWD5);
+	cancelCtx.ui.custom = async () => { formOpenCount++; return { declined: true }; };
+	formOpenCount = 0;
+	const piCancel = await intentTool.execute("id", { goal: F3_CANCEL_GOAL, statement: "Never written.", openQuestions: escQuestions }, undefined, undefined, cancelCtx);
+	check("F3 cancel mid-questions: closing page never opens (one form), store untouched, UNANSWERED + re-ask instruction stand",
+		formOpenCount === 1 && piCancel.details?.declined === true &&
+		readIntent(CWD5, F3_CANCEL_GOAL) === null &&
+		piCancel.content[0].text.includes("UNANSWERED") &&
+		piCancel.content[0].text.includes("carrying them in openQuestions"));
+	check("F3 cancel mid-questions: the result never steers a confirm around the unanswered fork",
+		!piCancel.content[0].text.includes("openQuestions empty") &&
+		piCancel.content[0].text.includes("Do NOT confirm the objective while any fork is still unresolved"));
+}
 
 console.log("\n[plan_intent — SAME goal, openQuestions omitted → ordinary Confirm/Keep-chatting flow unchanged]");
 formOpenCount = 0;
@@ -1048,9 +1123,18 @@ check("walk: transition+Gate2 IN ONE CALL — phase.txt=execute, guard released 
 check("walk: Gate 2 exactly ONE un-paged form opened", formOpenCount === 1);
 check("walk: guard OFF (env cleared), full tool set restored (edit/write back)", !guardOn() && activeTools.includes("edit") && activeTools.includes("write"));
 check("walk: durable approved plan.md persisted under the approved root (persistApproved)", existsSync(approvedRootPath) && readFileSync(approvedRootPath, "utf8").includes(`# Plan: ${WALK}`));
-check("walk: implementation briefing queued (not returned inline), delivered per the mock's idle state",
-	sent.length === 1 && sent[0].msg.customType === "smart-plan" && sent[0].msg.content.includes("start implementing NOW") && sent[0].msg.details?.goal === WALK &&
+check("walk: Gate 2 sends only the turn-starting handoff (no authorization text in the message itself), per the mock's idle state",
+	sent.length === 1 && sent[0].msg.customType === "smart-plan" && !sent[0].msg.content.includes("start implementing NOW") && sent[0].msg.details?.goal === WALK &&
 	idle === true && sent[0].opts.triggerTurn === true);
+// The authorization itself rides the NEXT turn's injection — same turn the
+// execute surface is re-granted on, whoever starts it.
+const walkHandoff = await bas({ systemPrompt: "BASE" }, makeCtx());
+check("walk: the authorization lands on the turn that actually starts, alongside execute's phase block",
+	walkHandoff?.systemPrompt.includes("start implementing NOW") === true && walkHandoff.systemPrompt.includes("Do not ask for confirmation again") &&
+	["plan_verify", "plan_task_update", "plan_next"].every((t) => activeTools.includes(t)));
+const walkHandoffAgain = await bas({ systemPrompt: "BASE" }, makeCtx());
+check("walk: the handoff is spent by the first turn it reaches — never re-briefed on every later turn",
+	walkHandoffAgain?.systemPrompt.includes("start implementing NOW") !== true);
 
 // ===========================================================================
 // NEW battery — re-guard mid-execute: toggling the guard back ON must not
@@ -1066,7 +1150,7 @@ await ensureGuardOff();
 // ===========================================================================
 // NEW battery — plan_exit's approved-goal branch: fresh-turn kickoff instead
 // of an inline "start implementing NOW" (same stale-surface hazard as
-// queueImplementationBriefing — a mid-run tool GRANT never reaches the model
+// armHandoffAndStartTurn — a mid-run tool GRANT never reaches the model
 // this same turn, so the briefing is queued for the NEXT turn instead).
 // ===========================================================================
 console.log("\n[plan_exit — approved-goal fresh-turn kickoff]");
@@ -1383,6 +1467,48 @@ if (savedDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH; else process
 activeTools = [...FULL_TOOLS];
 await registered.handlers.get("session_start")(undefined, makeCtx(CWD, { sessionManager: { getBranch: () => [] } }));
 
+console.log("\n[choice floor — alternatives in prose steer to ask_smart_plan, scoped to planning phases with the guard on]");
+// Every probe below runs on a state whose STRUCTURAL verdict is already ok
+// (discovery, deliverable complete, turn closed with journal_append — one of
+// discovery's legal closing tools), so any steer here can only come from the
+// content floor. fireTurn adds the tool calls fireProseRun cannot express.
+const fireTurn = async (text, toolNames = [], ctx = makeCtx()) => {
+	const content = [...toolNames.map((name) => ({ type: "toolCall", name, id: name })), { type: "text", text }];
+	turnEndHandler({ type: "turn_end", turnIndex: 0, message: { role: "assistant", content }, toolResults: [] });
+	await settledHandler(undefined, ctx);
+};
+const CHOICE_GOAL = "choicegoal";
+await ensureGuardOn();
+seedIntent(CWD, CHOICE_GOAL);
+savePlan(CWD, CHOICE_GOAL, canonicalHLD(CHOICE_GOAL));
+await claimGoal(CWD, CHOICE_GOAL);
+const CHOICE_PROSE = "Possiamo riusare il renderer esistente — oppure scriverne uno nuovo. Dimmi quale preferisci.";
+sent.length = 0;
+await fireTurn(CHOICE_PROSE, ["journal_append"]);
+const choiceSteer = sent.at(-1);
+check("planning turn offering alternatives in prose IS steered, naming ask_smart_plan, even though it closed with a legal structural tool",
+	sent.length === 1 && choiceSteer?.via === "sendUserMessage" && choiceSteer?.msg.includes("ask_smart_plan") && choiceSteer?.msg.includes("alternatives to the owner in prose"));
+await fireTurn("(regenerated — ignore)", ["journal_append"]); // drain the regen latch
+sent.length = 0;
+await fireTurn("Ho journalato il taglio e aggiornato il piano.", ["journal_append"]);
+check("same phase, ordinary prose with no choice offered → NOT steered (the floor is not a blanket prose ban)", sent.length === 0);
+sent.length = 0;
+await fireTurn(CHOICE_PROSE, ["ask_smart_plan"]);
+check("identical text but the turn already opened a form → NOT steered (ask_smart_plan is the compliant close)", sent.length === 0);
+sent.length = 0;
+await fireTurn(CHOICE_PROSE, ["plan_intent"]);
+check("identical text closed via plan_intent → NOT steered", sent.length === 0);
+setMachinePhase(CWD, CHOICE_GOAL, "execute");
+sent.length = 0;
+await fireTurn(CHOICE_PROSE, ["journal_append"]);
+check("identical text in execute → NOT steered (execute stays exempt from the floor)", sent.length === 0);
+await ensureGuardOff(); // safe: the goal sits in execute, so toggling off never tombstones it
+sent.length = 0;
+await fireTurn(CHOICE_PROSE, ["journal_append"]);
+check("identical text with the guard OFF → NOT steered (out of scope by design)", sent.length === 0);
+await registered.tools.get("plan_complete").execute("id", { goal: CHOICE_GOAL }, undefined, undefined, makeCtx());
+await ensureGuardOn();
+
 console.log("\n[F1 — simplify cut-log survives guard off/on (restart-proof, no session-local baseline)]");
 await ensureGuardOn();
 const F1_RESTART = "f1restart";
@@ -1461,7 +1587,7 @@ const f6Result = await f6Promise;
 check("F6/F7a: form resolves cleanly (declined)", f6Result.details?.phase === "review_hld");
 await ensureGuardOff();
 
-console.log("\n[F7b — queueImplementationBriefing BUSY branch: Gate 2 queues as followUp when the session isn't idle]");
+console.log("\n[F7b — armHandoffAndStartTurn BUSY branch: Gate 2 queues as followUp when the session isn't idle]");
 await ensureGuardOn();
 // Re-engaging the guard restored F6_GOAL to this session; finish it through the
 // real tool before this battery starts its own goal.
@@ -1473,6 +1599,90 @@ const f7bGate2Result = await enterReviewFinal(F7B_GATE2, "Start implementation")
 check("F7b Gate 2: guard released + briefing queued even while busy, deliverAs followUp (not triggerTurn)",
 	f7bGate2Result.details?.released === true && sent.length === 1 && sent[0].opts.deliverAs === "followUp" && sent[0].opts.triggerTurn === undefined);
 idle = true;
+
+// ===========================================================================
+// NEW battery — Gate-2 handoff atomicity. The authorization is armed at the
+// click and consumed by the turn that actually starts, so it cannot land on a
+// goal that moved on, and cannot land on a turn whose surface is still the
+// planning one. F7B_GATE2 is in execute with its handoff armed right here.
+// ===========================================================================
+console.log("\n[Gate-2 handoff atomicity — owner-pre-empted turn, stale suppression]");
+// The owner types before the harness's own kickoff turn runs: the surface is
+// still whatever the mid-gate GRANT could not deliver. Simulated by dropping
+// the execute tools, exactly the "No such tool available" field failure.
+activeTools = activeTools.filter((t) => !["plan_verify", "plan_task_update", "plan_next"].includes(t));
+const preempted = await bas({ systemPrompt: "BASE" }, makeCtx());
+check("(a) briefing lands on the owner-pre-empted turn (not lost with the harness's kickoff)",
+	preempted?.systemPrompt.includes("start implementing NOW") === true);
+check("(d) …and the execute surface is re-granted on that SAME turn",
+	["plan_verify", "plan_task_update", "plan_next"].every((t) => activeTools.includes(t)));
+await ensureGuardOff();
+
+// (b) goal completed between the click and the turn — the field failure: a
+// stale "start implementing NOW" arriving after plan_complete.
+await ensureGuardOn();
+await registered.tools.get("plan_complete").execute("id", { goal: F7B_GATE2 }, undefined, undefined, makeCtx());
+const STALE_DONE = "stalebriefdone";
+await enterReviewFinal(STALE_DONE, "Start implementation");
+await registered.tools.get("plan_complete").execute("id", { goal: STALE_DONE }, undefined, undefined, makeCtx());
+const afterComplete = await bas({ systemPrompt: "BASE" }, makeCtx());
+check("(b) goal completed before the turn runs → no stale authorization injected",
+	afterComplete?.systemPrompt.includes("start implementing NOW") !== true);
+await ensureGuardOff();
+
+// (c) phase moved off execute between the click and the turn.
+await ensureGuardOn();
+const STALE_PHASE = "stalebriefphase";
+await enterReviewFinal(STALE_PHASE, "Start implementation");
+setMachinePhase(CWD, STALE_PHASE, "discovery");
+const afterRegress = await bas({ systemPrompt: "BASE" }, makeCtx());
+check("(c) phase no longer execute when the turn runs → no stale authorization injected",
+	afterRegress?.systemPrompt.includes("start implementing NOW") !== true);
+await registered.tools.get("plan_complete").execute("id", { goal: STALE_PHASE }, undefined, undefined, makeCtx());
+await ensureGuardOff();
+
+// (e) the owner re-engages the guard between the click and the turn: that is
+// read-only supervision, not an implementation turn, so the authorization
+// must not land. It is still SPENT — an authorization that lies dormant and
+// fires against a later state is worse than one re-issued at the gate.
+await ensureGuardOn();
+const REGUARD = "stalebriefreguard";
+await enterReviewFinal(REGUARD, "Start implementation");
+await ensureGuardOn();
+const afterReguard = await bas({ systemPrompt: "BASE" }, makeCtx());
+check("(e) guard re-engaged before the turn runs → no authorization injected",
+	afterReguard?.systemPrompt.includes("start implementing NOW") !== true);
+await ensureGuardOff();
+const afterReguardOff = await bas({ systemPrompt: "BASE" }, makeCtx());
+check("(e) …and the handoff was spent, not re-armed for a later turn",
+	afterReguardOff?.systemPrompt.includes("start implementing NOW") !== true);
+await ensureGuardOn();
+await registered.tools.get("plan_complete").execute("id", { goal: REGUARD }, undefined, undefined, makeCtx());
+await ensureGuardOff();
+
+// (f) the claim diverges before the turn runs: the handoff is armed for A
+// while the session ends up owning B — itself a live execute goal, so the
+// suppression can only come from the goal mismatch, never from an absent
+// claim. Cross-checks the predicate alignment too: B's surface is re-granted
+// on the same turn A's authorization is refused.
+await ensureGuardOn();
+const HANDOFF_A = "stalebriefclaima";
+const HANDOFF_B = "stalebriefclaimb";
+await enterReviewFinal(HANDOFF_A, "Start implementation");
+seedIntent(CWD, HANDOFF_B);
+savePlan(CWD, HANDOFF_B, fullPlan(HANDOFF_B));
+setMachinePhase(CWD, HANDOFF_B, "execute");
+await claimGoal(CWD, HANDOFF_B);
+activeTools = activeTools.filter((t) => !["plan_verify", "plan_task_update", "plan_next"].includes(t));
+const afterClaimSwap = await bas({ systemPrompt: "BASE" }, makeCtx());
+check("(f) claim moved to another goal before the turn runs → no authorization injected",
+	afterClaimSwap?.systemPrompt.includes("start implementing NOW") !== true);
+check("(f) …yet the surface follows the SAME predicate: the owned execute goal still gets its tools",
+	["plan_verify", "plan_task_update", "plan_next"].every((t) => activeTools.includes(t)));
+await ensureGuardOn();
+await registered.tools.get("plan_complete").execute("id", { goal: HANDOFF_B }, undefined, undefined, makeCtx());
+await claimGoal(CWD, HANDOFF_A);
+await registered.tools.get("plan_complete").execute("id", { goal: HANDOFF_A }, undefined, undefined, makeCtx());
 await ensureGuardOff();
 
 // ===========================================================================
@@ -1809,6 +2019,89 @@ console.log("\n[tool renderers — Wave B]");
 		.join("\n");
 	check("plan_verify renderResult (expanded): FAILED headline + per-command ✓/✗ rows",
 		verifyResult.includes("DoD FAILED") && verifyResult.includes("✓") && verifyResult.includes("echo ok") && verifyResult.includes("✗") && verifyResult.includes("false"));
+}
+
+// ===========================================================================
+// Progress checklist on task close: a `done` result carries the whole task
+// DAG so overall progress is visible at a glance, while every other status
+// stays the one-liner. Two halves on purpose — the renderer half is
+// deterministic (synthetic details, no store), the wiring half drives the
+// real tool, so a renderer that is never fed cannot pass on its own.
+// ===========================================================================
+console.log("\n[progress checklist on task close]");
+{
+	const renderUpdate = (details, text) =>
+		registered.tools
+			.get("plan_task_update")
+			.renderResult({ content: [{ type: "text", text }], details }, { isPartial: false }, fakeTheme, {})
+			.render(72)
+			.join("\n");
+	const dagView = {
+		tasks: [
+			{ id: "T1", title: "first", done: true, deps: [], owns: ["src/a"], ready: false, wave: 1 },
+			{ id: "T2", title: "second", done: false, deps: ["T1"], owns: ["src/b"], ready: true, wave: 2 },
+		],
+		doneCount: 1,
+		total: 2,
+		frontier: ["T2"],
+	};
+
+	const closeRender = renderUpdate({ status: "done", checklist: dagView }, "Task T1 → done (owns + deps verified).");
+	check("close: headline plus the full DAG — closed task ☑, pending task ☐",
+		closeRender.includes("Task T1 → done") && closeRender.includes("☑ T1") && closeRender.includes("☐ T2") && closeRender.includes("WAVE 1"));
+	check("close: footer carries the post-close count and the ready frontier",
+		closeRender.includes("1/2 done") && closeRender.includes("ready now: T2"));
+
+	const claimRender = renderUpdate({ status: "in_progress" }, "Task T2 → in_progress.");
+	check("claim: single line, no DAG at all",
+		claimRender.includes("Task T2 → in_progress") && !claimRender.includes("WAVE") && !claimRender.includes("☑") && !claimRender.includes("done ·"));
+
+	const emptyRender = renderUpdate({ status: "done", checklist: { tasks: [], doneCount: 0, total: 0, frontier: [] } }, "Task T1 → done (owns + deps verified).");
+	check("close on a task-less goal: clean fallback to the bare headline",
+		emptyRender.includes("Task T1 → done") && !emptyRender.includes("WAVE") && !emptyRender.includes("done ·"));
+
+	// A restored transcript replays the stored payload verbatim: a legacy or
+	// malformed checklist must degrade to the headline, never throw the renderer.
+	const safeRender = (details) => {
+		try {
+			return renderUpdate(details, "Task T1 → done (owns + deps verified).");
+		} catch (err) {
+			return `THREW: ${err.message}`;
+		}
+	};
+	const malformed = [
+		{ status: "done", checklist: {} },
+		{ status: "done", checklist: true },
+		{ status: "done", checklist: { tasks: "nope", frontier: [] } },
+		// tasks present but no frontier — reaches the footer, which is the throw site
+		{ status: "done", checklist: { tasks: [{ id: "T1", title: "first", done: true, deps: [], owns: ["src/a"], ready: false, wave: 1 }] } },
+	];
+	check("close with a legacy/malformed checklist: headline only, renderer never throws",
+		malformed.every((details) => {
+			const out = safeRender(details);
+			return out.includes("Task T1 → done") && !out.startsWith("THREW:") && !out.includes("WAVE") && !out.includes("done ·");
+		}));
+
+	// Wiring: the real tool must attach exactly what the renderer reads, and
+	// read the store AFTER the close (T1 already ticked, count already bumped).
+	const { cwd: CWDCL } = makeRepo("checklist");
+	seedIntent(CWDCL, "cl");
+	savePlan(CWDCL, "cl", fullPlan("cl"));
+	await claimGoal(CWDCL, "cl");
+	const clTool = registered.tools.get("plan_task_update");
+	const clCtx = makeCtx(CWDCL);
+	const claimRes = await clTool.execute("id", { goal: "cl", taskId: "T1", status: "in_progress" }, undefined, undefined, clCtx);
+	check("wiring: a claim attaches no checklist", claimRes.isError === false && claimRes.details.checklist === undefined);
+
+	const closeRes = await clTool.execute("id", { goal: "cl", taskId: "T1", status: "done" }, undefined, undefined, clCtx);
+	check("wiring: a close attaches the POST-close view (T1 already done, 1/2 counted)",
+		closeRes.isError === false && closeRes.details.checklist?.total === 2 && closeRes.details.checklist?.doneCount === 1 &&
+		closeRes.details.checklist.tasks.find((t) => t.id === "T1")?.done === true);
+	const liveRender = renderUpdate(closeRes.details, "Task T1 → done (owns + deps verified).");
+	check("wiring: that attached view renders the ticked DAG through the real renderer",
+		liveRender.includes("☑ T1") && liveRender.includes("☐ T2"));
+	check("wiring: the live render carries the post-close footer count and ready frontier",
+		liveRender.includes("1/2 done") && liveRender.includes("ready now: T2"));
 }
 
 console.log("\n[live working message — Wave B]");
@@ -2300,7 +2593,93 @@ rmSync(join(homedir(), ".pi", "agent", "smart-plan", "approved", CWD15.replaceAl
 rmSync(expectedStore15, { recursive: true, force: true });
 rmSync(CWD15, { recursive: true, force: true });
 rmSync(expectedStore, { recursive: true, force: true });
+console.log("\n[F4 — self-documenting schemas: flat task record + objective cap declared up front]");
+{
+	const saveDesc = registered.tools.get("plan_save").description;
+	check("plan_save's description teaches the FLAT task record (sibling lines, not nested sub-bullets)",
+		saveDesc.includes("deps: []") && saveDesc.includes("owns: [src/]") && saveDesc.includes("done: echo ok") &&
+		/sibling/i.test(saveDesc) && /sub-bullet/i.test(saveDesc));
+	const statementSchema = registered.tools.get("plan_intent").parameters.properties.statement;
+	check("plan_intent's statement schema declares the objective cap up front (no discovery-by-rejection)",
+		statementSchema.description.includes(String(OBJECTIVE_MAX_LEN)));
+	// The declared cap must be the one actually enforced, or the schema lies.
+	const overCap = await registered.tools.get("plan_intent").execute("id", { goal: "capcheck", statement: "x".repeat(OBJECTIVE_MAX_LEN + 1) }, undefined, undefined, makeCtx(CWD16));
+	check("the declared cap is the ENFORCED cap — a statement one char over is refused pre-form",
+		overCap.isError === true && !existsSync(join(expectedStore16, "capcheck", "intent.txt")));
+}
+
+console.log("\n[F5 — simplify auto-pass: harness journals it, big plans still owe a cut log]");
+{
+	await ensureGuardOn(makeCtx(CWD16));
+	const SMALL = "tiny-goal";
+	seedIntent(CWD16, SMALL);
+	savePlan(CWD16, SMALL, canonicalHLD(SMALL));
+	setMachinePhase(CWD16, SMALL, "simplify");
+	// The phase-start marker transitionPhase would have written: without it the
+	// setup's own intent-confirm line counts as this phase's cut log.
+	appendJournal(CWD16, SMALL, "[→ simplify] phase pinned for this battery");
+	await claimGoal(CWD16, SMALL);
+	const journalBefore = readFileSync(join(expectedStore16, SMALL, "journal.md"), "utf8");
+	check("F5 setup: small plan in simplify with NO cut log journaled",
+		!journalBefore.includes("auto-pass") && journalEntriesSincePhaseStart(CWD16, SMALL) === 0);
+	formOpenCount = 0;
+	customResult = { answers: { "Approve this high-level plan?": "Approve" } };
+	const autoAdvance = await registered.tools.get("plan_advance").execute("id", {}, undefined, undefined, makeCtx(CWD16));
+	const journalAfter = readFileSync(join(expectedStore16, SMALL, "journal.md"), "utf8");
+	check("F5: a small plan advances out of simplify with no cut log — the phase is NOT blocked",
+		autoAdvance.isError !== true && readMachinePhase(CWD16, SMALL) === "decompose");
+	check("F5: the harness journaled the auto-pass itself — the phase never vanishes from the record",
+		journalAfter.includes("auto-pass") && /\(\d+ lines\)/.test(journalAfter));
+	check("F5: the auto-pass line lands in the SIMPLIFY segment, before the transition marker",
+		journalAfter.includes("auto-pass") && journalAfter.includes("[\u2192 review_hld]") &&
+		journalAfter.indexOf("auto-pass") < journalAfter.indexOf("[\u2192 review_hld]"));
+
+	// Above the threshold the cut log is still owed: same setup, bigger plan.
+	const BIG = "big-goal";
+	seedIntent(CWD16, BIG);
+	const bigDecisions = Array.from({ length: 70 }, (_, i) => `- decision ${i}: weighed and recorded`).join("\n");
+	savePlan(CWD16, BIG, canonicalHLD(BIG, { decisions: bigDecisions }));
+	setMachinePhase(CWD16, BIG, "simplify");
+	appendJournal(CWD16, BIG, "[→ simplify] phase pinned for this battery");
+	await claimGoal(CWD16, BIG);
+	const bigAdvance = await registered.tools.get("plan_advance").execute("id", {}, undefined, undefined, makeCtx(CWD16));
+	check("F5: a plan ABOVE the threshold still owes a real cut log — refused, phase untouched",
+		bigAdvance.isError === true && bigAdvance.content[0].text.includes("cut-log journaled") &&
+		readMachinePhase(CWD16, BIG) === "simplify");
+	check("F5: nothing was auto-journaled for the big plan",
+		!readFileSync(join(expectedStore16, BIG, "journal.md"), "utf8").includes("auto-pass"));
+}
+
+console.log("\n[F7 — ownership wording: a COMPLETED goal is not 'never yours']");
+{
+	await ensureGuardOff(makeCtx(CWD16));
+	const DONE_GOAL = "finished-goal";
+	seedIntent(CWD16, DONE_GOAL);
+	setMachinePhase(CWD16, DONE_GOAL, "execute");
+	savePlan(CWD16, DONE_GOAL, fullPlan(DONE_GOAL));
+	completeGoal(CWD16, DONE_GOAL);
+	await claimGoal(CWD16, undefined); // claim released by plan_complete, exactly like the real flow
+	const doneRefusal = await registered.tools.get("plan_verify").execute("id", { goal: DONE_GOAL }, undefined, undefined, makeCtx(CWD16));
+	check("F7: a completed goal refuses as COMPLETED + claim released, naming plan_save as the way back",
+		doneRefusal.isError === true && doneRefusal.content[0].text.includes("completed and its claim released") &&
+		doneRefusal.content[0].text.includes("plan_save") && doneRefusal.details?.completed === true);
+	check("F7: the completed goal is NOT described as one this session never owned",
+		!doneRefusal.content[0].text.includes("no plan of its own"));
+	// The other branch must be untouched: a goal that exists, is NOT done, and
+	// this session never owned still gets the original wording.
+	const LIVE_FOREIGN = "never-mine";
+	seedIntent(CWD16, LIVE_FOREIGN);
+	savePlan(CWD16, LIVE_FOREIGN, fullPlan(LIVE_FOREIGN));
+	await claimGoal(CWD16, undefined);
+	const foreignRefusal = await registered.tools.get("plan_verify").execute("id", { goal: LIVE_FOREIGN }, undefined, undefined, makeCtx(CWD16));
+	check("F7: a never-owned, still-live goal keeps the original 'no plan of its own' wording",
+		foreignRefusal.isError === true && foreignRefusal.content[0].text.includes("no plan of its own") &&
+		!foreignRefusal.content[0].text.includes("completed and its claim released"));
+}
+
 rmSync(CWD, { recursive: true, force: true });
+rmSync(expectedStore16, { recursive: true, force: true });
+rmSync(CWD16, { recursive: true, force: true });
 rmSync(expectedStore2, { recursive: true, force: true });
 rmSync(CWD2, { recursive: true, force: true });
 rmSync(expectedStore3, { recursive: true, force: true });
