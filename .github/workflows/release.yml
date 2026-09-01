@@ -1,0 +1,46 @@
+# Il nome di questo file è registrato nella configurazione del trusted publisher su npmjs.com.
+# Rinominarlo rompe la pubblicazione in silenzio: npm non valida la configurazione al salvataggio,
+# quindi l'errore (ENEEDAUTH) compare solo al primo publish.
+name: Release
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - id: gate
+        run: |
+          VER="$(node -p "require('./package.json').version")"
+          # npm esce 0 con output vuoto quando la versione non esiste: conta l'output, non l'exit code.
+          PUBLISHED="$(npm view "@jnardiello/pi-smart-plan@$VER" version 2>/dev/null || true)"
+          if [ -z "$PUBLISHED" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # I test importano questi tre pacchetti, dichiarati solo come peerDependencies: in CI non
+      # esiste node_modules, quindi vanno installati esplicitamente.
+      - if: steps.gate.outputs.publish == 'true'
+        run: npm install --no-save @earendil-works/pi-coding-agent @earendil-works/pi-tui typebox
+
+      - if: steps.gate.outputs.publish == 'true'
+        run: npm test
+
+      - if: steps.gate.outputs.publish == 'true'
+        run: npm publish
