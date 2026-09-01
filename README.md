@@ -172,6 +172,14 @@ While the guard is active:
 - Exiting outside the gate flow requires a user-confirmed `plan_exit` dialog — which shows the active plans (or warns when none was saved) so the decision is informed — or `/plan-guard off`, or toggling `shift+tab` again.
 - **Exiting mid-planning discards the plan after a 10-second grace, not immediately**: toggling off (`shift+tab`, `/plan-guard off`, `plan_exit`) while the active goal is still anywhere before `execute` tombstones it and warns you in chat that it will be discarded; re-enabling plan mode within the grace restores it (with a "plan kept" notify). Goals already in `execute` are exempt — Gate 2's release and any later guard re-engagement for supervision never discard anything. A fresh plan-mode activation always starts clean, purging any leftover tombstone or stale mid-planning pointer first — see [Artifacts layout](#artifacts-layout).
 
+### Outside plan mode
+
+The guard doesn't gate every tool the same way — some of them are deliberately usable whether or not it's on:
+
+- `ask_smart_plan`'s ordinary (non-gate) question forms, `plan_recall`, and `journal_append` work in any session, guard on or off — a feature, not an oversight, so the model can ask a quick question, look up prior work, or log a decision/finding without making the owner engage plan mode first. `journal_append` still requires an EXISTING goal: one never confirmed via `plan_intent` refuses with `no plan named "<goal>" — goals are created by confirming an objective via plan_intent`, so a stray call can never silently create a phantom goal. Accepted edge: journaling during the 10-second abandon grace (below) re-pins `active.txt` to the goal, which the grace timer reads as "kept" rather than discarded — any activity on a still-tombstoned goal counts as interest, the same as re-enabling plan mode within the window.
+- The execute-phase tools (`plan_verify`, `plan_task_update`, `plan_next`, and `plan_save` on a goal already in `execute`) stay fully operational with the guard off once a goal has cleared Gate 2 — that's the designed flow: Gate 2 releases the guard specifically so implementation can proceed unrestricted.
+- Planning-state mutations are the one thing that still requires plan mode active. `plan_intent`, and `plan_save`/`plan_advance` when the target goal is still in a planning phase (`discovery`…`review_final`), all refuse with `"plan mode is off — activate it first (shift+tab or /plan)"` if called with the guard off — writing or advancing a still-planning goal without the guard's read-only protection and phase prompts is exactly what plan mode exists to prevent.
+
 ### Combining with pi-permission-system
 
 If you use `@gotgenes/pi-permission-system`, this extension's enforcement is independent (tool removal + allowlist), so nothing breaks either way. For extra depth you can manually keep restrictive rules in its config during planning; automatic policy flipping is not possible without an upstream API.

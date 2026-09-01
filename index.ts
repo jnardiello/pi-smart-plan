@@ -41,7 +41,7 @@ import {
 	discoveryPostIntentSteer,
 	type PhaseSnapshot,
 } from "./src/phase-machine.ts";
-import { savePlan, appendJournal, recall, approvedGoals, completeGoal, confirmIntent, currentPhase, getDoD, getPlanView, gitStagedFiles, goalIsDone, goalSummaries, isPartiallyStaged, isPlanningPhase, journalEntriesSincePhaseStart, nextTasks, persistApproved, purgeTombstone, readIntent, readMachinePhase, readPlan, restoreTombstonedGoal, setMachinePhase, tombstoneActiveGoal, updateTaskStatus, validateGoalSlug, OBJECTIVE_MAX_LEN, PlanStoreValidationError, type PlanView } from "./src/plan-store.ts";
+import { savePlan, appendJournal, recall, approvedGoals, completeGoal, confirmIntent, currentPhase, getDoD, getPlanView, gitStagedFiles, goalExists, goalIsDone, goalSummaries, isPartiallyStaged, isPlanningPhase, journalEntriesSincePhaseStart, nextTasks, persistApproved, purgeTombstone, readIntent, readMachinePhase, readPlan, restoreTombstonedGoal, setMachinePhase, tombstoneActiveGoal, updateTaskStatus, validateGoalSlug, OBJECTIVE_MAX_LEN, PlanStoreValidationError, type PlanView } from "./src/plan-store.ts";
 import { cancelAbandon, getAbandonGraceMs, scheduleAbandon } from "./src/abandon.ts";
 
 const STORE_KEY = "plan-guard";
@@ -902,6 +902,14 @@ export default function planGuard(pi: ExtensionAPI): void {
 			if (!current) {
 				return refuse("plan_advance blocked — no active goal yet; establish the goal before requesting a phase advance.");
 			}
+			// Close the shadow-planning gap: advancing a still-planning goal
+			// (discovery…review_final) mutates the phase machine and, for review
+			// phases, opens an owner gate form — exactly what plan mode's read-only
+			// guard exists to protect. Guard-off + execute stays untouched (Gate 2
+			// already released it by design).
+			if (!enabled && isPlanningPhase(current.phase)) {
+				return refuse("plan mode is off — activate it first (shift+tab or /plan)");
+			}
 			// Already IN a review phase: plan_advance RE-OPENS the owner gate — the
 			// harness composes the panel + form itself in this same call; there is
 			// no separate presentation step or tool.
@@ -957,6 +965,14 @@ export default function planGuard(pi: ExtensionAPI): void {
 			content: Type.String(),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			// Close the shadow-planning gap: writing/overwriting plan.md for a
+			// still-planning goal (discovery…review_final) with the guard off
+			// happens without read-only protection or phase prompts — exactly
+			// what plan mode exists to prevent. Execute-phase goals are
+			// unaffected (Gate 2 already released them by design).
+			if (!enabled && isPlanningPhase(readMachinePhase(ctx.cwd, params.goal) ?? "discovery")) {
+				return refuse("plan mode is off — activate it first (shift+tab or /plan)");
+			}
 			try {
 				savePlan(ctx.cwd, params.goal, params.content);
 				refreshWidget(ctx);
@@ -1128,6 +1144,18 @@ export default function planGuard(pi: ExtensionAPI): void {
 			lines: Type.String(),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			// The journal is the plan's append-only logbook — a twin of
+			// plan_recall (reading and annotating memory stay available in ANY
+			// session, guard on or off, any phase). Unlike plan_save/plan_advance,
+			// journaling never advances the phase machine or rewrites plan
+			// content, so the shadow-planning guard doesn't apply here. The one
+			// guard that DOES apply, unconditionally: the goal must already
+			// exist — appendJournal's own ensureActiveGoalDir would otherwise
+			// silently CREATE a fresh goal dir from a stray call, resurrecting a
+			// phantom goal that was never confirmed via plan_intent.
+			if (!goalExists(ctx.cwd, params.goal)) {
+				return refuse(`no plan named "${params.goal}" — goals are created by confirming an objective via plan_intent`);
+			}
 			try {
 				appendJournal(ctx.cwd, params.goal, params.lines);
 				return ok(`Journal updated for ${params.goal}.`, { goal: params.goal });

@@ -80,6 +80,15 @@ export function goalIsDone(cwd: string, goal: string): boolean {
 	return existsSync(doneGoalDir(cwd, goal));
 }
 
+/** True when `goal` has a directory anywhere in the store — active or
+ * archived in done/. Used to gate tools (journal_append) that must work on
+ * any REAL goal, guard-independent, without silently creating a phantom one
+ * via ensureActiveGoalDir's own fresh-dir fallback. Validates nothing itself,
+ * same convention as goalIsDone — callers validate the slug first. */
+export function goalExists(cwd: string, goal: string): boolean {
+	return existsSync(activeGoalDir(cwd, goal)) || existsSync(doneGoalDir(cwd, goal));
+}
+
 /** Path of the "last touched goal" pointer at the repo-slug store root. */
 function activePointerPath(cwd: string): string {
 	return join(storeRoot(cwd), "active.txt");

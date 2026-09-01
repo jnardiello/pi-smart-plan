@@ -1765,6 +1765,65 @@ console.log("\n[V2c — owns-check parallel-safe, re-claim baseline persisted]")
 	check("claims.json entry cleared once the task actually closes", !("T3" in JSON.parse(readFileSync(claimsFile, "utf8"))));
 }
 
+console.log("\n[shadow-planning guard — plan_save/plan_advance refuse guard-off on a still-planning goal; execute-phase + ask_smart_plan stay operational]");
+{
+	// Fresh planning-phase goal (raw store writes — bypass the tool, so guard
+	// state never gates the SETUP itself, only the tool calls under test).
+	// No setMachinePhase call: phase.txt stays absent, so readMachinePhase
+	// defaults to "discovery" — a planning phase, and CWD9's active pointer
+	// after this write.
+	const SHADOW_PLAN_GOAL = "shadow-plan-goal";
+	seedIntent(CWD9, SHADOW_PLAN_GOAL);
+	savePlan(CWD9, SHADOW_PLAN_GOAL, canonicalHLD(SHADOW_PLAN_GOAL));
+	await ensureGuardOff(makeCtx(CWD9));
+	const shadowSave = await registered.tools.get("plan_save").execute("id", { goal: SHADOW_PLAN_GOAL, content: canonicalHLD(SHADOW_PLAN_GOAL) }, undefined, undefined, makeCtx(CWD9));
+	check("guard-off + planning-phase goal → plan_save refuses with the exact plan-mode-off text",
+		shadowSave.isError === true && shadowSave.content[0].text === "plan mode is off — activate it first (shift+tab or /plan)");
+	const shadowAdvance = await registered.tools.get("plan_advance").execute("id", {}, undefined, undefined, makeCtx(CWD9));
+	check("guard-off + planning-phase goal (current pointer) → plan_advance refuses with the exact plan-mode-off text",
+		shadowAdvance.isError === true && shadowAdvance.content[0].text === "plan mode is off — activate it first (shift+tab or /plan)");
+
+	// Execute-phase goal stays fully operational guard-off — Gate 2 already
+	// released it by design, so plan_save/journal_append must be unaffected.
+	const SHADOW_EXEC_GOAL = "shadow-exec-goal";
+	seedIntent(CWD9, SHADOW_EXEC_GOAL);
+	setMachinePhase(CWD9, SHADOW_EXEC_GOAL, "execute");
+	savePlan(CWD9, SHADOW_EXEC_GOAL, fullPlan(SHADOW_EXEC_GOAL));
+	const execSave = await registered.tools.get("plan_save").execute("id", { goal: SHADOW_EXEC_GOAL, content: fullPlan(SHADOW_EXEC_GOAL) }, undefined, undefined, makeCtx(CWD9));
+	check("guard-off + execute-phase goal → plan_save still works", execSave.isError !== true && execSave.content[0].text.includes("Plan saved"));
+	const execJournal = await registered.tools.get("journal_append").execute("id", { goal: SHADOW_EXEC_GOAL, lines: "guard-off execute journal still works" }, undefined, undefined, makeCtx(CWD9));
+	check("guard-off + execute-phase goal → journal_append still works", execJournal.isError !== true && execJournal.content[0].text.includes("Journal updated"));
+
+	// journal_append inverts the block above: unlike plan_save/plan_advance it
+	// is now available in ANY session, guard on or off, any phase — the ONLY
+	// guard left is goal existence (checked next).
+	const shadowJournal = await registered.tools.get("journal_append").execute("id", { goal: SHADOW_PLAN_GOAL, lines: "guard-off planning-phase journal now allowed" }, undefined, undefined, makeCtx(CWD9));
+	check("guard-off + planning-phase goal → journal_append WORKS (available everywhere on existing goals)",
+		shadowJournal.isError !== true && shadowJournal.content[0].text.includes("Journal updated"));
+
+	// Existence check closes the implicit goal-creation hole: a journal_append
+	// on a goal that was never confirmed via plan_intent must refuse, not
+	// silently create it via appendJournal's own ensureActiveGoalDir — and the
+	// refusal is identical whether the guard is off or on.
+	const SHADOW_NO_SUCH_GOAL = "shadow-no-such-goal";
+	const noGoalOff = await registered.tools.get("journal_append").execute("id", { goal: SHADOW_NO_SUCH_GOAL, lines: "should refuse" }, undefined, undefined, makeCtx(CWD9));
+	check("guard-off + nonexistent goal → journal_append refuses with the exact no-plan-named text",
+		noGoalOff.isError === true && noGoalOff.content[0].text === `no plan named "${SHADOW_NO_SUCH_GOAL}" — goals are created by confirming an objective via plan_intent`);
+	await ensureGuardOn(makeCtx(CWD9));
+	const noGoalOn = await registered.tools.get("journal_append").execute("id", { goal: SHADOW_NO_SUCH_GOAL, lines: "should refuse" }, undefined, undefined, makeCtx(CWD9));
+	check("guard-on + nonexistent goal → journal_append refuses identically (existence check is guard-independent)",
+		noGoalOn.isError === true && noGoalOn.content[0].text === noGoalOff.content[0].text);
+	await ensureGuardOff(makeCtx(CWD9));
+
+	// ask_smart_plan's ordinary form path checks neither guard nor goal phase
+	// at all — blessed behavior, usable in any session.
+	customResult = { answers: { "Pick?": "A" } };
+	const shadowAsk = await registered.tools.get("ask_smart_plan").execute("id", { questions: [{ question: "Pick?", options: [{ label: "A" }, { label: "B" }] }] }, undefined, undefined, makeCtx(CWD9));
+	check("guard-off + ordinary ask_smart_plan → still works (blessed behavior)",
+		!guardOn() && shadowAsk.isError !== true && shadowAsk.details?.answers?.["Pick?"] === "A");
+	customResult = { answers: {} };
+}
+
 console.log("\n[V2d — ask_smart_plan / plan_intent options schema accepts bare strings]");
 {
 	// SCHEMA-level check (not runtime coercion): options.N: must be object used
